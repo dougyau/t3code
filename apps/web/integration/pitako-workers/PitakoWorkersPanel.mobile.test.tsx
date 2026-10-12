@@ -51,6 +51,10 @@ vi.mock("../../../mobile/src/components/AndroidScreenHeader", () => ({
 vi.mock("../../../mobile/src/lib/useUniwindTheme", () => ({ useUniwindTheme: () => ({}) }));
 vi.mock("../../../mobile/src/native/StackHeader", () => ({
   nativeHeaderScrollEdgeEffects: () => ({}),
+  NativeStackScreenOptions: () => null,
+}));
+vi.mock("../../../mobile/src/features/layout/AdaptiveWorkspaceLayout", () => ({
+  useAdaptiveWorkspaceLayout: () => ({ layout: { usesSplitView: false } }),
 }));
 vi.mock("../../../mobile/node_modules/react-native-safe-area-context", () => ({
   useSafeAreaInsets: () => ({ bottom: 0 }),
