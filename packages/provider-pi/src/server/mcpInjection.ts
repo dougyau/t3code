@@ -30,6 +30,8 @@ const RESERVED_PI_LAUNCH_ARGUMENTS = new Set([
   "--session-id",
   "--version",
   "-v",
+  "--pitako-agent-bridge",
+  "--pitako-agent-bridge-grants",
 ]);
 
 const PI_ARGUMENTS_WITH_VALUES = new Set([

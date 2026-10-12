@@ -25,6 +25,8 @@
  */
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { AgentScope } from "@t3tools/shared/AgentScope";
+import * as Scope from "effect/Scope";
+import * as Exit from "effect/Exit";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { readToolOutputImage } from "@t3tools/shared/toolOutput";
 import * as Predicate from "effect/Predicate";
@@ -84,11 +86,11 @@ import {
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 import {
   makePiRpcConnection,
+  PiRpcError,
   parsePiModelSlug,
   piRecordField as recordField,
   piRecordNumber as recordNumber,
   piRecordString as recordString,
-  type PiRpcConnection,
   type PiRpcRecord,
 } from "./rpc.ts";
 import {
@@ -97,6 +99,7 @@ import {
   resolvePiLaunchArgs,
 } from "./mcpInjection.ts";
 import { PI_FILE_CHANGE_TOOLS } from "./mcpExtensionSource.ts";
+import { PiWorkerBridge } from "./workerBridge.ts";
 
 export const PI_PROVIDER = ProviderDriverKind.make("pi");
 const PI_DRIVER_KIND = PI_PROVIDER;
@@ -547,20 +550,81 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         extensionPath,
         runtimeMode: input.runtimePolicy.runtimeMode,
       });
-      const scopedLaunch = yield* agentScope.wrap({
-        command: options.settings.binaryPath || "pi",
-        args: launch.args,
-        name: "pi",
-        threadId: input.threadId,
-        env: launch.env,
+      const platform = yield* HostProcess.Platform;
+      const runtimeMode = input.runtimePolicy.runtimeMode === "auto"
+        ? "approval-required"
+        : input.runtimePolicy.runtimeMode;
+      const binary = options.settings.binaryPath || "pi";
+      const acquire = Effect.fnUntraced(function* (launchFailed = false) {
+        const attemptScope = yield* Scope.make();
+        yield* Effect.addFinalizer((exit) => Scope.close(attemptScope, exit));
+        const workers = new PiWorkerBridge(options.settings, runtimeMode, platform, launchFailed);
+        let spawnAttempted = false;
+        yield* Scope.addFinalizer(attemptScope,
+          Effect.sync(() => { if (!spawnAttempted) workers.cleanupDirectory(true); }),
+        );
+        const scopedLaunch = yield* agentScope.wrap({
+          command: binary,
+          args: [...launch.args, ...workers.launchArgs],
+          name: "pi",
+          threadId: input.threadId,
+          env: launch.env,
+        });
+        // An interrupted/failed spawn can still have acquired a child. Only
+        // the later confirmed orderly shutdown may authorize directory deletion.
+        spawnAttempted = true;
+        const connection = yield* makePiRpcConnection({
+          command: scopedLaunch.command,
+          args: scopedLaunch.args,
+          cwd,
+          env: launch.env,
+          ...(workers.launchArgs.length === 0 ? {} : {
+            bridgeOptions: [
+              "--pitako-agent-bridge" as const,
+              ...(workers.launchArgs.length > 1 ? ["--pitako-agent-bridge-grants" as const] : []),
+            ],
+          }),
+        }).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provideService(Scope.Scope, attemptScope),
+        );
+        if (options.settings.workerBridge)
+          yield* Scope.addFinalizer(attemptScope,
+            workers.close.pipe(
+              Effect.andThen(connection.shutdown),
+              Effect.tap((orderlyExit) => Effect.sync(() => workers.cleanupDirectory(orderlyExit))),
+              Effect.asVoid,
+            ),
+          );
+        return { connection, workers, attemptScope };
       });
-      const connection: PiRpcConnection = yield* makePiRpcConnection({
-        command: scopedLaunch.command,
-        args: scopedLaunch.args,
-        cwd,
-        env: launch.env,
+      const selected = yield* Effect.gen(function* () {
+        const initial = yield* acquire();
+        if (initial.workers.launchArgs.length === 0) return initial;
+        // Only this pre-publication read may authorize the single bootstrap
+        // fallback. Pi may already have constructed a local AgentSession; no
+        // lifecycle command, prompt or T3 thread registration has run yet.
+        const usable = yield* initial.connection.request({ type: "get_state" }).pipe(
+          Effect.flatMap((state) =>
+            recordString(state, "sessionFile")
+              ? Effect.succeed(true)
+              : Effect.fail(new PiRpcError({ operation: "bootstrap", detail: "missing sessionFile" })),
+          ),
+          Effect.catchTags({
+            PiRpcError: (error) =>
+              error.operation === "read" || error.operation === "write"
+                ? initial.connection.bridgeOptionsRejected.pipe(
+                    Effect.flatMap((rejected) => rejected ? Effect.succeed(false) : Effect.fail(error)),
+                  )
+                : Effect.fail(error),
+          }),
+        );
+        if (usable) return initial;
+        // Joined transport plus confirmed nonzero exit permits replacement,
+        // not deletion of this attempt's diagnostic directory.
+        yield* Scope.close(initial.attemptScope, Exit.void);
+        return yield* acquire(true);
       }).pipe(
-        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.mapError(
           (cause) =>
             new ProviderAdapter.ProviderAdapterOpenSessionError({
@@ -570,6 +634,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             }),
         ),
       );
+      const { connection, workers } = selected;
       const now = yield* DateTime.now;
       let sessionEntity: OrchestrationV2ProviderSession = {
         id: input.providerSessionId,
@@ -726,7 +791,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       };
 
       const lifecycleRequest = (record: PiRpcRecord) =>
-        request(record, PI_SESSION_TIMEOUT_MS).pipe(
+        workers.invalidate.pipe(
+          Effect.andThen(request(record, PI_SESSION_TIMEOUT_MS)),
           // A local timeout does not cancel Pi's lifecycle hook. Retire the
           // process before fallback can race its eventual switch/new-session.
           Effect.tapError((error) =>
@@ -2244,6 +2310,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               // closes the provider stream cleanly; only an unexpected death
               // is surfaced as an event-stream failure.
               const state = threadState;
+              if (options.settings.workerBridge) yield* workers.invalidate;
               if (rollbackBarrier !== null)
                 yield* Deferred.fail(
                   rollbackBarrier,
@@ -2370,9 +2437,13 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         if (nativeId === undefined) {
           return yield* protocolError("get_state returned no persisted sessionFile", stateData);
         }
+        if (resumeId != null && nativeId !== resumeId) {
+          return yield* protocolError("Pi did not resume the requested session file");
+        }
         if (needsNewSession && nativeId === lastNativeThreadId) {
           return yield* protocolError("Pi did not create a distinct session file");
         }
+        yield* workers.bind(recordString(stateData, "sessionId"));
         lastNativeThreadId = nativeId;
         const createdAt = yield* DateTime.now;
         const providerThread: OrchestrationV2ProviderThread =
@@ -2519,7 +2590,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           return sessionEntity;
         },
         events: Stream.fromQueue(events),
-        hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null),
+        workers,
+        hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null || workers.pending),
         hasPendingBackgroundWorkForThread: (providerThread) =>
           Effect.sync(
             () => pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id,

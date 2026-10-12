@@ -25,6 +25,7 @@ import { EnvironmentRoutesSection } from "./EnvironmentRoutesSection";
 import { SettingsActionRow } from "./components/SettingsActionRow";
 import { SettingsScreen } from "./components/SettingsScreen";
 import { SettingsSection } from "./components/SettingsSection";
+import { PiWorkerSettings } from "./PiWorkerSettings";
 import {
   canMaintainEnvironment,
   canUpdateEnvironmentProvider,
@@ -360,6 +361,12 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
                             </Text>
                           ) : null}
                         </View>
+                        {provider.driver === "pi" ? (
+                          <PiWorkerSettings
+                            environmentId={environmentId}
+                            instanceId={provider.instanceId}
+                          />
+                        ) : null}
                         {canUpdateEnvironmentProvider(provider) ? (
                           <SettingsActionRow
                             icon="arrow.up.circle"

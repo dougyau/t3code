@@ -1,3 +1,5 @@
+import { useNavigation } from "@react-navigation/native";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { useMemo } from "react";
 import { ScreenHeader } from "../../components/ScreenHeader";
 import { ScreenHeaderButton } from "../../components/ScreenHeaderButton";
@@ -18,12 +20,23 @@ export function ThreadHeader(
     readonly onOpenFilesInspector: () => void;
   },
 ) {
+  const navigation = useNavigation();
   const returnToList = useWorkspaceListNavigation("threads");
   const { layout, panes, toggleAuxiliaryPane } = useAdaptiveWorkspaceLayout();
   const { onOpenTerminal, onMergeBack } = props.gitControls;
   const native = useThreadHeaderOptions(props);
   const androidHeaderActions = useMemo<ReadonlyArray<ScreenHeaderAction>>(() => {
-    const actions: ScreenHeaderAction[] = [];
+    const actions: ScreenHeaderAction[] = [
+      {
+        accessibilityLabel: "Open agents",
+        icon: "person.2",
+        onPress: () =>
+          navigation.navigate("ThreadAgents", {
+            environmentId: EnvironmentId.make(props.gitControls.environmentId),
+            threadId: ThreadId.make(props.gitControls.threadId),
+          }),
+      },
+    ];
     if (props.onReturnToThread) {
       actions.push({
         accessibilityLabel: "Return to chat",
@@ -61,6 +74,9 @@ export function ThreadHeader(
     }
     return actions;
   }, [
+    navigation,
+    props.gitControls.environmentId,
+    props.gitControls.threadId,
     props.inspectorMode,
     panes.auxiliaryPaneVisible,
     props.onOpenFilesInspector,

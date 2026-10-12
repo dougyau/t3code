@@ -1,12 +1,14 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { checkPiProviderStatus, MINIMUM_PI_VERSION } from "./status.ts";
+import { PiSettings } from "../settings.ts";
 
 const encoder = new TextEncoder();
 
@@ -37,6 +39,7 @@ function processHandle(input: {
 function piProbeSpawner(version: string) {
   return ChildProcessSpawner.make((command) => {
     const args = ChildProcess.isStandardCommand(command) ? command.args : [];
+    assert.isFalse(args.some((arg) => arg.startsWith("--pitako-agent-bridge")));
     return Effect.succeed(
       args.includes("--version")
         ? processHandle({ stdout: `pi ${version}\n` })
@@ -45,12 +48,16 @@ function piProbeSpawner(version: string) {
   });
 }
 
-const settings = {
+const settings = Schema.decodeSync(PiSettings)({
   enabled: true,
   binaryPath: "pi",
   launchArgs: "",
   customModels: [],
-} as const;
+  workerBridge: true,
+  workerHistory: true,
+  workerRoute: true,
+  workerControl: true,
+});
 
 describe("PiProvider", () => {
   it.effect("requires the first published Pi version with entries and settlement hooks", () =>

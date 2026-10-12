@@ -387,6 +387,8 @@ export class SessionStore extends Context.Service<
       readonly replaceSessionId?: AuthSessionId;
     }) => Effect.Effect<IssuedSession, SessionCredentialInternalError>;
     readonly verify: (token: string) => Effect.Effect<VerifiedSession, SessionCredentialError>;
+    /** Revalidate an already authenticated caller without minting or retaining a credential. */
+    readonly isActive: (sessionId: AuthSessionId) => Effect.Effect<boolean, SessionCredentialVerificationError>;
     readonly issueWebSocketToken: (
       sessionId: AuthSessionId,
       input?: {
@@ -1079,6 +1081,15 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const isActive = Effect.fn("SessionStore.isActive")(function* (sessionId: AuthSessionId) {
+    const row = yield* authSessions.getById({ sessionId }).pipe(
+      Effect.mapError((cause) => new SessionCredentialVerificationError({ sessionId, cause })),
+    );
+    const now = yield* DateTime.now;
+    return Option.isSome(row) && row.value.revokedAt === null &&
+      row.value.expiresAt.epochMilliseconds > now.epochMilliseconds;
+  });
+
   return SessionStore.of({
     cookieName,
     legacyCookieName,
@@ -1088,6 +1099,7 @@ export const make = Effect.gen(function* () {
     verifyWebSocketToken,
     listActive,
     awaitInvalidation,
+    isActive,
     get streamChanges() {
       return Stream.fromPubSub(changesPubSub);
     },

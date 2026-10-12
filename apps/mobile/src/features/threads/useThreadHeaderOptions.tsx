@@ -1,4 +1,5 @@
 import { StackActions, useNavigation } from "@react-navigation/native";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { useMemo } from "react";
 import { Platform } from "react-native";
 import type { AppNativeStackNavigationOptions } from "../../native/StackHeader";
@@ -28,6 +29,22 @@ export function useThreadHeaderOptions(props: {
   const { layout, panes, togglePrimarySidebar } = useAdaptiveWorkspaceLayout();
   const threadCenterHeaderItems = useThreadGitCenterHeaderItems(props.gitControls);
   const compactRightHeaderItems = useThreadGitRightHeaderItems(props.gitControls);
+  const agentsHeaderItem = useMemo(
+    () =>
+      withNativeGlassHeaderItem({
+        type: "button" as const,
+        identifier: "thread-right-agents",
+        label: "Agents",
+        accessibilityLabel: "Open agents",
+        icon: { name: "person.2", type: "sfSymbol" as const },
+        onPress: () =>
+          navigation.navigate("ThreadAgents", {
+            environmentId: EnvironmentId.make(props.gitControls.environmentId),
+            threadId: ThreadId.make(props.gitControls.threadId),
+          }),
+      }),
+    [navigation, props.gitControls.environmentId, props.gitControls.threadId],
+  );
   const splitLeftHeaderItems = useMemo<NativeHeaderItems>(
     () => [
       ...(!usesDuoHeader
@@ -161,12 +178,14 @@ export function useThreadHeaderOptions(props: {
     // Search lives in the persistent sidebar, so the split header keeps
     // the git controls on the RIGHT (no center items — center space is
     // reserved for future breadcrumbs/status).
-    unstable_headerRightItems: () =>
-      usesDuoHeader
+    unstable_headerRightItems: () => [
+      agentsHeaderItem,
+      ...(usesDuoHeader
         ? duoRightHeaderItems
         : layout.usesSplitView
           ? threadCenterHeaderItems
-          : compactRightHeaderItems,
+          : compactRightHeaderItems),
+    ],
     unstable_headerToolbarItems: () => [],
     unstable_headerSubtitle: props.usesNativeHeaderGlass ? props.subtitle : undefined,
     contentStyle: undefined,
@@ -179,6 +198,7 @@ export function useThreadHeaderOptions(props: {
     // callbacks also read state the items do not display (a "Push" item runs `push` or
     // `commit_push` depending on the default ref), so that state is keyed too.
     optionsVersion: [
+      agentsHeaderItem,
       splitLeftHeaderItems,
       threadCenterHeaderItems,
       compactRightHeaderItems,

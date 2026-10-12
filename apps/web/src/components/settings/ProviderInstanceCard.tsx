@@ -1147,13 +1147,21 @@ export function ProviderInstanceCard({
   );
 
   const runtimeFields = driverOption ? (
-    <ProviderSettingsForm
-      definition={driverOption}
-      value={instance.config}
-      idPrefix={`provider-instance-${instanceId}`}
-      variant="settings"
-      onChange={updateConfig}
-    />
+    <>
+      {instance.driver === "pi" ? (
+        <SettingsRow
+          title="Pitako worker opt-ins"
+          description="Changes apply to the next Pi process, without restarting the current one. These ceilings are not grants: private reads need acknowledgement and control needs explicit activation in the worker inspector."
+        />
+      ) : null}
+      <ProviderSettingsForm
+        definition={driverOption}
+        value={instance.config}
+        idPrefix={`provider-instance-${instanceId}`}
+        variant="settings"
+        onChange={updateConfig}
+      />
+    </>
   ) : (
     <SettingsRow
       title="Driver"

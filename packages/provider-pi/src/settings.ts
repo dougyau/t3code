@@ -35,13 +35,41 @@ export const PiSettings = makeProviderSettingsSchema(
         providerSettingsForm: { clearWhenEmpty: "omit" },
       }),
     ),
+    workerBridge: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Pitako worker bridge",
+        description:
+          "Inspect workers from an externally installed compatible Pitako extension. Applies to the next Pi process.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
+    workerHistory: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({ title: "Allow worker history acknowledgement", providerSettingsForm: { control: "switch" } }),
+    ),
+    workerRoute: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({ title: "Allow worker routing acknowledgement", providerSettingsForm: { control: "switch" } }),
+    ),
+    workerControl: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({ title: "Allow worker control activation", providerSettingsForm: { control: "switch" } }),
+    ),
     customModels: Schema.Array(CustomModelSetting).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   {
-    order: ["binaryPath", "launchArgs"],
+    order: [
+      "binaryPath",
+      "launchArgs",
+      "workerBridge",
+      "workerHistory",
+      "workerRoute",
+      "workerControl",
+    ],
   },
 );
 export type PiSettings = typeof PiSettings.Type;

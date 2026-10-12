@@ -646,7 +646,7 @@ export function createEnvironmentSubscriptionAtomFamily<R, ER, Input, A, E>(
     Input,
     A,
     E,
-    EnvironmentSupervisor.EnvironmentSupervisor | R
+    EnvironmentSupervisor.EnvironmentSupervisor | AtomRegistry.AtomRegistry | R
   >,
 ) {
   const family = Atom.family((key: string) => {
@@ -746,16 +746,18 @@ export function createEnvironmentRpcSubscriptionAtomFamily<
     readonly tag: TTag;
     readonly idleTtlMs?: number;
     readonly completeWhen?: (value: B) => boolean;
+    readonly onEnd?: (input: EnvironmentRpcInput<TTag>, registry: AtomRegistry.AtomRegistry) => void;
     readonly transform?: (
       stream: Stream.Stream<
         EnvironmentRpcStreamValue<TTag>,
         EnvironmentRpcStreamFailure<TTag>,
         EnvironmentSupervisor.EnvironmentSupervisor | R
       >,
+      input: EnvironmentRpcInput<TTag>,
     ) => Stream.Stream<
       B,
       EnvironmentRpcStreamFailure<TTag>,
-      EnvironmentSupervisor.EnvironmentSupervisor | R
+      EnvironmentSupervisor.EnvironmentSupervisor | AtomRegistry.AtomRegistry | R
     >;
   },
 ) {
@@ -763,16 +765,19 @@ export function createEnvironmentRpcSubscriptionAtomFamily<
     label: options.label,
     ...(options.completeWhen === undefined ? {} : { completeWhen: options.completeWhen }),
     ...(options.idleTtlMs === undefined ? {} : { idleTtlMs: options.idleTtlMs }),
-    subscribe: (input: EnvironmentRpcInput<TTag>) => {
-      const stream = subscribe(options.tag, input);
+    subscribe: (input: EnvironmentRpcInput<TTag>) => Stream.unwrap(Effect.gen(function* () {
+      const registry = yield* AtomRegistry.AtomRegistry;
+      const stream = subscribe(options.tag, input, {
+        onEnd: () => options.onEnd?.(input, registry),
+      });
       return options.transform === undefined
         ? (stream as Stream.Stream<
             B,
             EnvironmentRpcStreamFailure<TTag>,
             EnvironmentSupervisor.EnvironmentSupervisor | R
           >)
-        : options.transform(stream);
-    },
+        : options.transform(stream, input);
+    })),
   });
 }
 
@@ -798,6 +803,10 @@ export function createEnvironmentRpcCommand<
       readonly environmentId: EnvironmentIdType;
       readonly input: NoInfer<Input>;
     }>;
+    readonly onStart?: (
+      target: { readonly environmentId: EnvironmentIdType; readonly input: NoInfer<Input> },
+      registry: AtomRegistry.AtomRegistry,
+    ) => Effect.Effect<void, never, R>;
     readonly onSuccess?: (
       target: {
         readonly environmentId: EnvironmentIdType;
@@ -805,6 +814,10 @@ export function createEnvironmentRpcCommand<
       },
       registry: AtomRegistry.AtomRegistry,
       result: EnvironmentRpcSuccess<TTag>,
+    ) => Effect.Effect<void, never, R>;
+    readonly onFailure?: (
+      target: { readonly environmentId: EnvironmentIdType; readonly input: NoInfer<Input> },
+      registry: AtomRegistry.AtomRegistry,
     ) => Effect.Effect<void, never, R>;
     readonly onSettled?: (
       target: {
@@ -828,12 +841,14 @@ export function createEnvironmentRpcCommand<
       // Routing requires consent on the origin as well as the actual destination.
       // The transport check below deliberately checks the destination again.
       return permissions.authorize(registry, environmentId, input).pipe(
+        Effect.andThen(() => options.onStart?.(target, registry) ?? Effect.void),
         Effect.andThen(() => options.execute?.(input) ?? requestGuarded(options.tag, input)),
         Effect.provideService(RpcPermissionGuard, {
           authorize: (id, method, payload) =>
             createCommandPermissions(runtime, method).authorize(registry, id, payload),
         }),
         Effect.tap((result) => options.onSuccess?.(target, registry, result) ?? Effect.void),
+        Effect.tapError(() => options.onFailure?.(target, registry) ?? Effect.void),
         Effect.ensuring(options.onSettled?.(target, registry) ?? Effect.void),
       );
     },

@@ -7,12 +7,15 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { makePiTextGeneration } from "./textGeneration.ts";
+import { PiSettings } from "../settings.ts";
 
 const decodeJsonLine = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const encodeJsonLine = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodePiSettings = Schema.decodeEffect(PiSettings);
 
 /**
  * In-process `pi --mode rpc` that answers one prompt with `reply`. Every
@@ -44,8 +47,10 @@ const makeFakePi = (reply: string) =>
           }
         }
       });
-    const spawner = ChildProcessSpawner.make(() =>
-      Effect.succeed(
+    const spawner = ChildProcessSpawner.make((command) => {
+      const args = ChildProcess.isStandardCommand(command) ? command.args : [];
+      assert.isFalse(args.some((arg) => arg.startsWith("--pitako-agent-bridge")));
+      return Effect.succeed(
         ChildProcessSpawner.makeHandle({
           // Outside the valid pid range, so PiRpc's process-group kill never lands.
           pid: ChildProcessSpawner.ProcessId(999_999_999),
@@ -60,8 +65,8 @@ const makeFakePi = (reply: string) =>
           getInputFd: () => Sink.drain,
           getOutputFd: () => Stream.empty,
         }),
-      ),
-    );
+      );
+    });
     return { spawner, received };
   });
 
@@ -69,7 +74,14 @@ it.effect("puts linked source control context in the Pi thread title prompt", ()
   Effect.gen(function* () {
     const pi = yield* makeFakePi(encodeJsonLine({ title: "Route Reset Credits Through Hub" }));
     const textGeneration = yield* makePiTextGeneration(
-      { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
+      yield* decodePiSettings({
+        enabled: true,
+        binaryPath: "pi",
+        workerBridge: true,
+        workerHistory: true,
+        workerRoute: true,
+        workerControl: true,
+      }),
       {},
     ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, pi.spawner));
 
