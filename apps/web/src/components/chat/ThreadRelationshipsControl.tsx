@@ -1,4 +1,5 @@
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
+import { PitakoWorkersPanel } from "./PitakoWorkersPanel";
 import { ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
 import { CollapsibleSectionHeader, SectionHeaderStatus } from "../ui/collapsible-section-header";
@@ -211,6 +212,18 @@ function currentSubagent<Agent extends RuntimeSubagent>(
 }
 
 export function ThreadRelationshipsPanel(props: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+}) {
+  return (
+    <>
+      <ThreadRelationshipRows {...props} />
+      <PitakoWorkersPanel {...props} />
+    </>
+  );
+}
+
+function ThreadRelationshipRows(props: {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
 }) {

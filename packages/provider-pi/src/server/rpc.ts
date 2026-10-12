@@ -17,9 +17,11 @@
  * `PiProvider` for ephemeral one-shot processes.
  */
 import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Queue from "effect/Queue";
@@ -87,6 +89,8 @@ export interface PiRpcSpawnOptions {
   readonly args: ReadonlyArray<string>;
   readonly cwd: string | undefined;
   readonly env: NodeJS.ProcessEnv;
+  /** Only the managed foreground bootstrap may classify its own added options. */
+  readonly bridgeOptions?: ReadonlyArray<"--pitako-agent-bridge" | "--pitako-agent-bridge-grants">;
 }
 
 export interface PiRpcConnection {
@@ -116,10 +120,53 @@ export interface PiRpcConnection {
    * fresh process on the next turn.
    */
   readonly terminate: Effect.Effect<void>;
+  /** Orderly stdin EOF; true only when Pi joined its runtime and exited successfully. */
+  readonly shutdown: Effect.Effect<boolean>;
+  /** Complete drained diagnostics and confirmed exit; never infers rejection from RPC failure. */
+  readonly bridgeOptionsRejected: Effect.Effect<boolean>;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const TERMINATION_GRACE = Duration.seconds(1);
+const MAX_BOOTSTRAP_DIAGNOSTIC_BYTES = 16 * 1024;
+
+function bootstrapDiagnostics(options: PiRpcSpawnOptions["bridgeOptions"]) {
+  let stderr = new Uint8Array(0);
+  let valid = options !== undefined && options.length > 0;
+  return {
+    stdout: (chunk: Uint8Array) => { if (chunk.length > 0) valid = false; },
+    stderr: (chunk: Uint8Array) => {
+      if (!valid) return;
+      if (stderr.length + chunk.length > MAX_BOOTSTRAP_DIAGNOSTIC_BYTES) {
+        valid = false;
+        stderr = new Uint8Array(0);
+        return;
+      }
+      const next = new Uint8Array(stderr.length + chunk.length);
+      next.set(stderr);
+      next.set(chunk, stderr.length);
+      stderr = next;
+    },
+    invalidate: () => { valid = false; },
+    rejected: () => {
+      if (!valid || !options) return false;
+      try {
+        // Pi's reportDiagnostics emits this exact error. Permit only its red
+        // SGR wrapper, no arbitrary warning/fatal text, partial line or payload.
+        const text = new TextDecoder("utf-8", { fatal: true }).decode(stderr)
+          .replace(/\u001b\[(?:31|39)m/g, "");
+        const match = /^Error: Unknown options?: (--[a-z-]+(?:, --[a-z-]+)*)\r?\n$/.exec(text);
+        if (!match) return false;
+        const names = match[1]!.split(", ");
+        return names.length > 0 && names.every((name) => options.some((option) => option === name));
+      } catch {
+        return false;
+      } finally {
+        stderr = new Uint8Array(0);
+      }
+    },
+  };
+}
 
 interface PendingPiRequest {
   readonly deferred: Deferred.Deferred<unknown, PiRpcError>;
@@ -235,6 +282,7 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
 
   let childExited = false;
   let diagnosingStdoutClose = false;
+  const diagnostics = bootstrapDiagnostics(options.bridgeOptions);
 
   const killProcessGroup = (signal: NodeJS.Signals): boolean => {
     try {
@@ -284,7 +332,7 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
 
   const pendingRequests = new Map<string, PendingPiRequest>();
   const events = yield* Queue.unbounded<PiRpcRecord, PiRpcError>();
-  const outgoing = yield* Queue.unbounded<Uint8Array, PiRpcError>();
+  const outgoing = yield* Queue.unbounded<Uint8Array, PiRpcError | Cause.Done>();
   const transportDown = yield* Deferred.make<never, PiRpcError>();
   const exitDeferred = yield* Deferred.make<number, PiRpcError>();
   let nextRequestId = 0;
@@ -343,9 +391,10 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
   );
 
   // Reader: decode stdout into LF-delimited JSON records.
-  yield* Effect.gen(function* () {
+  const reader = yield* Effect.gen(function* () {
     const frame = makeJsonlFramer();
     yield* child.stdout.pipe(
+      Stream.tap((chunk) => Effect.sync(() => diagnostics.stdout(chunk))),
       Stream.decodeText(),
       Stream.runForEach((chunk) =>
         Effect.gen(function* () {
@@ -369,7 +418,9 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
     }
   }).pipe(
     Effect.matchCauseEffect({
-      onFailure: (cause) => failTransport(new PiRpcError({ operation: "read", cause })),
+      onFailure: (cause) => Effect.sync(diagnostics.invalidate).pipe(
+        Effect.andThen(failTransport(new PiRpcError({ operation: "read", cause }))),
+      ),
       onSuccess: () =>
         Effect.gen(function* () {
           // Claim the stdout-close path before waiting so a broken stdin
@@ -403,7 +454,8 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
   );
 
   // Surface stderr as debug logs; pi reserves stdout for the protocol.
-  yield* child.stderr.pipe(
+  const stderrReader = yield* child.stderr.pipe(
+    Stream.tap((chunk) => Effect.sync(() => diagnostics.stderr(chunk))),
     Stream.decodeText(),
     Stream.runForEach((chunk) =>
       chunk.trim().length === 0
@@ -412,13 +464,13 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
           // credentials or prompt text, so it never enters a log annotation.
           Effect.logDebug("pi stderr", { stderrLength: chunk.length }),
     ),
-    Effect.ignore,
+    Effect.catchCause(() => Effect.sync(diagnostics.invalidate)),
     Effect.forkIn(scope),
   );
 
   // Writer starts after the reader so an already-closed stdout can mark
   // diagnosis before a broken-pipe stdin claims the transport.
-  yield* Stream.fromQueue(outgoing).pipe(
+  const writer = yield* Stream.fromQueue(outgoing).pipe(
     Stream.run(child.stdin),
     Effect.catchCause((cause) =>
       diagnosingStdoutClose
@@ -478,6 +530,24 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
     request,
     events,
     exited: Deferred.await(exitDeferred),
+    bridgeOptionsRejected: Effect.gen(function* () {
+      const code = yield* Deferred.await(exitDeferred);
+      yield* Fiber.join(reader);
+      yield* Fiber.join(stderrReader);
+      yield* Fiber.join(writer);
+      return code === 1 && diagnostics.rejected();
+    }).pipe(
+      Effect.timeoutOption(Duration.seconds(1)),
+      Effect.map((result) => Option.isSome(result) && result.value),
+      Effect.orElseSucceed(() => false),
+    ),
+    shutdown: Queue.end(outgoing).pipe(
+      Effect.andThen(Deferred.await(exitDeferred)),
+      Effect.timeoutOption(Duration.seconds(5)),
+      Effect.provideService(Clock.Clock, Clock.Clock.defaultValue()),
+      Effect.map((code) => Option.isSome(code) && code.value === 0),
+      Effect.orElseSucceed(() => false),
+    ),
     terminate: failTransport(
       new PiRpcError({ operation: "terminate", detail: "pi process was stopped" }),
     ).pipe(Effect.andThen(terminateProcess), Effect.ignore, Effect.uninterruptible),

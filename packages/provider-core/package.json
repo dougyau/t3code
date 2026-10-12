@@ -103,6 +103,10 @@
       "types": "./src/server/ProviderAdapter.ts",
       "import": "./src/server/ProviderAdapter.ts"
     },
+    "./server/ProviderWorkers": {
+      "types": "./src/server/ProviderWorkers.ts",
+      "import": "./src/server/ProviderWorkers.ts"
+    },
     "./server/providerAuthFlow": {
       "types": "./src/server/providerAuthFlow.ts",
       "import": "./src/server/providerAuthFlow.ts"

@@ -105,6 +105,7 @@ function layerExecutorFor(input: {
         shutdown: Effect.void,
         open: () => Effect.die("unused open"),
         get: () => Effect.succeed(Option.none()),
+        getResident: () => Effect.succeed(Option.none()),
         close: () => Effect.void,
         closeInstance: () => Effect.void,
         release: () => record("release"),

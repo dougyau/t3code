@@ -6,6 +6,7 @@ export interface T3McpToolPresentation {
 }
 
 export type T3McpToolSummaryAction =
+  | "workers-read"
   | "capabilities"
   | "delegate"
   | "task-status"
@@ -108,6 +109,7 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
     "unwatch-pr",
     "pull-request",
   ),
+  t3_workers_read: tool(["Read", "Reading", "Read", "native workers"], "workers-read"),
   orchestrator_capabilities: tool(
     ["Get", "Getting", "Got", "orchestration capabilities"],
     "capabilities",

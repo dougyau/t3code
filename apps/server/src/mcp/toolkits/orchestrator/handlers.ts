@@ -5,8 +5,16 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
+import * as ProviderWorkers from "../../../providerWorkers/ProviderWorkers.ts";
 
 const handlers = {
+  t3_workers_read: McpToolAccess.readsAsCaller((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const workers = yield* ProviderWorkers.ProviderWorkers;
+      return yield* workers.readForMcp(scope, input);
+    }),
+  ),
   orchestrator_capabilities: McpToolAccess.reads(() =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;

@@ -38,6 +38,7 @@ import * as Schema from "effect/Schema";
 import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
+import type { ProviderWorkersPort } from "./ProviderWorkers.ts";
 
 import type {
   ProviderSelectionTransitionInput,
@@ -537,6 +538,7 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly providerSessionId: ProviderSessionId;
   readonly providerSession: OrchestrationV2ProviderSession;
   readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
+  readonly workers?: ProviderWorkersPort;
   /**
    * Manager-owned runtimes expose a synchronous subscription so concurrent
    * provider threads receive independent copies of the process event stream.

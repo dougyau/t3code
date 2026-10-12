@@ -22,6 +22,7 @@ import {
   ChatGptHandoffState,
 } from "./providerSetup.ts";
 import * as Schema from "effect/Schema";
+import * as Workers from "./providerWorkers.ts";
 import * as Rpc from "effect/rpc/Rpc";
 import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
@@ -364,6 +365,22 @@ import { VcsError } from "./vcs.ts";
 import { Project, ProjectMutation, ProjectMutationError } from "./project.ts";
 
 export const WS_METHODS = {
+  workerObserve: "providerWorkers.observe",
+  workerList: "providerWorkers.list",
+  workerDetail: "providerWorkers.detail",
+  workerRequests: "providerWorkers.requests",
+  workerActivity: "providerWorkers.activity",
+  workerResult: "providerWorkers.result",
+  workerHistoryList: "providerWorkers.historyList",
+  workerOpenView: "providerWorkers.openView",
+  workerCloseView: "providerWorkers.closeView",
+  workerAcknowledge: "providerWorkers.acknowledge",
+  workerHistoryRead: "providerWorkers.historyRead",
+  workerRouteRead: "providerWorkers.routeRead",
+  workerControlDetail: "providerWorkers.controlDetail",
+  workerActivate: "providerWorkers.activate",
+  workerAction: "providerWorkers.action",
+  workerReceipt: "providerWorkers.receipt",
   // Project registry methods
   projectsList: "projects.list",
   projectsAdd: "projects.add",
@@ -1835,7 +1852,26 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
   { error: EnvironmentAuthorizationError },
 ) {}
 
-export const WsRpcGroup = RpcGroup.make(
+export const ProviderWorkersRpcGroup = RpcGroup.make(
+  Rpc.make(WS_METHODS.workerObserve, { payload: Workers.WorkerTarget, success: Workers.WorkerObservation, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]), stream: true }),
+  Rpc.make(WS_METHODS.workerList, { payload: Workers.WorkerListInput, success: Workers.WorkerRoster, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerDetail, { payload: Workers.WorkerIdInput, success: Workers.WorkerDetail, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerRequests, { payload: Workers.WorkerIdInput, success: Workers.WorkerRequests, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerActivity, { payload: Workers.WorkerRefInput, success: Workers.WorkerActivity, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerResult, { payload: Workers.WorkerRefInput, success: Workers.WorkerResult, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerHistoryList, { payload: Workers.WorkerHistoryListInput, success: Workers.WorkerHistoryList, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerOpenView, { payload: Workers.WorkerTarget, success: Workers.WorkerViewEvent, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]), stream: true }),
+  Rpc.make(WS_METHODS.workerCloseView, { payload: Workers.WorkerViewInput, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerAcknowledge, { payload: Workers.WorkerAcknowledgeInput, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerHistoryRead, { payload: Workers.WorkerHistoryReadInput, success: Workers.WorkerHistoryRead, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerRouteRead, { payload: Workers.WorkerRouteInput, success: Workers.WorkerRoute, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerControlDetail, { payload: Workers.WorkerControlDetailInput, success: Workers.WorkerControlDetail, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerActivate, { payload: Workers.WorkerActivateInput, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerAction, { payload: Workers.WorkerActionInput, success: Workers.WorkerActionOutcome, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+  Rpc.make(WS_METHODS.workerReceipt, { payload: Workers.WorkerReceiptInput, success: Workers.WorkerActionOutcome, error: Schema.Union([Workers.ProviderWorkersError, EnvironmentAuthorizationError]) }),
+).middleware(RpcScopeAuthorization);
+
+export const WsCoreRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
@@ -2025,3 +2061,4 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeShellRpc,
   WsOrchestrationV2SubscribeThreadRpc,
 ).middleware(RpcScopeAuthorization);
+export const WsRpcGroup = WsCoreRpcGroup.merge(ProviderWorkersRpcGroup);

@@ -169,6 +169,10 @@ export interface ProviderSessionManagerV2Shape {
     Option.Option<ProviderAdapter.ProviderAdapterV2SessionRuntime>,
     ProviderSessionManagerV2Error
   >;
+  /** Inspection only: never starts a runtime or renews its idle residency. */
+  readonly getResident: (
+    providerSessionId: ProviderSessionId,
+  ) => Effect.Effect<Option.Option<ProviderAdapter.ProviderAdapterV2SessionRuntime>>;
   readonly close: (
     providerSessionId: ProviderSessionId,
   ) => Effect.Effect<void, ProviderSessionManagerV2Error>;
@@ -2212,6 +2216,12 @@ export const layerWithOptions = (
               yield* scheduleIdleRelease(input.providerSessionId);
               return exposedRuntime;
             }),
+          ),
+        getResident: (providerSessionId) =>
+          Ref.get(sessions).pipe(
+            Effect.map((entries) =>
+              Option.fromUndefinedOr(entries.get(sessionKey(providerSessionId))?.exposedRuntime),
+            ),
           ),
         get: (providerSessionId) =>
           Effect.gen(function* () {

@@ -148,6 +148,13 @@ describe("pi T3 MCP injection", () => {
     assert.isTrue(resolvePiLaunchArgs("--model deepseek/v4").ok);
   });
 
+  it("reserves bridge paths and authority including equals forms", () => {
+    assert.isFalse(resolvePiLaunchArgs("--pitako-agent-bridge /tmp/foreign").ok);
+    assert.isFalse(resolvePiLaunchArgs("--pitako-agent-bridge=/tmp/foreign").ok);
+    assert.isFalse(resolvePiLaunchArgs("--pitako-agent-bridge-grants history").ok);
+    assert.isFalse(resolvePiLaunchArgs("--pitako-agent-bridge-grants=control").ok);
+  });
+
   it.effect("materializes the MCP bridge with namespaced tool registration", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

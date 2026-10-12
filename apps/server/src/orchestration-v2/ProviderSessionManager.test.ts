@@ -2638,7 +2638,7 @@ it.effect("ProviderSessionManagerV2 terminal detach revokes the thread's MCP cre
   }),
 );
 
-it.effect("ProviderSessionManagerV2 releases idle sessions without sweeping all sessions", () =>
+it.effect("ProviderSessionManagerV2 resident inspection does not renew idle residency", () =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
     const effect = Effect.gen(function* () {
@@ -2669,10 +2669,14 @@ it.effect("ProviderSessionManagerV2 releases idle sessions without sweeping all 
         runtimePolicy,
       });
 
-      yield* TestClock.adjust("1 second");
+      yield* TestClock.adjust("500 millis");
+      const resident = yield* manager.getResident(providerSessionId);
+      assert.isTrue(Option.isSome(resident));
+      yield* manager.getResident(providerSessionId);
+      yield* TestClock.adjust("500 millis");
       yield* Effect.yieldNow;
 
-      const liveSession = yield* manager.get(providerSessionId);
+      const liveSession = yield* manager.getResident(providerSessionId);
       const runtimeState = yield* Ref.get(state);
       const projection = yield* projectionStore.getThreadProjection(threadId);
 
@@ -2765,7 +2769,7 @@ it.effect("ProviderSessionManagerV2 defers idle release while background work is
 
       yield* TestClock.adjust("3 seconds");
       yield* Effect.yieldNow;
-      assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+      assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
       assert.equal((yield* Ref.get(state)).closeCount, 0);
 
       yield* Ref.set(pendingWork, false);
@@ -2818,7 +2822,8 @@ it.effect("ProviderSessionManagerV2 releases pinned idle sessions once the pin c
 
       yield* TestClock.adjust("3 seconds");
       yield* Effect.yieldNow;
-      assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+      assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
+      yield* manager.getResident(providerSessionId);
 
       yield* TestClock.adjust("1 second");
       yield* Effect.yieldNow;
