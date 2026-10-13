@@ -40,6 +40,13 @@ export interface WorkerListItem {
   activated?: { attemptId: string; model: string; reasoning: string }; sdkRequest: SdkRequest | null;
   acceptedAt: number; terminalAt?: number; activity: string;
   phase: "working" | "idle" | "suspected_stall" | "stalled"; profile?: string;
+  resultTaken?: boolean;
+  handoff?: {
+    collection: "collected";
+    bookkeeping: "pending" | "reconciled" | "inapplicable" | "blocked";
+    delivery: "pending" | "offered" | "incorporated" | "blocked" | "dropped";
+    continuation: "not-requested" | "requested" | "observed" | "blocked-unconfirmed";
+  };
 }
 export interface WorkerList { owner: Owner; revision: number; items: WorkerListItem[]; cursor: string | null }
 export interface Subscription { subscriptionId: string; snapshot: WorkerList }

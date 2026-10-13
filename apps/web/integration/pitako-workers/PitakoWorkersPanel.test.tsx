@@ -7,6 +7,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import type { createProviderWorkersEnvironmentAtoms } from "@t3tools/client-runtime/state/provider-workers";
 import { workerPanelFixture } from "./PitakoWorkersPanel.fixture";
+import { workerRefreshScenario, renderedWorkerText } from "./WorkerRefresh.fixture";
 
 const state = vi.hoisted(() => ({
   workers: null as ReturnType<typeof createProviderWorkersEnvironmentAtoms> | null,
@@ -53,10 +54,41 @@ vi.mock("@t3tools/client-runtime/state/session", () => ({
   }),
 }));
 import { ThreadRelationshipsPanel } from "../../src/components/chat/ThreadRelationshipsControl";
+import { PitakoWorkersPanel } from "../../src/components/chat/PitakoWorkersPanel";
 
 describe("Pitako worker inspection interaction", () => {
+  it.effect("presents independent handoff observations and refreshes only roster/detail on native notifications", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const f = yield* workerPanelFixture;
+      state.workers = f.workers;
+      vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+      let renderer: ReactTestRenderer;
+      yield* Effect.addFinalizer(() => Effect.sync(() => vi.unstubAllGlobals()));
+      yield* Effect.addFinalizer(() => Effect.promise(async () => {
+        if (renderer) await act(async () => renderer.unmount());
+      }));
+      yield* Effect.promise(async () => {
+        await act(async () => {
+          renderer = create(<RegistryContext.Provider value={f.registry}>
+            <PitakoWorkersPanel {...f.target} />
+          </RegistryContext.Provider>);
+        });
+      });
+      yield* workerRefreshScenario(f, {
+        text: () => renderedWorkerText(renderer.toJSON()),
+        click: async (label) => {
+          await act(async () => {
+            const button = renderer.root.findAllByType("button")
+              .find((node) => node.props.children === label);
+            expect(button, label).toBeDefined();
+            expect(button!.props.disabled).not.toBe(true);
+            button!.props.onClick();
+          });
+        },
+      });
+    })));
   it.effect(
-    "opens idle, reads bounded ordinary and acknowledged private pages, controls explicitly and looks up an old receipt after replacement + new submission",
+    "opens with a passive roster, reads bounded ordinary and acknowledged private pages, controls explicitly and looks up an old receipt after replacement + new submission",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -116,7 +148,8 @@ describe("Pitako worker inspection interaction", () => {
             await act(async () => {
               await wait(pages, (p) => p.observation?.state === "last_observation");
             });
-            expect(f.calls.list).toBe(0);
+            await act(async () => { await wait(pages, (p) => p.list !== null); });
+            expect(f.calls.list).toBe(1);
             expect(f.calls.grants).toEqual([]);
             expect(f.calls.effects).toEqual([]);
             await click(

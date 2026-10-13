@@ -8,8 +8,132 @@ import { PiWorkerBridge, WorkerInspectionError, classifyPiWorkerFailure } from "
 import { BridgeError } from "./pitako/bridge/client.js";
 import { errors } from "./pitako/bridge/protocol.js";
 import { workerWireFixture } from "./workerBridge.wire.fixture.ts";
+import { handoffWorkerRows, invalidHandoffWorkerRows, legacyWorkerRow } from "../../../contracts/src/providerWorkers.fixture.ts";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as Stream from "effect/Stream";
 
 const decodeSettings = Schema.decodeUnknownSync(PiSettings);
+
+describe("passive worker handoff wire boundary", () => {
+  const owner = { processId: "process", coordinatorSessionId: "session", epoch: "epoch" };
+  it.effect("conserves every public combination through real list and subscription replies", () =>
+    Effect.gen(function* () {
+      const f = yield* workerWireFixture(owner);
+      for (const row of handoffWorkerRows) {
+        const roster = { owner, revision: 1, cursor: null, items: [row] };
+        f.policy.roster = roster;
+        assert.deepEqual(yield* Effect.promise(() => f.client.list()), roster);
+        const changed = Promise.withResolvers<unknown>();
+        const subscription = yield* Effect.promise(() => f.client.subscribe(changed.resolve));
+        assert.deepEqual(subscription.snapshot, roster);
+        f.policy.roster = { ...roster, revision: 2 };
+        f.notify(2);
+        assert.deepEqual(yield* Effect.promise(() => changed.promise), {
+          version: 1, method: "changed", owner, clientId: f.client.lease.clientId,
+          subscriptionId: "subscription", revision: 2, refreshRequired: true, gap: false,
+        });
+        assert.deepEqual(yield* Effect.promise(() => subscription.refresh()), f.policy.roster);
+        yield* Effect.promise(() => subscription.dispose());
+      }
+      assert.deepEqual(f.calls, ["connect", ...handoffWorkerRows.flatMap(() => [
+        "workers.list", "subscribe", "workers.list", "unsubscribe",
+      ])]);
+      yield* Effect.promise(() => f.client.disconnect());
+    }).pipe(Effect.scoped));
+
+  it.effect("returns observable transport errors for invalid list and subscription payloads", () =>
+    Effect.gen(function* () {
+      const f = yield* workerWireFixture(owner);
+      const badPages = [
+        ...invalidHandoffWorkerRows.map((row) => ({ owner, revision: 1, cursor: null, items: [row] })),
+        { owner, revision: 1, cursor: null, items: [{ ...legacyWorkerRow, futureField: true }] },
+        { owner, revision: 1, cursor: null, items: [{ ...handoffWorkerRows[3], handoff: {
+          collection: "collected", bookkeeping: "pending", delivery: "offered", continuation: "requested", futureField: true,
+        } }] },
+        { owner, revision: 1, cursor: null, items: Array.from({ length: 51 }, () => handoffWorkerRows[3]) },
+        { owner: { ...owner, epoch: "foreign" }, revision: 1, cursor: null, items: [legacyWorkerRow] },
+      ];
+      for (const page of badPages) {
+        for (const method of ["list", "subscribe"] as const) {
+          const client = yield* Effect.promise(() => f.open());
+          f.policy.roster = page;
+          const error = yield* Effect.tryPromise(async () => method === "list"
+            ? client.list() : client.subscribe(() => assert.fail("Invalid subscription must not notify"))).pipe(Effect.flip);
+          assert.deepEqual(classifyPiWorkerFailure(error.cause), { kind: "transport", code: "invalid_reply" });
+          yield* Effect.promise(() => client.disconnect());
+        }
+      }
+      assert.isTrue(f.calls.every((call) => ["connect", "workers.list", "subscribe"].includes(call)));
+    }).pipe(Effect.scoped));
+
+  it.effect("keeps bounded pagination revisions and stale cursor errors on the passive client", () =>
+    Effect.gen(function* () {
+      const f = yield* workerWireFixture(owner);
+      const first = { owner, revision: 7, cursor: "next-page", items: handoffWorkerRows.slice(0, 50) };
+      f.policy.roster = first;
+      assert.deepEqual(yield* Effect.promise(() => f.client.list()), first);
+      const second = { ...first, cursor: null, items: handoffWorkerRows.slice(50) };
+      f.policy.roster = second;
+      assert.deepEqual(yield* Effect.promise(() => f.client.list(first.cursor, first.revision)), second);
+      assert.deepEqual(f.requests.at(-1)?.params, { after: "next-page", revision: 7 });
+      f.policy.pageError = "stale_cursor";
+      const error = yield* Effect.tryPromise(() => f.client.list(first.cursor, first.revision)).pipe(Effect.flip);
+      assert.deepEqual(classifyPiWorkerFailure(error.cause), { kind: "coded", code: "stale_cursor" });
+    }).pipe(Effect.scoped));
+
+  it.effect("publishes native revision changes without treating blocked handoff as physical pending", () =>
+    Effect.gen(function* () {
+      const bridge = new PiWorkerBridge(decodeSettings({ workerBridge: true }), "full-access", "linux");
+      try {
+        if (bridge.directory === undefined) throw new Error("Expected private worker bridge directory");
+        const f = yield* workerWireFixture(owner, bridge.directory);
+        const row = { ...legacyWorkerRow, resultTaken: false, handoff: {
+          collection: "collected", bookkeeping: "blocked", delivery: "offered", continuation: "blocked-unconfirmed",
+        } };
+        const ref = { kind: "read", ...owner, instanceId: "worker", source: "agent_spawn", attemptId: "attempt",
+          native: { generation: 1, historyId: "history", sessionId: "child" } };
+        const workbrief = { text: "passive inspection", offset: 0, nextOffset: null, source: "invocation task" };
+        f.policy.roster = { owner, revision: 1, cursor: null, items: [row] };
+        f.policy.detail = { state: "ready", ref, observedStatus: "completed", status: "completed",
+          result: "ready", activity: "observed_binding", workbrief,
+          metadata: { text: "{}", offset: 0, nextOffset: null }, nextMetadata: null, nextBrief: null,
+          controls: { grant: "denied" } };
+        f.policy.activity = { ref, state: "ready", page: {
+          historyId: "history", sessionId: "child", active: false,
+          native: { historyId: "history", sessionId: "child", leafId: null, persisted: true },
+          workbrief, activity: [], interactions: [], gaps: [], cursor: 0, more: false,
+        }, next: { ref, section: "activity", after: 0 } };
+        yield* bridge.bind(owner.coordinatorSessionId);
+        assert.equal(bridge.observation.state, "last_observation");
+        assert.isFalse(bridge.pending);
+        const listening = yield* Deferred.make<void>();
+        const updated = yield* Deferred.make<void>();
+        const listener = yield* bridge.observations.pipe(Stream.runForEach((observation) =>
+          observation.state === "last_observation" && observation.revision === 2
+            ? Deferred.succeed(updated, undefined) : Deferred.succeed(listening, undefined),
+        ), Effect.forkScoped);
+        yield* Deferred.await(listening);
+        f.policy.roster = { owner, revision: 2, cursor: null, items: [{ ...row, resultTaken: true }] };
+        f.notify(2);
+        yield* Deferred.await(updated);
+        assert.isFalse(bridge.pending);
+        assert.deepEqual(yield* bridge.read((client) => client.list()), f.policy.roster);
+        assert.deepEqual(f.calls, ["connect", "connect", "subscribe",
+          "workers.list", "workers.detail", "workers.activity",
+          "workers.list", "workers.detail", "workers.activity", "workers.list"]);
+        yield* Fiber.interrupt(listener);
+        yield* bridge.invalidate;
+        assert.equal(bridge.observation.state, "stale_owner");
+        assert.isTrue(bridge.pending);
+        const error = yield* bridge.read((client) => client.list()).pipe(Effect.flip);
+        assert.equal(error.code, "bridge_unavailable");
+      } finally {
+        yield* bridge.close;
+        bridge.cleanupDirectory(true);
+      }
+    }).pipe(Effect.scoped));
+});
 
 describe("Pi worker failure provenance", () => {
   it("classifies the authoritative native vocabulary, not arbitrary code-shaped errors", () => {

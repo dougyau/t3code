@@ -81,9 +81,17 @@ apply to the next Pi process. Saving does not restart a running coordinator.
 
 Open the thread's Agents view and choose **Inspect Pitako workers**, even while the coordinator
 is idle. Pitako workers have a separate roster. They are not T3 subagents or durable T3 threads.
-Load the roster, select a worker, then request the brief, activity, result, or history metadata
-you need. Pages are bounded and replace the previous page. Reload deliberately when a cursor
-is stale.
+The open inspector loads the first roster page and refreshes it when native observations
+change. Selecting a worker reads its detail; later observations refresh that detail only when
+the selected worker is on the current first page. Load more workers deliberately to find a
+selection outside that page. Request activity, result, or history metadata separately.
+Pages are bounded and replace the previous page. Failed reads do not automatically retry;
+reload deliberately or wait for a new observation.
+
+Execution, collection, delivery, bookkeeping, continuation, and the reported `resultTaken`
+value are separate observations. Missing values are not reported, and result read availability
+comes only from the selected detail. Delivery and continuation do not prove acceptance or
+verification. Reading **Result** does not collect or acknowledge the worker's handoff.
 
 Provider settings set ceilings, not grants. Acknowledge private history and routing separately
 before reading either. To control a worker, inspect and activate its exact current target.

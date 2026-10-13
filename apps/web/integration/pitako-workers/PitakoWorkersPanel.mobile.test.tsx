@@ -10,6 +10,7 @@ import { act, create, type ReactTestRenderer } from "../../src/test/componentRen
 import { describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import { workerPanelFixture } from "./PitakoWorkersPanel.fixture";
+import { workerRefreshScenario, renderedWorkerText } from "./WorkerRefresh.fixture";
 
 const state = vi.hoisted(() => ({
   workers: null as ReturnType<typeof createProviderWorkersEnvironmentAtoms> | null,
@@ -99,8 +100,39 @@ vi.mock("@t3tools/client-runtime/state/session", () => ({
   createEnvironmentSessionAtoms: () => ({ sessionStateAtom: sessions }),
 }));
 import { ThreadAgentsSheet } from "../../../mobile/src/features/threads/ThreadAgentsSheet";
+import { PitakoWorkersPanel } from "../../../mobile/src/features/threads/PitakoWorkersPanel";
 
 describe("mobile Pitako agents entry", () => {
+  it.effect("presents the same independent handoff dimensions and notification-driven reads", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const f = yield* workerPanelFixture;
+      state.workers = f.workers;
+      vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+      let renderer: ReactTestRenderer;
+      yield* Effect.addFinalizer(() => Effect.sync(() => vi.unstubAllGlobals()));
+      yield* Effect.addFinalizer(() => Effect.promise(async () => {
+        if (renderer) await act(async () => renderer.unmount());
+      }));
+      yield* Effect.promise(async () => {
+        await act(async () => {
+          renderer = create(<RegistryContext.Provider value={f.registry}>
+            <PitakoWorkersPanel {...f.target} />
+          </RegistryContext.Provider>);
+        });
+      });
+      yield* workerRefreshScenario(f, {
+        text: () => renderedWorkerText(renderer.toJSON()),
+        click: async (label) => {
+          await act(async () => {
+            const button = renderer.root.findAllByType("button")
+              .find((node) => node.props.accessibilityLabel === label);
+            expect(button, label).toBeDefined();
+            expect(button!.props.disabled).not.toBe(true);
+            button!.props.onPress();
+          });
+        },
+      });
+    })));
   it.effect(
     "coexists with subagent navigation, forbids auto input, permits explicit cancel, and clears private data on transport loss",
     () =>

@@ -48,15 +48,19 @@ function WorkerInspection(target: typeof WorkerTarget.Type) {
       {model.busy ? <p role="status">Request in progress. No automatic resend.</p> : null}
       <div className="flex flex-wrap gap-2">
         {model.rows.map((row) => (
-          <Button
-            key={row.id}
-            variant="outline"
-            size="sm"
-            disabled={model.busy}
-            onClick={() => void row.select()}
-          >
-            {row.label}
-          </Button>
+          <section key={row.id} aria-label={row.label} className="space-y-1">
+            <Button variant="outline" size="sm" disabled={model.busy} onClick={() => void row.select()}>
+              {row.label}
+            </Button>
+            <dl>
+              {row.sections.map((section) => (
+                <div key={section.title}>
+                  <dt className="inline font-medium">{section.title}: </dt>
+                  <dd className="inline">{section.text}</dd>
+                </div>
+              ))}
+            </dl>
+          </section>
         ))}
       </div>
       <label className="block">

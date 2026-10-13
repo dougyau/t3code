@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
+import { handoffWorkerRows, invalidHandoffWorkerRows } from "./providerWorkers.fixture.ts";
 import { WorkerAcknowledgeInput, WorkerHistoryRead, WorkerHistoryReadInput, WorkerMcpReadInput, WorkerRoster, WorkerTextPage, WorkerActivateInput, WorkerActionOutcome, WorkerReceiptInput, WorkerActionId, makeWorkerActionId, parseWorkerActionId } from "./providerWorkers.ts";
 
 const decodeText = Schema.decodeUnknownSync(WorkerTextPage);
@@ -15,6 +16,16 @@ const decodeActionId = Schema.decodeUnknownSync(WorkerActionId);
 const actionId = makeWorkerActionId("view", 1, "00000000-0000-0000-0000-000000000001");
 
 describe("browser-safe worker pages", () => {
+  it("preserves optional handoff observations and rejects incomplete or unknown states", () => {
+    const page = { owner: { processId: "process", coordinatorSessionId: "session", epoch: "1" }, revision: 1, cursor: null };
+    for (const row of handoffWorkerRows) {
+      expect(decodeRoster({ ...page, items: [row] })).toEqual({ ...page, items: [row] });
+    }
+    for (const row of invalidHandoffWorkerRows) {
+      expect(() => decodeRoster({ ...page, items: [row] })).toThrow();
+    }
+    expect(() => decodeRoster({ ...page, items: Array.from({ length: 51 }, () => handoffWorkerRows[3]) })).toThrow();
+  });
   it("offers only ordinary discriminated read requests to MCP", () => {
     expect(decodeMcp({ request: { operation: "list", threadId: "thread" } })).toEqual({
       request: { operation: "list", threadId: "thread" },
