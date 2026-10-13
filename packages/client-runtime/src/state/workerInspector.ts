@@ -2,7 +2,7 @@ import * as C from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import { Atom, AtomRegistry, AsyncResult } from "effect/reactivity";
-import type { createProviderWorkersEnvironmentAtoms, WorkerDecision } from "./providerWorkers.ts";
+import { workerObservationKey, type createProviderWorkersEnvironmentAtoms, type WorkerDecision } from "./providerWorkers.ts";
 
 type Workers = ReturnType<typeof createProviderWorkersEnvironmentAtoms>;
 type Button = {
@@ -12,6 +12,17 @@ type Button = {
 };
 type Section = { readonly title: string; readonly text: string };
 const json = (value: unknown) => JSON.stringify(value, null, 2);
+
+/** Separate observations, never a computed success/acceptance state. */
+export function workerHandoffSections(row: (typeof C.WorkerRoster.Type)["items"][number]): Section[] {
+  return [
+    { title: "Engine collection", text: row.handoff?.collection ?? "not reported" },
+    { title: "Coordinator delivery", text: row.handoff?.delivery ?? "not reported" },
+    { title: "Bookkeeping", text: row.handoff?.bookkeeping ?? "not reported" },
+    { title: "Continuation", text: row.handoff?.continuation ?? "not reported" },
+    { title: "Composite resultTaken", text: row.resultTaken === undefined ? "not reported" : String(row.resultTaken) },
+  ];
+}
 
 /** Parse metadata only when this page contains the entire section. Never join different observations. */
 export function workerTextSection(
@@ -77,12 +88,69 @@ export function createWorkerInspector(
   const privateAtom = workers.privateState(target);
   const pageAtom = workers.pages(target);
   let releaseViewWait: (() => void) | undefined;
+  let mounted = false;
+  let generation = 0;
+  let invocation = 0;
+  let refreshing = false;
+  let pendingRefresh: string | null = null;
+  const captured = () => ({ generation, key: workerObservationKey(registry.get(pageAtom).observation) });
+  const current = (stamp: ReturnType<typeof captured>) =>
+    stamp.generation === generation && stamp.key === workerObservationKey(registry.get(pageAtom).observation);
+  const clearCursors = () => update({
+    briefCursor: null, configurationCursor: null, resultTextCursor: null, resultMetadataCursor: null,
+  });
+  function reportFailure<A, E>(result: AsyncResult.AsyncResult<A, E>) {
+    if (!AsyncResult.isFailure(result)) return;
+    const failure = Cause.findError(result.cause);
+    const code = failure._tag === "Success" && typeof failure.success === "object" &&
+      failure.success !== null && "code" in failure.success ? String(failure.success.code) : "request_failed";
+    update({ error: `${code}. No automatic retry. Restart a stale traversal deliberately.` });
+  }
+  async function drainRefresh() {
+    if (!mounted || refreshing || !pendingRefresh || registry.get(local).busy || registry.get(privateAtom).pending) return;
+    const intent = pendingRefresh;
+    pendingRefresh = null;
+    if (intent !== workerObservationKey(registry.get(pageAtom).observation)) return;
+    const stamp = captured();
+    refreshing = true;
+    update({ error: "" });
+    try {
+      const roster = await workers.list.run(registry, { environmentId: target.environmentId, input: target });
+      if (!mounted || !current(stamp)) return;
+      reportFailure(roster);
+      const id = registry.get(local).id;
+      if (AsyncResult.isSuccess(roster) && registry.get(pageAtom).list === roster.value &&
+        roster.value.items.some((row) => row.id === id)) {
+        if (registry.get(local).busy || registry.get(privateAtom).pending) {
+          pendingRefresh = intent;
+          return;
+        }
+        const detailStamp = captured();
+        const result = await detailRead.run(registry, { environmentId: target.environmentId, input: { ...target, id } });
+        if (mounted && current(detailStamp)) reportFailure(result);
+      }
+    } catch {
+      if (mounted && current(stamp)) update({ error: "request_failed. No automatic retry." });
+    } finally {
+      refreshing = false;
+      void drainRefresh();
+    }
+  }
   // Commands still check destination permissions at execution; UI availability is not authority.
   async function invoke<A, E>(run: () => Promise<AsyncResult.AsyncResult<A, E>>) {
     if (registry.get(local).busy) return;
+    if (refreshing) {
+      generation++;
+      workers.invalidate(target, registry, true);
+      clearCursors();
+      pendingRefresh = workerObservationKey(registry.get(pageAtom).observation);
+    }
+    const stamp = captured();
+    const request = ++invocation;
     update({ busy: true, error: "" });
     try {
       const result = await run();
+      if (!current(stamp)) return;
       if (AsyncResult.isFailure(result)) {
         const failure = Cause.findError(result.cause);
         const code =
@@ -115,9 +183,11 @@ export function createWorkerInspector(
         }
       }
     } catch {
-      update({ error: "request_failed. No automatic retry or resend." });
+      if (current(stamp)) update({ error: "request_failed. No automatic retry or resend." });
     } finally {
-      update({ busy: false });
+      // Revision changes fence data/errors, but the admitted human action still owns busy.
+      if (mounted && request === invocation) update({ busy: false });
+      void drainRefresh();
     }
   }
   const detailRead = {
@@ -126,8 +196,9 @@ export function createWorkerInspector(
       registry: AtomRegistry.AtomRegistry,
       args: Parameters<Workers["detail"]["run"]>[1],
     ) => {
+      const stamp = captured();
       const result = await workers.detail.run(registry, args);
-      if (AsyncResult.isSuccess(result)) {
+      if (mounted && current(stamp) && AsyncResult.isSuccess(result) && registry.get(pageAtom).detail === result.value) {
         const cursor = args.input.cursor;
         update({
           ...(!cursor || ("section" in cursor && cursor.section === "brief")
@@ -147,8 +218,9 @@ export function createWorkerInspector(
       registry: AtomRegistry.AtomRegistry,
       args: Parameters<Workers["result"]["run"]>[1],
     ) => {
+      const stamp = captured();
       const result = await workers.result.run(registry, args);
-      if (AsyncResult.isSuccess(result)) {
+      if (mounted && current(stamp) && AsyncResult.isSuccess(result) && registry.get(pageAtom).result === result.value) {
         const cursor = args.input.cursor;
         const page = result.value;
         update({
@@ -210,7 +282,8 @@ export function createWorkerInspector(
     const state = get(privateAtom);
     const view = state.view;
     const viewInput = view ? { ...target, viewId: view.viewId } : null;
-    const detail = pages.detail?.ref.instanceId === ui.id ? pages.detail : null;
+    const row = pages.list?.items.find((item) => item.id === ui.id);
+    const detail = row && pages.detail?.ref.instanceId === ui.id ? pages.detail : null;
     const buttons: Button[] = [];
     const sections: Section[] = [];
     const add = <I, A, E>(
@@ -254,8 +327,12 @@ export function createWorkerInspector(
     const rows = (pages.list?.items ?? []).map((row) => ({
       id: row.id,
       label: `${row.roleId} · ${row.status} · ${row.source ?? "worker"} · ${row.task}`,
+      sections: [{ title: "Execution", text: row.status },
+        { title: "Result read availability", text: "not consulted" }, ...workerHandoffSections(row)],
       select: async () => {
         if (ui.busy) return;
+        generation++;
+        workers.invalidate(target, registry, true);
         update({
           id: "",
           text: "",
@@ -265,15 +342,8 @@ export function createWorkerInspector(
           resultTextCursor: null,
           resultMetadataCursor: null,
         });
-        registry.set(pageAtom, {
-          ...registry.get(pageAtom),
-          detail: null,
-          requests: null,
-          activity: null,
-          result: null,
-          historyList: null,
-        });
         const privateState = registry.get(privateAtom);
+        const stamp = captured();
         if (
           privateState.history ||
           privateState.route ||
@@ -282,6 +352,7 @@ export function createWorkerInspector(
           privateState.view?.grants.length
         )
           await revoke();
+        if (!mounted || !current(stamp)) return;
         update({ id: row.id });
         await invoke(() =>
           detailRead.run(registry, {
@@ -291,7 +362,6 @@ export function createWorkerInspector(
         );
       },
     }));
-    const row = pages.list?.items.find((item) => item.id === ui.id);
     if (row)
       sections.push({
         title: "Chosen, activated, and observed requests",
@@ -304,11 +374,17 @@ export function createWorkerInspector(
           returned_service_tier: "unavailable",
         }),
       });
-    if (ui.id) add("Reload detail", detailRead, { ...target, id: ui.id }, !ready);
+    if (ui.id && !row) sections.push({
+      title: "Selection", text: "Selected worker is outside current page. Load more workers deliberately.",
+    });
+    if (row) {
+      sections.push(...workerHandoffSections(row));
+      add("Reload detail", detailRead, { ...target, id: ui.id }, !ready);
+    }
     if (detail) {
       sections.push({
         title: "Worker state",
-        text: `Observed ${detail.observedStatus}; recorded ${detail.status}; result ${detail.result}. ${detail.controls.reason ?? ""}`,
+        text: `Execution observed ${detail.observedStatus}; registered ${detail.status}; result read availability ${detail.result}. ${detail.controls.reason ?? ""} Detail is a separate observation from roster revision ${pages.list?.revision}.`,
       });
       if (detail.workbrief)
         sections.push(workerTextSection(detail.workbrief.source, detail.workbrief));
@@ -498,10 +574,12 @@ export function createWorkerInspector(
       });
     }
     async function submit(decision: WorkerDecision) {
+      const stamp = captured();
       const result = await workers.action.run(registry, {
         environmentId: target.environmentId,
         input: decision,
       });
+      if (!current(stamp)) return result;
       if (AsyncResult.isFailure(result)) {
         const failure = Cause.findError(result.cause);
         if (
@@ -586,7 +664,7 @@ export function createWorkerInspector(
       inputEnabled,
       setText: (text: string) => update({ text: text.slice(0, 8192) }),
       notice:
-        "Private access is acknowledged separately for history and routing. Controls need explicit activation. Query and steer require effective full-access. Closing this view does not cancel workers. Each section has its own cursor; separately requested pages are not an immutable snapshot. Receipts are not useful answers. Receipt availability is bounded: 16 server records per owner, 32 mappings per lease, five-minute disconnected handles, and native retention. Unknown does not authorize resend.",
+        "Passive inspection. Delivery and continuation do not prove acceptance or verification. Result is a deliberate read, not collection or acknowledgement. Private access is acknowledged separately for history and routing. Controls need explicit activation. Query and steer require effective full-access. Closing this view does not cancel workers. Each section has its own cursor; separately requested pages are not an immutable snapshot. Receipts are not useful answers. Receipt availability is bounded: 16 server records per owner, 32 mappings per lease, five-minute disconnected handles, and native retention. Unknown does not authorize resend.",
     };
   });
   return {
@@ -594,11 +672,27 @@ export function createWorkerInspector(
     viewAtom,
     observationAtom,
     mount: () => {
+      mounted = true;
+      let previousKey: string | null = null;
+      let previousList = registry.get(pageAtom).list;
+      const offPages = registry.subscribe(pageAtom, (pages) => {
+        if (pages.list !== previousList) {
+          previousList = pages.list;
+          clearCursors();
+        }
+        const key = workerObservationKey(pages.observation);
+        if (key === previousKey) return;
+        previousKey = key;
+        generation++;
+        clearCursors();
+        update({ error: "", text: "", cancelConfirmation: false, busyDecision: null });
+        pendingRefresh = key;
+        void drainRefresh();
+      }, { immediate: true });
       let previous = registry.get(privateAtom).view;
-      return registry.subscribe(privateAtom, (state) => {
+      const offPrivate = registry.subscribe(privateAtom, (state) => {
         if (previous && state.view?.viewId !== previous.viewId)
           update({
-            id: "",
             text: "",
             cancelConfirmation: false,
             error: "",
@@ -609,7 +703,19 @@ export function createWorkerInspector(
             resultMetadataCursor: null,
           });
         previous = state.view;
+        void drainRefresh();
       });
+      return () => {
+        mounted = false;
+        generation++;
+        invocation++;
+        pendingRefresh = null;
+        offPages();
+        offPrivate();
+        workers.invalidate(target, registry);
+        clearCursors();
+        update({ busy: false });
+      };
     },
     clearLocal: () =>
       update({

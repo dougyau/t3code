@@ -44,6 +44,17 @@ const emptyPages: WorkerPages = {
   observation: null, list: null, detail: null, requests: null, activity: null, result: null, historyList: null,
 };
 
+const sameOwner = (left: typeof C.WorkerOwner.Type, right: typeof C.WorkerOwner.Type) =>
+  left.processId === right.processId &&
+  left.coordinatorSessionId === right.coordinatorSessionId && left.epoch === right.epoch;
+
+/** Native revisions are meaningful only within the complete owner identity. */
+export const workerObservationKey = (observation: typeof C.WorkerObservation.Type | null) =>
+  observation?.state === "last_observation"
+    ? JSON.stringify([observation.owner.processId, observation.owner.coordinatorSessionId,
+        observation.owner.epoch, observation.revision])
+    : null;
+
 /** Only the latest bounded page is retained. Authority changes discard it, never merge traversals. */
 export function workerPrivateStateForEvent(
   state: WorkerPrivateState, event: typeof C.WorkerViewEvent.Type,
@@ -81,27 +92,68 @@ export function createProviderWorkersEnvironmentAtoms<R, E>(
   const pages = (target: typeof C.WorkerTarget.Type) => pageStates(environmentRpcKey({
     environmentId: target.environmentId, input: { threadId: target.threadId },
   }));
-  const storePage = (
-    target: { environmentId: C.EnvironmentId; input: { threadId: C.ThreadId } },
-    registry: AtomRegistry.AtomRegistry, page: Partial<WorkerPages>,
-  ) => Effect.sync(() => {
-    const atom = pages({ environmentId: target.environmentId, threadId: target.input.threadId });
-    const current = registry.get(atom);
-    const observation = current.observation;
-    if (observation && observation.state !== "last_observation") return;
-    if (page.list && observation?.state === "last_observation" &&
-      (page.list.revision !== observation.revision ||
-        page.list.owner.processId !== observation.owner.processId ||
-        page.list.owner.coordinatorSessionId !== observation.owner.coordinatorSessionId ||
-        page.list.owner.epoch !== observation.owner.epoch)) return;
-    registry.set(atom, { ...current, ...page });
-  });
-  const clearPages = (
-    target: { environmentId: C.EnvironmentId; input: { threadId: C.ThreadId } },
+  // Request fences live with the registry, not idle atoms that can reset during an RPC.
+  const tickets = new WeakMap<AtomRegistry.AtomRegistry, Map<Atom.Atom<WorkerPages>, Map<string, number>>>();
+  const invalidate = (
+    target: typeof C.WorkerTarget.Type,
     registry: AtomRegistry.AtomRegistry,
-  ) => Effect.sync(() => {
-    const atom = pages({ environmentId: target.environmentId, threadId: target.input.threadId });
-    registry.set(atom, { ...emptyPages, observation: registry.get(atom).observation });
+    keepRoster = false,
+  ) => {
+    const atom = pages(target);
+    const current = registry.get(atom);
+    const pending = tickets.get(registry)?.get(atom);
+    pending?.forEach((ticket, field) => { pending.set(field, ticket + 1); });
+    registry.set(atom, { ...emptyPages, observation: current.observation,
+      list: keepRoster ? current.list : null });
+  };
+  // Fence command settlement too: a late failure must not clear newer pages.
+  const read = <K extends Exclude<keyof WorkerPages, "observation">,
+    I extends { threadId: C.ThreadId }, E>(
+    field: K,
+    command: {
+      readonly run: (registry: AtomRegistry.AtomRegistry,
+        target: { environmentId: C.EnvironmentId; input: I }) =>
+        Promise<AsyncResult.AsyncResult<NonNullable<WorkerPages[K]>, E>>;
+      readonly permissionAtom: (id: C.EnvironmentId, input?: unknown) => Atom.Atom<boolean>;
+      readonly label: string;
+    },
+    accepts: (page: NonNullable<WorkerPages[K]>, current: WorkerPages, input: I) => boolean = () => true,
+  ) => ({
+    ...command,
+    run: async (registry: AtomRegistry.AtomRegistry,
+      request: { environmentId: C.EnvironmentId; input: I }) => {
+      const target = { environmentId: request.environmentId, threadId: request.input.threadId };
+      const atom = pages(target);
+      const key = workerObservationKey(registry.get(atom).observation);
+      const detailRef = JSON.stringify(registry.get(atom).detail?.ref);
+      let byPage = tickets.get(registry);
+      if (!byPage) {
+        byPage = new Map();
+        tickets.set(registry, byPage);
+      }
+      let byField = byPage.get(atom);
+      if (!byField) {
+        byField = new Map();
+        byPage.set(atom, byField);
+      }
+      const ticket = (byField.get(field) ?? 0) + 1;
+      byField.set(field, ticket);
+      const result = await command.run(registry, request);
+      const current = registry.get(atom);
+      if (byField.get(field) !== ticket ||
+        key !== workerObservationKey(current.observation) ||
+        (field !== "list" && detailRef !== JSON.stringify(current.detail?.ref)) ||
+        (current.observation && current.observation.state !== "last_observation")) return result;
+      if (AsyncResult.isFailure(result))
+        registry.set(atom, { ...emptyPages, observation: current.observation,
+          list: field === "list" ? null : current.list });
+      else if (AsyncResult.isSuccess(result) && accepts(result.value, current, request.input))
+        registry.set(atom, {
+          ...(field === "list" ? { ...emptyPages, observation: current.observation } : current),
+          [field]: result.value,
+        });
+      return result;
+    },
   });
   const privateState = (target: typeof C.WorkerTarget.Type) => privateStates(environmentRpcKey({
     environmentId: target.environmentId, input: { threadId: target.threadId },
@@ -136,49 +188,56 @@ export function createProviderWorkersEnvironmentAtoms<R, E>(
   return {
     privateState,
     pages,
+    invalidate,
     view,
     observe: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:workers:observe", tag: C.WS_METHODS.workerObserve, idleTtlMs: 0,
-      onEnd: (input, registry) => registry.set(pages(input), emptyPages),
+      onEnd: (input, registry) => {
+        invalidate(input, registry);
+        registry.set(pages(input), emptyPages);
+      },
       transform: (stream, input) => Stream.unwrap(Effect.gen(function* () {
         const registry = yield* AtomRegistry.AtomRegistry;
         let previous: typeof C.WorkerObservation.Type | undefined;
         return stream.pipe(Stream.tap((observation) => Effect.sync(() => {
           if (observation.state !== "last_observation" || previous?.state !== "last_observation" ||
             observation.revision !== previous.revision ||
-            observation.owner.processId !== previous.owner.processId ||
-            observation.owner.coordinatorSessionId !== previous.owner.coordinatorSessionId ||
-            observation.owner.epoch !== previous.owner.epoch)
-            registry.set(pages(input), { ...emptyPages, observation });
+            !sameOwner(observation.owner, previous.owner))
+            {
+              invalidate(input, registry);
+              registry.set(pages(input), { ...emptyPages, observation });
+            }
           else registry.set(pages(input), { ...registry.get(pages(input)), observation });
           previous = observation;
         })));
       })),
     }),
-    list: createEnvironmentRpcCommand(runtime, {
-      label: "workers:list", tag: C.WS_METHODS.workerList, onFailure: clearPages,
-      onSuccess: (target, registry, page) => storePage(target, registry, { list: page }),
-    }),
-    detail: createEnvironmentRpcCommand(runtime, {
-      label: "workers:detail", tag: C.WS_METHODS.workerDetail, onFailure: clearPages,
-      onSuccess: (target, registry, page) => storePage(target, registry, { detail: page }),
-    }),
-    requests: createEnvironmentRpcCommand(runtime, {
-      label: "workers:requests", tag: C.WS_METHODS.workerRequests, onFailure: clearPages,
-      onSuccess: (target, registry, page) => storePage(target, registry, { requests: page }),
-    }),
-    activity: createEnvironmentRpcCommand(runtime, {
-      label: "workers:activity", tag: C.WS_METHODS.workerActivity, onFailure: clearPages,
-      onSuccess: (target, registry, page) => storePage(target, registry, { activity: page }),
-    }),
-    result: createEnvironmentRpcCommand(runtime, {
-      label: "workers:result", tag: C.WS_METHODS.workerResult, onFailure: clearPages,
-      onSuccess: (target, registry, page) => storePage(target, registry, { result: page }),
-    }),
-    historyList: createEnvironmentRpcCommand(runtime, {
-      label: "workers:history-list", tag: C.WS_METHODS.workerHistoryList, onFailure: clearPages,
-      onSuccess: (target, registry, page) => storePage(target, registry, { historyList: page }),
-    }),
+    list: read("list", createEnvironmentRpcCommand(runtime, {
+      label: "workers:list", tag: C.WS_METHODS.workerList,
+    }), (page, current) => !current.observation ||
+      (current.observation.state === "last_observation" && current.observation.revision === page.revision &&
+        sameOwner(current.observation.owner, page.owner))),
+    detail: read("detail", createEnvironmentRpcCommand(runtime, {
+      label: "workers:detail", tag: C.WS_METHODS.workerDetail,
+    }), (page, current, input) => page.ref.instanceId === input.id &&
+      (!current.list || current.list.items.some((row) => row.id === page.ref.instanceId &&
+        (!row.source || row.source === page.ref.source) &&
+        (!row.assignmentId || row.assignmentId === page.ref.assignmentId) &&
+        (!row.activated?.attemptId || !page.ref.attemptId || row.activated.attemptId === page.ref.attemptId))) &&
+      (!current.observation ||
+        (current.observation.state === "last_observation" && sameOwner(current.observation.owner, page.ref)))),
+    requests: read("requests", createEnvironmentRpcCommand(runtime, {
+      label: "workers:requests", tag: C.WS_METHODS.workerRequests,
+    })),
+    activity: read("activity", createEnvironmentRpcCommand(runtime, {
+      label: "workers:activity", tag: C.WS_METHODS.workerActivity,
+    })),
+    result: read("result", createEnvironmentRpcCommand(runtime, {
+      label: "workers:result", tag: C.WS_METHODS.workerResult,
+    })),
+    historyList: read("historyList", createEnvironmentRpcCommand(runtime, {
+      label: "workers:history-list", tag: C.WS_METHODS.workerHistoryList,
+    })),
     acknowledge: createEnvironmentRpcCommand(runtime, { label: "workers:acknowledge", tag: C.WS_METHODS.workerAcknowledge }),
     closeView: createEnvironmentRpcCommand(runtime, {
       label: "workers:close-view", tag: C.WS_METHODS.workerCloseView,

@@ -19,8 +19,166 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as Workers from "./ProviderWorkers.ts";
 import * as WorkerRpc from "./rpc.ts";
+import { handoffWorkerRows, invalidHandoffWorkerRows } from "../../../../packages/contracts/src/providerWorkers.fixture.ts";
+import { workerWireFixture } from "../../../../packages/provider-pi/src/server/workerBridge.wire.fixture.ts";
+import { McpSchema, McpServer } from "effect/ai";
+import * as McpHttpServer from "../mcp/McpHttpServer.ts";
+import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import * as McpToolAccessTestkit from "../mcp/McpToolAccess.testkit.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import * as ProjectService from "../project/ProjectService.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
 
 describe("worker caller authority and view admission", () => {
+  it.effect("conserves passive handoff pages through native decoder, service, RPC and registered MCP", () =>
+    Effect.gen(function* () {
+      const environmentId = C.EnvironmentId.make("handoff-environment");
+      const threadId = C.ThreadId.make("handoff-thread");
+      const providerSessionId = C.ProviderSessionId.make("handoff-session");
+      const providerInstanceId = C.ProviderInstanceId.make("pi");
+      const providerThreadId = C.ProviderThreadId.make("handoff-provider-thread");
+      const shell = { ...McpToolAccessTestkit.liveThreadShell(threadId),
+        providerInstanceId, activeProviderThreadId: providerThreadId, lastVisitedAt: null };
+      const owner = { processId: "process", coordinatorSessionId: "session", epoch: "epoch" };
+      const f = yield* workerWireFixture(owner);
+      let client = f.client;
+      const unexpected = () => { throw new Error("Passive inspection invoked private view or provider work"); };
+      const port: PiWorkersPort = {
+        driver: "pi", runtimeMode: "full-access", pending: false,
+        ceilings: { history: true, route: true, control: true },
+        observation: { state: "last_observation", owner, revision: 1, observedAt: 1 },
+        observations: Stream.never, refresh: Effect.die("Unexpected passive refresh"),
+        openView: unexpected, disconnectView: unexpected,
+        read: (use) => Effect.tryPromise({ try: () => use(client),
+          catch: (cause) => new WorkerInspectionError({ code: cause instanceof Error && "code" in cause
+            && typeof cause.code === "string" ? cause.code : "inspection_failed" }) }),
+      };
+      const runtime: ProviderAdapterV2SessionRuntime = {
+        instanceId: providerInstanceId, driver: C.ProviderDriverKind.make("pi"), providerSessionId, workers: port,
+        get providerSession() { return unexpected(); },
+        events: Stream.empty, ensureThread: unexpected, resumeThread: unexpected,
+        startTurn: unexpected, steerTurn: unexpected, interruptTurn: unexpected,
+        respondToRuntimeRequest: unexpected, readThreadSnapshot: unexpected,
+        rollbackThread: unexpected, forkThread: unexpected,
+      };
+      const workersLayer = Workers.layer.pipe(Layer.provide(Layer.mergeAll(
+        Layer.mock(SessionStore.SessionStore)({ cookieName: "test", legacyCookieName: undefined, isActive: unexpected }),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({ getEnvironmentId: Effect.succeed(environmentId) }),
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getThreadShell: () => Effect.succeed(shell),
+          getThreadProviderContext: () => Effect.succeed({
+            thread: shell, providerSessions: [], providerThreads: [{
+              id: providerThreadId, driver: C.ProviderDriverKind.make("pi"), providerInstanceId,
+              providerSessionId, appThreadId: threadId, ownerNodeId: null, nativeThreadRef: null,
+              nativeConversationHeadRef: null, status: "idle", firstRunOrdinal: null, lastRunOrdinal: null,
+              handoffIds: [], forkedFrom: null, createdAt: shell.createdAt, updatedAt: shell.updatedAt,
+            }],
+          }),
+        }),
+        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+          getResident: () => Effect.succeedSome(runtime),
+        }),
+      )));
+      const session = { sessionId: C.AuthSessionId.make("handoff-auth"), subject: "fixture",
+        method: "bearer-access-token" as const, scopes: [C.AuthOrchestrationReadScope] };
+      const target = { environmentId, threadId };
+      const viewer = { session, connectionId: "fixture" };
+      const invocation: McpInvocationScope = {
+        environmentId, issuedAt: 0, requestNamespace: "handoff-mcp",
+        thread: { threadId, providerSessionId, providerInstanceId },
+        client: undefined, capabilities: new Set(["orchestration"]),
+      };
+      const mcpClient = McpSchema.McpServerClient.of({
+        clientId: 1, protocolVersion: "2025-06-18", clientCapabilities: {},
+        clientInfo: { name: "handoff-fixture", version: "1" },
+        initializePayload: { protocolVersion: "2025-06-18", capabilities: {},
+          clientInfo: { name: "handoff-fixture", version: "1" } },
+        getClient: Effect.die("Unexpected MCP client access"),
+      });
+      const mcpLayer = McpHttpServer.layerOrchestratorToolkit.pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({})),
+        Layer.provide(Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({})),
+        Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
+        Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+        Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
+      );
+      const ref = { kind: "read" as const, ...owner, instanceId: "worker", source: "agent_run" as const };
+      const detail = { state: "ready", ref, observedStatus: "completed", status: "completed",
+        result: "unavailable", activity: "unavailable",
+        workbrief: { text: "sync worker", offset: 0, nextOffset: null, source: "invocation task" },
+        metadata: { text: "{}", offset: 0, nextOffset: null }, nextMetadata: null, nextBrief: null,
+        controls: { grant: "denied" } } satisfies typeof C.WorkerDetail.Type;
+      const result = { state: "unavailable", reason: "unsupported_kind" } satisfies typeof C.WorkerResult.Type;
+      f.policy.detail = detail;
+      f.policy.result = result;
+      yield* Effect.gen(function* () {
+        const service = yield* Workers.ProviderWorkers;
+        const rpc = yield* RpcTest.makeClient(C.ProviderWorkersRpcGroup);
+        const mcp = yield* McpServer.McpServer;
+        const callMcp = (request: typeof C.WorkerMcpReadInput.Type["request"]) =>
+          mcp.callTool({ name: "t3_workers_read", arguments: { request } }).pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.provideService(McpSchema.McpServerClient, mcpClient),
+          );
+        for (const [index, items] of [handoffWorkerRows.slice(0, 50), handoffWorkerRows.slice(50)].entries()) {
+          const roster = { owner, revision: 7, cursor: index === 0 ? "page-2" : null, items };
+          const input = index === 0 ? target : { ...target, after: "page-2", revision: 7 };
+          f.policy.roster = roster;
+          assert.deepEqual(yield* service.list(viewer, input), roster);
+          assert.deepEqual(yield* rpc[C.WS_METHODS.workerList](input), roster);
+          const response = yield* callMcp({ operation: "list", threadId,
+            ...(index === 0 ? {} : { after: "page-2", revision: 7 }) });
+          assert.isFalse(response.isError ?? false);
+          assert.deepEqual(response.structuredContent, roster);
+          assert.deepEqual(f.requests.at(-1)?.params, index === 0 ? {} : { after: "page-2", revision: 7 });
+        }
+        assert.deepEqual(yield* service.detail(viewer, { ...target, id: "worker" }), detail);
+        assert.deepEqual(yield* service.result(viewer, { ...target, ref }), result);
+        assert.deepEqual(yield* rpc[C.WS_METHODS.workerDetail]({ ...target, id: "worker" }), detail);
+        assert.deepEqual(yield* rpc[C.WS_METHODS.workerResult]({ ...target, ref }), result);
+        assert.deepEqual((yield* callMcp({ operation: "detail", threadId, id: "worker" })).structuredContent, detail);
+        assert.deepEqual((yield* callMcp({ operation: "result", threadId, ref })).structuredContent, result);
+        for (const row of invalidHandoffWorkerRows) {
+          f.policy.roster = { owner, revision: 7, cursor: null, items: [row] };
+          const error = yield* service.list(viewer, target).pipe(Effect.flip);
+          assert.equal(error.code, "invalid_reply");
+          client = yield* Effect.promise(() => f.open());
+          const rpcError = yield* rpc[C.WS_METHODS.workerList](target).pipe(Effect.flip);
+          if (rpcError._tag !== "ProviderWorkersError") throw rpcError;
+          assert.equal(rpcError.code, "invalid_reply");
+          client = yield* Effect.promise(() => f.open());
+          const mcpError = yield* callMcp({ operation: "list", threadId });
+          assert.isTrue(mcpError.isError);
+          assert.isUndefined(mcpError.structuredContent);
+          const content = mcpError.content[0];
+          if (content?.type !== "text") throw new Error("Expected declared MCP failure");
+          assert.deepEqual(JSON.parse(content.text), {
+            _tag: "OrchestratorMcpFailure", code: "provider_unavailable",
+            message: "Worker inspection unavailable: invalid_reply.",
+          });
+          client = yield* Effect.promise(() => f.open());
+        }
+        f.policy.roster = { owner, revision: 8, cursor: null, items: handoffWorkerRows.slice(0, 1) };
+        f.policy.pageError = "stale_cursor";
+        assert.equal((yield* service.list(viewer, { ...target, after: "page-2", revision: 7 }).pipe(Effect.flip)).code, "stale_cursor");
+        f.policy.pageError = undefined;
+        assert.deepEqual(yield* service.list(viewer, target), f.policy.roster);
+        assert.deepEqual(f.calls.slice(0, 13), ["connect",
+          ...Array.from({ length: 6 }, () => "workers.list"),
+          "workers.detail", "workers.result", "workers.detail", "workers.result", "workers.detail", "workers.result"]);
+        assert.isTrue(f.calls.every((method) => ["connect", "workers.list", "workers.detail", "workers.result"].includes(method)));
+      }).pipe(Effect.provide(Layer.mergeAll(
+        C.ProviderWorkersRpcGroup.toLayer(WorkerRpc.makeHandlers(session)),
+        RpcAuthorization.layer(session.scopes), mcpLayer,
+      ).pipe(Layer.provideMerge(workersLayer))));
+    }).pipe(Effect.scoped, Effect.provide(NodeCrypto.layer)),
+  );
   it.effect("requires thread-scoped MCP reads and preserves ordinary RPC access and structured busy", () =>
     Effect.gen(function* () {
       const environmentId = C.EnvironmentId.make("workers-busy-environment");

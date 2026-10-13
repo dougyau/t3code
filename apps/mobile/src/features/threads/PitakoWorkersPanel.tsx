@@ -64,12 +64,12 @@ function WorkerInspection(target: typeof WorkerTarget.Type) {
       {model.error ? <Text accessibilityRole="alert">{model.error}</Text> : null}
       {model.busy ? <Text>Request in progress. No automatic resend.</Text> : null}
       {model.rows.map((row) => (
-        <WorkerButton
-          key={row.id}
-          label={row.label}
-          disabled={model.busy}
-          press={() => void row.select()}
-        />
+        <View key={row.id} className="gap-1" accessibilityLabel={row.label}>
+          <WorkerButton label={row.label} disabled={model.busy} press={() => void row.select()} />
+          {row.sections.map((section) => (
+            <Text key={section.title}>{section.title}: {section.text}</Text>
+          ))}
+        </View>
       ))}
       <Text>Deliberate worker input</Text>
       <TextInput

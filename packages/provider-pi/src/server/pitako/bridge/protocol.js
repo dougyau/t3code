@@ -142,7 +142,8 @@ function isList(value, owner) {
     (value.cursor === null || string(value.cursor)) &&
     value.items.every(row => object(row) &&
       keys(row, ["id", "roleId", "status", "source", "assignmentId", "task", "selectedModel", "requestedModel",
-        "requestedReasoning", "activated", "sdkRequest", "acceptedAt", "terminalAt", "activity", "phase", "profile"]) &&
+        "requestedReasoning", "activated", "sdkRequest", "acceptedAt", "terminalAt", "activity", "phase", "profile",
+        "resultTaken", "handoff"]) &&
       string(row.id) && string(row.roleId) &&
       ["created", "running", "completed", "failed", "cancelled"].includes(row.status) &&
       optional(row, "source", source => ["agent_run", "agent_spawn", "team_assign"].includes(source)) &&
@@ -151,6 +152,11 @@ function isList(value, owner) {
       optional(row, "activated", item => object(item) && keys(item, ["attemptId", "model", "reasoning"]) &&
         text(item.attemptId) && text(item.model) && text(item.reasoning)) &&
       (row.sdkRequest === null || isSdkRequest(row.sdkRequest)) &&
+      optional(row, "resultTaken", item => typeof item === "boolean") &&
+      optional(row, "handoff", item => object(item) && keys(item, ["collection", "bookkeeping", "delivery", "continuation"]) &&
+        item.collection === "collected" && ["pending", "reconciled", "inapplicable", "blocked"].includes(item.bookkeeping) &&
+        ["pending", "offered", "incorporated", "blocked", "dropped"].includes(item.delivery) &&
+        ["not-requested", "requested", "observed", "blocked-unconfirmed"].includes(item.continuation)) &&
       Number.isFinite(row.acceptedAt) && text(row.activity) &&
       ["working", "idle", "suspected_stall", "stalled"].includes(row.phase));
 }

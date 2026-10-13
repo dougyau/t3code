@@ -71,6 +71,13 @@ export const WorkerRoster = Schema.Struct({
     activated: Schema.optional(Schema.Struct({ attemptId: Id, model: Text, reasoning: Text })),
     sdkRequest: Schema.NullOr(SdkRequest), acceptedAt: Schema.Number, terminalAt: Schema.optional(Schema.Number),
     activity: Text, phase: Schema.Literals(["working", "idle", "suspected_stall", "stalled"]), profile: Schema.optional(Text),
+    resultTaken: Schema.optionalKey(Schema.Boolean),
+    handoff: Schema.optionalKey(Schema.Struct({
+      collection: Schema.Literal("collected"),
+      bookkeeping: Schema.Literals(["pending", "reconciled", "inapplicable", "blocked"]),
+      delivery: Schema.Literals(["pending", "offered", "incorporated", "blocked", "dropped"]),
+      continuation: Schema.Literals(["not-requested", "requested", "observed", "blocked-unconfirmed"]),
+    })),
   })),
 });
 export const WorkerAvailability = Schema.Union([

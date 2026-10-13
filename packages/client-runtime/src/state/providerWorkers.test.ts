@@ -23,6 +23,129 @@ const sessions = Atom.family((_id: C.EnvironmentId) => Atom.make(AsyncResult.suc
 })));
 
 describe("worker private state", () => {
+  it.effect("fences late successes and failures across full owners, revisions, selections and disconnects", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const env = C.EnvironmentId.make("fence-environment");
+      const target = { environmentId: env, threadId: C.ThreadId.make("fence-thread") };
+      const owner = { processId: "process", coordinatorSessionId: "coordinator", epoch: "epoch" };
+      const observed = (revision: number, currentOwner = owner) =>
+        ({ state: "last_observation", owner: currentOwner, revision, observedAt: revision } as const);
+      const observations = yield* SubscriptionRef.make<typeof C.WorkerObservation.Type>(observed(1));
+      const roster = (revision: number, currentOwner = owner): typeof C.WorkerRoster.Type =>
+        ({ owner: currentOwner, revision, items: [], cursor: `cursor-${revision}` });
+      const detail: typeof C.WorkerDetail.Type = {
+        state: "ready", ref: { kind: "read", ...owner, instanceId: "worker", source: "agent_spawn", attemptId: "attempt1" },
+        status: "completed", observedStatus: "completed", result: "ready", activity: "unavailable",
+        controls: { grant: "denied" },
+      };
+      let listResponse: Effect.Effect<typeof C.WorkerRoster.Type, C.ProviderWorkersError> = Effect.succeed(roster(1));
+      let detailResponse: Effect.Effect<typeof C.WorkerDetail.Type, C.ProviderWorkersError> = Effect.succeed(detail);
+      const session = { client: {
+        [C.WS_METHODS.workerObserve]: () => SubscriptionRef.changes(observations),
+        [C.WS_METHODS.workerList]: () => listResponse,
+        [C.WS_METHODS.workerDetail]: () => detailResponse,
+      } } as unknown as RpcSession;
+      const sessionRef = yield* SubscriptionRef.make(Option.some(session));
+      const supervisor = { session: sessionRef, target: new PrimaryConnectionTarget({
+        environmentId: env, label: "test", httpBaseUrl: "http://fixture", wsBaseUrl: "ws://fixture",
+      }) } as unknown as EnvironmentSupervisor["Service"];
+      const entries = yield* SubscriptionRef.make<ReadonlyMap<C.EnvironmentId, import("../connection/catalog.ts").ConnectionCatalogEntry>>(new Map());
+      const networkStatus = yield* SubscriptionRef.make<"online" | "offline" | "unknown">("online");
+      const runtime = Atom.runtime(Layer.mock(EnvironmentRegistry)({
+        entries, networkStatus,
+        run: (_id, effect) => Effect.provideService(effect, EnvironmentSupervisor, supervisor),
+        followStream: (_id, stream) => Stream.provideService(stream, EnvironmentSupervisor, supervisor),
+      }));
+      const atoms = createProviderWorkersEnvironmentAtoms(runtime, () => "unused");
+      const registry = AtomRegistry.make();
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+      const pages = atoms.pages(target);
+      registry.mount(pages);
+      const observe = atoms.observe({ environmentId: env, input: target });
+      registry.mount(observe);
+      yield* AtomRegistry.getResult(registry, observe);
+      const wait = <A>(atom: Atom.Atom<A>, predicate: (value: A) => boolean) => Effect.callback<void>((resume) => {
+        const off = registry.subscribe(atom, (value) => { if (predicate(value)) resume(Effect.void); }, { immediate: true });
+        return Effect.sync(off);
+      });
+      const notify = (value: typeof C.WorkerObservation.Type) => SubscriptionRef.set(observations, value).pipe(
+        Effect.andThen(wait(pages, (p) => p.observation === value)));
+      let revision = 1;
+      for (const replacement of [
+        { ...owner, processId: "other-process" },
+        { ...owner, coordinatorSessionId: "other-coordinator" },
+        { ...owner, epoch: "other-epoch" },
+        owner,
+      ]) {
+        for (const fail of [false, true]) {
+          yield* notify(observed(++revision, owner));
+          const oldRevision = revision;
+          const started = yield* Deferred.make<void>();
+          const reply = yield* Deferred.make<typeof C.WorkerRoster.Type, C.ProviderWorkersError>();
+          listResponse = Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(reply)));
+          const old = yield* Effect.promise(() => atoms.list.run(registry, { environmentId: env, input: target })).pipe(Effect.forkScoped);
+          yield* Deferred.await(started);
+          // Changed owner dimensions must fence even when the native revision is identical.
+          if (replacement === owner) revision++;
+          yield* notify(observed(revision, replacement));
+          listResponse = Effect.succeed(roster(revision, replacement));
+          yield* Effect.promise(() => atoms.list.run(registry, { environmentId: env, input: target }));
+          const newest = registry.get(pages);
+          if (fail) yield* Deferred.fail(reply, new C.ProviderWorkersError({ code: "late_failure" }));
+          else yield* Deferred.succeed(reply, roster(oldRevision));
+          yield* Fiber.join(old);
+          expect(registry.get(pages)).toBe(newest);
+          expect(newest.list?.cursor).toBe(`cursor-${revision}`);
+        }
+      }
+      yield* notify(observed(++revision));
+      for (const fail of [false, true]) {
+        const started = yield* Deferred.make<void>();
+        const reply = yield* Deferred.make<typeof C.WorkerDetail.Type, C.ProviderWorkersError>();
+        detailResponse = Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(reply)));
+        const old = yield* Effect.promise(() => atoms.detail.run(registry, {
+          environmentId: env, input: { ...target, id: "worker" },
+        })).pipe(Effect.forkScoped);
+        yield* Deferred.await(started);
+        // A human selection generation changes even when native owner/revision and id are unchanged.
+        atoms.invalidate(target, registry, true);
+        const latest = { ...detail, ref: { ...detail.ref, attemptId: "attempt2" } };
+        detailResponse = Effect.succeed(latest);
+        yield* Effect.promise(() => atoms.detail.run(registry, { environmentId: env, input: { ...target, id: "worker" } }));
+        const newest = registry.get(pages);
+        if (fail) yield* Deferred.fail(reply, new C.ProviderWorkersError({ code: "late_failure" }));
+        else yield* Deferred.succeed(reply, detail);
+        yield* Fiber.join(old);
+        expect(registry.get(pages)).toBe(newest);
+        expect(newest.detail?.ref.attemptId).toBe("attempt2");
+      }
+      for (const loss of [{ state: "runtime_absent" }, { state: "error", code: "observation_failure" }] as const) {
+        for (const fail of [false, true]) {
+          yield* notify(observed(++revision));
+          const started = yield* Deferred.make<void>();
+          const reply = yield* Deferred.make<typeof C.WorkerDetail.Type, C.ProviderWorkersError>();
+          detailResponse = Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(reply)));
+          const old = yield* Effect.promise(() => atoms.detail.run(registry, {
+            environmentId: env, input: { ...target, id: "worker" },
+          })).pipe(Effect.forkScoped);
+          yield* Deferred.await(started);
+          yield* notify(loss);
+          if (fail) yield* Deferred.fail(reply, new C.ProviderWorkersError({ code: "late_failure" }));
+          else yield* Deferred.succeed(reply, detail);
+          yield* Fiber.join(old);
+          expect(registry.get(pages).detail).toBeNull();
+          expect(registry.get(pages).list).toBeNull();
+        }
+      }
+      // Independent targets progress and cannot write the selected thread's pages.
+      const other = { ...target, environmentId: C.EnvironmentId.make("another-environment"), threadId: C.ThreadId.make("another-thread") };
+      registry.mount(atoms.pages(other));
+      detailResponse = Effect.succeed(detail);
+      yield* Effect.promise(() => atoms.detail.run(registry, { environmentId: other.environmentId, input: { ...other, id: "worker" } }));
+      expect(registry.get(atoms.pages(other)).detail).toEqual(detail);
+      expect(registry.get(pages).detail).toBeNull();
+    })));
+
   it.effect("keeps bounded pages per environment and clears them on grant, owner, stream and stale-page changes", () =>
     Effect.scoped(Effect.gen(function* () {
       const env = C.EnvironmentId.make("env");

@@ -4,6 +4,7 @@ import type { PiWorkersPort } from "@t3tools/provider-pi/server";
 import { BridgeError } from "../../../../packages/provider-pi/src/server/pitako/bridge/client.js";
 import type { ProviderAdapterV2SessionRuntime } from "@t3tools/provider-core/server/ProviderAdapter";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Layer from "effect/Layer";
@@ -65,6 +66,9 @@ export const workerPanelFixture = Effect.gen(function* () {
     effects: [] as unknown[],
     receipts: [] as unknown[],
     result: [] as unknown[],
+    requests: 0,
+    activity: 0,
+    historyList: 0,
   };
   const policy = {
     mode: "full-access" as PiWorkersPort["runtimeMode"],
@@ -96,6 +100,43 @@ export const workerPanelFixture = Effect.gen(function* () {
   } as const;
   type NativeClient = Effect.Success<ReturnType<PiWorkersPort["openView"]>>;
   type NativeStatus = Awaited<ReturnType<NativeClient["requestStatus"]>>;
+  type Roster = Awaited<ReturnType<NativeClient["list"]>>;
+  const data: { roster: Roster; detail: typeof C.WorkerDetail.Type } = {
+    roster: {
+      owner, revision: 1, cursor: null,
+      items: [{
+        id: "worker", kind: "background", roleId: "developer", status: "running",
+        task: "fixture task", readRef: ref, source: "agent_spawn",
+        selectedModel: "selected", requestedModel: "requested", requestedReasoning: "high",
+        sdkRequest: null, acceptedAt: 1, activity: "observed_binding", phase: "working",
+      }],
+    },
+    detail,
+  };
+  let observation: typeof C.WorkerObservation.Type = {
+    state: "last_observation", owner, revision: 1, observedAt: 1,
+  };
+  const observations = yield* SubscriptionRef.make<typeof C.WorkerObservation.Type>(observation);
+  const holds = new Map<"list" | "detail" | "action", {
+    started: Deferred.Deferred<void>;
+    reply: Deferred.Deferred<void, C.ProviderWorkersError>;
+  }>();
+  const holdNext = Effect.fn(function* (kind: "list" | "detail" | "action") {
+    const started = yield* Deferred.make<void>();
+    const reply = yield* Deferred.make<void, C.ProviderWorkersError>();
+    holds.set(kind, { started, reply });
+    return { started, reply };
+  });
+  const hold = async (kind: "list" | "detail" | "action") => {
+    const gate = holds.get(kind);
+    if (!gate) return;
+    holds.delete(kind);
+    // Reject with the public error, rather than runPromise's FiberFailure wrapper.
+    const exit = await Effect.runPromise(
+      Deferred.succeed(gate.started, undefined).pipe(Effect.andThen(Deferred.await(gate.reply)), Effect.result),
+    );
+    if (exit._tag === "Failure") throw exit.failure;
+  };
   const receipts = new Map<number, NativeStatus>();
   const client: NativeClient = {
     owner,
@@ -103,61 +144,50 @@ export const workerPanelFixture = Effect.gen(function* () {
     lease: { clientId: "lease", resumeToken: "private-test-only", highWater: 0 },
     list: async () => {
       calls.list++;
-      return {
-        owner,
-        revision: 1,
-        cursor: null,
-        items: [
-          {
-            id: "worker",
-            kind: "background",
-            roleId: "developer",
-            status: "running",
-            task: "fixture task",
-            readRef: ref,
-            source: "agent_spawn",
-            selectedModel: "selected",
-            requestedModel: "requested",
-            requestedReasoning: "high",
-            sdkRequest: null,
-            acceptedAt: 1,
-            activity: "observed_binding",
-            phase: "working",
-          },
-        ],
-      };
+      const snapshot = data.roster;
+      await hold("list");
+      return snapshot;
     },
     detail: async (_id, next) => {
       calls.detail.push(next);
+      const snapshot = data.detail;
+      await hold("detail");
       if (policy.detailBusy) throw new BridgeError("busy", "fixture pre-admission detail busy");
       if (next && policy.invalidCursor)
         throw new C.ProviderWorkersError({ code: "invalid_cursor" });
       return next && "section" in next && next.section === "detail_metadata"
         ? {
-            ...detail,
+            ...snapshot,
             metadata: { text: ' continuation"}', offset: 1024, nextOffset: null },
             nextMetadata: null,
           }
         : next
           ? {
-              ...detail,
+              ...snapshot,
               workbrief: {
-                ...detail.workbrief,
+                ...snapshot.workbrief,
+                source: "invocation task",
                 text: "brief continuation",
                 offset: 1024,
                 nextOffset: null,
               },
               nextBrief: null,
             }
-          : detail;
+          : { ...snapshot, controls: { ...snapshot.controls, selection } };
     },
-    requests: async () => ({
+    requests: async () => {
+      calls.requests++;
+      return ({
       state: "ready",
       ref,
       page: { text: "{}", offset: 0, nextOffset: null },
       next: null,
-    }),
-    activity: async () => ({ state: "unavailable", reason: "not_captured" }),
+      });
+    },
+    activity: async () => {
+      calls.activity++;
+      return { state: "unavailable", reason: "not_captured" };
+    },
     result: async (_ref, next) => {
       calls.result.push(next);
       return {
@@ -186,7 +216,9 @@ export const workerPanelFixture = Effect.gen(function* () {
             : cursor("result_metadata"),
       };
     },
-    historyList: async () => ({
+    historyList: async () => {
+      calls.historyList++;
+      return ({
       items: [
         {
           kind: "member",
@@ -199,7 +231,8 @@ export const workerPanelFixture = Effect.gen(function* () {
       ],
       diagnostics: [],
       cursor: null,
-    }),
+      });
+    },
     historyRead: async () => {
       calls.history++;
       return {
@@ -232,6 +265,7 @@ export const workerPanelFixture = Effect.gen(function* () {
     },
     input: async (_selection, input, sequence) => {
       calls.effects.push(input);
+      await hold("action");
       if (policy.actionBusy) throw new BridgeError("busy", "fixture native envelope busy");
       if (policy.actionError) throw new BridgeError(policy.actionError, "fixture native request rejection");
       const status: NativeStatus = {
@@ -253,6 +287,7 @@ export const workerPanelFixture = Effect.gen(function* () {
     },
     cancel: async (_selection, sequence) => {
       calls.effects.push("cancel");
+      await hold("action");
       const status: NativeStatus = {
         state: "recorded",
         sequence,
@@ -287,15 +322,12 @@ export const workerPanelFixture = Effect.gen(function* () {
     },
     pending: false,
     ceilings: { history: true, route: true, control: true },
-    observation: { state: "last_observation", owner, revision: 1, observedAt: 1 },
+    get observation() { return observation; },
     observations: Stream.unwrap(
       Effect.acquireRelease(
         Effect.sync(() => {
           calls.liveObservations++;
-          return Stream.concat(
-            Stream.make({ state: "last_observation", owner, revision: 1, observedAt: 1 } as const),
-            Stream.never,
-          );
+          return SubscriptionRef.changes(observations);
         }),
         () =>
           Effect.sync(() => {
@@ -469,5 +501,8 @@ export const workerPanelFixture = Effect.gen(function* () {
   );
   const registry = AtomRegistry.make();
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
-  return { target, calls, policy, workers, registry, sessionRef };
+  return { target, calls, policy, workers, registry, sessionRef, data, owner, holdNext,
+    notify: (next: typeof C.WorkerObservation.Type) => Effect.sync(() => { observation = next; })
+      .pipe(Effect.andThen(SubscriptionRef.set(observations, next))),
+  };
 });

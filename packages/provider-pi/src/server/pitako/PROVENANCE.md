@@ -1,5 +1,5 @@
 Client-only snapshot from Pitako, revision
-`7d656fbd66d68ee8a814c42b18befe546d7c68e3` (MIT; see LICENSE).
+`2632ad8449abae924fa508930bddd6d5881e2b21` (MIT; see LICENSE).
 
 The six files below `extensions/agent/` are copied without modification, preserving
 the bridge client's relative framing imports. They have no Pi extension or
