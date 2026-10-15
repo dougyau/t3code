@@ -29,6 +29,7 @@ const decodePiChecklistSelectionPointer = Schema.decodeUnknownSync(PiChecklistSe
 const decodePiChecklistCapture = Schema.decodeUnknownSync(PiChecklistCapture);
 import { resolveUserMessagePresentation } from "@t3tools/client-runtime/user-message";
 import { summarizeToolGroup } from "@t3tools/client-runtime/work-log/presentation";
+import { nativeWorkerRecordFixture } from "@t3tools/client-runtime/testing/nativeWorker";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -228,6 +229,33 @@ function assistantMessage(updatedAt = "2026-06-20T00:00:03.000Z") {
 }
 
 describe("buildThreadFeed", () => {
+  it("keeps omitted native IDs reserved across cached visibility changes", () => {
+    const item = { ...assistantMessage(), text: " \n ", nativeWorkerRecord: nativeWorkerRecordFixture() };
+    const hiddenRow = projected(item, 0);
+    const sameId = {
+      id: item.messageId, role: "assistant" as const, text: "stale local", turnId: null,
+      streaming: false, createdAt: "2026-06-20T00:00:03.000Z", updatedAt: "2026-06-20T00:00:03.000Z",
+    };
+    const options = { anchoredMessages: [sameId, { ...sameId, id: MessageId.make("unrelated") }] };
+    const hidden = buildThreadFeed([hiddenRow], options);
+    expect(hidden.map((entry) => entry.id)).toEqual(["unrelated"]);
+    expect(buildThreadFeed([hiddenRow], options)).toEqual(hidden);
+
+    const visibleRow = projected({ ...item, text: "[T3 notice] The response failed." }, 0);
+    const visible = buildThreadFeed([visibleRow], options);
+    expect(visible.map((entry) => entry.id)).toEqual([item.messageId, "unrelated"]);
+    expect(visible[0]).toMatchObject({ message: { text: "[T3 notice] The response failed." } });
+    expect(buildThreadFeed([visibleRow], options)[0]).toBe(visible[0]);
+    expect(buildThreadFeed([hiddenRow], options)).toEqual(hidden);
+
+    const withAttachment = { ...item,
+      attachments: [{ id: "image", type: "image" as const, name: "image.png", mimeType: "image/png", sizeBytes: 1 }] };
+    expect(buildThreadFeed([projected(withAttachment, 0)]).map((entry) => entry.id)).toEqual([item.messageId]);
+    // Mobile already filters ordinary empty messages; this change must not broaden that rule.
+    expect(buildThreadFeed([projected({ ...item, nativeWorkerRecord: undefined }, 0)])).toEqual([]);
+    expect(buildThreadFeed([projected({ ...item, streaming: true }, 0)])).toEqual([]);
+  });
+
   it("keeps async answers in question history instead of user bubbles", () => {
     const requestId = RuntimeRequestId.make("question");
     const question: OrchestrationV2TurnItem = {

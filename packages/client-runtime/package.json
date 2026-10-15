@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./native-worker-message": {
+      "types": "./src/nativeWorkerMessage.ts",
+      "default": "./src/nativeWorkerMessage.ts"
+    },
     "./testing/nativeWorker": {
       "types": "./src/testing/nativeWorker.ts",
       "default": "./src/testing/nativeWorker.ts"

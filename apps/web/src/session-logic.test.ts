@@ -47,8 +47,46 @@ import {
 } from "./session-logic";
 import { makeStreamingTimelineFixture, makeThreadProjectionFixture } from "./test-fixtures";
 import type { ChatMessage } from "./types";
+import { nativeWorkerRecordFixture } from "@t3tools/client-runtime/testing/nativeWorker";
 
 describe("V2 session presentation", () => {
+  it("omits historical empty native messages without letting local copies resurrect them", () => {
+    const fixture = makeStreamingTimelineFixture();
+    const row = fixture.visibleTurnItems.find(({ item }) => item.type === "assistant_message")!;
+    if (row.item.type !== "assistant_message") throw new Error("Expected assistant fixture");
+    const item = { ...row.item, text: " \n ", streaming: false, nativeWorkerRecord: nativeWorkerRecordFixture() };
+    const local: ChatMessage = {
+      id: item.messageId, role: "assistant", text: "stale local copy", streaming: false,
+      runId: item.runId,
+      createdAt: DateTime.formatIso(item.updatedAt), updatedAt: DateTime.formatIso(item.updatedAt),
+    };
+    const input = {
+      visibleTurnItems: [{ ...row, item }],
+      anchoredMessages: [local, { ...local, id: MessageId.make("unrelated"), text: "local feedback" }],
+      optimisticMessages: [local],
+    };
+    const hidden = deriveTimelineEntriesFromVisibleTurnItemsWithState(input);
+    expect(hidden.entries.map((entry) => entry.id)).toEqual(["unrelated"]);
+    expect(deriveTimelineEntriesFromVisibleTurnItems(input)).toEqual(hidden.entries);
+    const visibleInput = {
+      ...input, visibleTurnItems: [{ ...row, item: { ...item, text: "Final response" } }],
+    };
+    const visible = deriveTimelineEntriesFromVisibleTurnItemsWithState(visibleInput, hidden);
+    expect(visible.entries.map((entry) => entry.id)).toEqual([item.messageId, "unrelated"]);
+    expect(visible.entries).toEqual(deriveTimelineEntriesFromVisibleTurnItems(visibleInput));
+    expect(deriveTimelineEntriesFromVisibleTurnItemsWithState(input, visible).entries).toEqual(hidden.entries);
+
+    for (const preserved of [
+      { ...item, nativeWorkerRecord: undefined },
+      { ...item, streaming: true },
+      { ...item, attachments: [{ id: "image", type: "image", name: "image.png", mimeType: "image/png", sizeBytes: 1 }] },
+    ]) {
+      expect(deriveTimelineEntriesFromVisibleTurnItems({
+        visibleTurnItems: [{ ...row, item: preserved }], optimisticMessages: [],
+      }).map((entry) => entry.id)).toEqual([item.messageId]);
+    }
+  });
+
   it("uses run status as the settlement boundary", () => {
     const runId = RunId.make("run-1");
     expect(

@@ -1,4 +1,5 @@
 import { resolveThreadWorkingStartedAt } from "@t3tools/client-runtime/state/models";
+import { shouldOmitNativeWorkerMessage } from "@t3tools/client-runtime/native-worker-message";
 import {
   type AssetResource,
   type OrchestrationV2ExecutionNode,
@@ -666,6 +667,8 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
       continue;
     }
     if (item.type === "user_message" || item.type === "assistant_message") {
+      committedMessageIds.add(item.messageId);
+      if (shouldOmitNativeWorkerMessage(item)) continue;
       const message: ChatMessage = {
         id: item.messageId,
         role: item.type === "user_message" ? "user" : "assistant",
@@ -695,7 +698,6 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
         updatedAt: DateTime.formatIso(item.updatedAt),
         ...(item.type === "user_message" ? { inputIntent: item.inputIntent } : {}),
       };
-      committedMessageIds.add(message.id);
       entries.push({
         id: message.id,
         kind: "message",
