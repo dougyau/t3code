@@ -2,6 +2,7 @@ import { act, cloneElement, type ReactElement, type ReactNode } from "react";
 import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import {
   EnvironmentId,
+  NodeId,
   ThreadId,
   type ModelSelection,
   type ProviderOptionDescriptor,
@@ -59,6 +60,13 @@ vi.mock("../ui/tooltip", () => ({
 }));
 
 import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
+import {
+  nativeSubagentFixture,
+  nativeWorkerFixture,
+} from "@t3tools/client-runtime/testing/nativeWorker";
+import { registerTimelinePositionReader } from "./timelineScrollAnchoring";
+import { scopedThreadKey } from "@t3tools/client-runtime/environment";
+import { ProviderSubagentBar } from "./ProviderSubagentBar";
 
 let renderer: ReactTestRenderer;
 
@@ -74,6 +82,135 @@ afterEach(async () => {
   state.workflowCommand.mockReset().mockResolvedValue({ _tag: "Success" });
   state.toast.mockClear();
   state.projection = null;
+});
+
+it("keeps native assignments under their coordinator and navigates public child threads without controls", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  state.showTooltips = true;
+  const team = nativeSubagentFixture();
+  const launch = team.nativeWorker!.launch;
+  if (launch.source !== "team_assign") throw new Error("Expected Team fixture");
+  const independent = nativeSubagentFixture({
+    id: NodeId.make("independent"),
+    childThreadId: ThreadId.make("independent-chat"),
+    title: "Independent worker",
+    nativeWorker: nativeWorkerFixture({
+      launch: { ...launch, source: "agent_spawn", instanceId: "independent" },
+      roleId: "developer",
+      availability: "ready",
+      execution: "running",
+      capture: "closed",
+    }),
+  });
+  state.projection = {
+    thread: { id: "parent", lineage: { relationshipToParent: null } },
+    runs: [{ id: "newer-run", status: "running" }],
+    providerThreads: [],
+    providerSessions: [],
+    contextTransfers: [],
+    subagents: [team, independent],
+  };
+  state.shells = [team, independent].map((agent) => ({
+    environmentId: "remote",
+    source: {
+      id: agent.childThreadId,
+      title: agent.title,
+      lineage: { parentThreadId: "parent", relationshipToParent: "subagent" },
+    },
+  }));
+  const retained = vi.fn();
+  const unregister = registerTimelinePositionReader(
+    scopedThreadKey({
+      environmentId: EnvironmentId.make("remote"),
+      threadId: ThreadId.make("parent"),
+    }),
+    retained,
+  );
+  state.navigate.mockImplementation(() => expect(retained).toHaveBeenCalledOnce());
+  try {
+    await act(async () => {
+      renderer = create(
+        <ThreadRelationshipsPanel
+          environmentId={EnvironmentId.make("remote")}
+          threadId={ThreadId.make("parent")}
+        />,
+      );
+    });
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).toContain("Team assignments");
+    expect(text).toContain("reviewer · Assignment assignment-review");
+    expect(text).toContain(
+      "Execution completed · Capture open · Availability unavailable · Result available",
+    );
+    expect(text).toContain("gpt-effective");
+    expect(text).not.toContain("requested-not-effective");
+    expect(
+      renderer.root.findAll(
+        (node) =>
+          node.type === "button" &&
+          /Stop |Cancel |Steer |Query /.test(node.props["aria-label"] ?? ""),
+      ),
+    ).toHaveLength(0);
+    const link = renderer.root
+      .findAll(
+        (node) => node.type === "button" && node.props["aria-label"] === "Open Review worker",
+      )
+      .at(0);
+    expect(link).toBeDefined();
+    await act(async () => link!.props.onClick());
+    expect(state.navigate).toHaveBeenCalledWith({
+      to: "/$environmentId/$threadId",
+      params: { environmentId: "remote", threadId: "worker-chat" },
+    });
+    expect(state.command).not.toHaveBeenCalled();
+    expect(state.workflowCommand).not.toHaveBeenCalled();
+  } finally {
+    unregister();
+    state.navigate.mockReset();
+  }
+});
+
+it("shows the selected worker checklist read-only, clears it when unavailable and returns to the parent", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const parent = vi.fn();
+  const props = {
+    provider: null,
+    showInstanceBadge: false,
+    modelLabel: "requested-not-effective",
+    effortLabel: null,
+    status: null,
+    nativeWorker: nativeWorkerFixture(),
+    onOpenParent: parent,
+  };
+  await act(async () => {
+    renderer = create(
+      <ProviderSubagentBar
+        {...props}
+        tasksProgress={{ step: "Verify result", completedSteps: 1, totalSteps: 2 }}
+        taskSteps={[
+          { step: "Inspect public output", status: "completed" },
+          { step: "Verify result", status: "inProgress" },
+        ]}
+      />,
+    );
+  });
+  const buttons = renderer.root.findAllByType("button");
+  const checklist = buttons.find((button) => button.props["aria-expanded"] === false);
+  expect(checklist).toBeDefined();
+  await act(async () => checklist!.props.onClick());
+  expect(JSON.stringify(renderer.toJSON())).toContain("Inspect public output");
+  expect(JSON.stringify(renderer.toJSON())).toContain("Verify result");
+  expect(renderer.root.findAllByType("textarea")).toHaveLength(0);
+  expect(renderer.root.findAllByType("input")).toHaveLength(0);
+  await act(async () =>
+    renderer.update(<ProviderSubagentBar {...props} tasksProgress={null} taskSteps={null} />),
+  );
+  expect(JSON.stringify(renderer.toJSON())).not.toContain("Inspect public output");
+  const openParent = renderer.root
+    .findAllByType("button")
+    .find((button) => button.children.includes("Open parent"));
+  await act(async () => openParent!.props.onClick());
+  expect(parent).toHaveBeenCalledOnce();
 });
 
 it("stops the entire native workflow through its parent without changing state before acknowledgement", async () => {

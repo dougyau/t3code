@@ -16,6 +16,7 @@ import {
   type TurnItemId,
 } from "@t3tools/contracts";
 import { extractToolActivityPresentation } from "@t3tools/client-runtime/work-log/tool-presentation";
+import { isPiChecklistPlan, selectCurrentChecklistPlan } from "@t3tools/shared/checklist";
 import {
   classifyToolActivity,
   collectToolFilePaths,
@@ -263,12 +264,24 @@ export function deriveActivePlanState(
   latestRunId: RunId | undefined,
 ): ActivePlanState | null {
   if (projection === null) return null;
-  const plans = projection.plans.filter((plan) => plan.kind === "todo_list");
+  const activeProviderThread =
+    projection.providerThreads.find(
+      (thread) => thread.id === projection.thread.activeProviderThreadId,
+    ) ?? null;
+  const pointed = selectCurrentChecklistPlan({
+    plans: projection.plans,
+    activeProviderThread,
+  });
+  const plans = projection.plans.filter(
+    (plan) => plan.kind === "todo_list" && !isPiChecklistPlan(plan),
+  );
   const plan =
-    [...plans].toReversed().find((candidate) => candidate.runId === latestRunId) ??
-    plans.at(-1) ??
-    null;
-  if (plan === null || plan.steps.length === 0) return null;
+    pointed !== undefined
+      ? pointed
+      : ([...plans].toReversed().find((candidate) => candidate.runId === latestRunId) ??
+        plans.at(-1) ??
+        null);
+  if (plan === null || plan.kind !== "todo_list" || plan.steps.length === 0) return null;
   return {
     createdAt: planItemTime(projection, plan.id),
     runId: plan.runId,
@@ -276,7 +289,7 @@ export function deriveActivePlanState(
     steps: plan.steps.map(({ text, status, durationMs }) => ({
       step: text,
       status: status === "running" ? "inProgress" : status,
-      ...(durationMs === undefined ? {} : { durationMs }),
+      ...(isPiChecklistPlan(plan) || durationMs === undefined ? {} : { durationMs }),
     })),
   };
 }

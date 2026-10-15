@@ -77,10 +77,6 @@ it.effect("puts linked source control context in the Pi thread title prompt", ()
       yield* decodePiSettings({
         enabled: true,
         binaryPath: "pi",
-        workerBridge: true,
-        workerHistory: true,
-        workerRoute: true,
-        workerControl: true,
       }),
       {},
     ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, pi.spawner));

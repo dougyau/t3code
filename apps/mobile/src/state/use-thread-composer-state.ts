@@ -271,6 +271,17 @@ export function useThreadComposerState() {
       anchoredMessages: pendingCreation,
       attempts: selectedThreadAttempts,
       nodes: selectedThreadNodes,
+      checklist: selectedThreadProjection
+        ? {
+            plans: selectedThreadProjection.projection.plans,
+            turnItems: selectedThreadProjection.projection.turnItems,
+            activeProviderThread:
+              selectedThreadProjection.projection.providerThreads.find(
+                (thread) =>
+                  thread.id === selectedThreadProjection.projection.thread.activeProviderThreadId,
+              ) ?? null,
+          }
+        : undefined,
     });
     const pendingAcknowledgments = acknowledgedMessages.filter(
       (message) =>
@@ -286,6 +297,7 @@ export function useThreadComposerState() {
     selectedThreadAttempts,
     selectedThreadNodes,
     selectedThreadVisibleTurnItems,
+    selectedThreadProjection,
     pendingCreationMessage,
     selectedThreadKey,
     selectedThreadQueuedMessages,
@@ -320,7 +332,9 @@ export function useThreadComposerState() {
   const canSteerActiveTurn = queueWorkflow?.canPromoteToSteer === true;
   const queuedRunEdit = useQueuedRunEdit(selectedThreadKey);
   const composerDraftKey =
-    selectedThreadKey === null
+    selectedThreadKey === null ||
+    (selectedThreadShell?.source.creationSource === "provider" &&
+      selectedThreadShell.source.lineage.relationshipToParent === "subagent")
       ? null
       : queuedRunEdit === null
         ? selectedThreadKey

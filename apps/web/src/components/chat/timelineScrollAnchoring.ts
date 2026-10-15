@@ -160,6 +160,19 @@ export interface RememberedTimelinePosition {
 
 // Scoped thread keys keep separate environments independent. Bound the session cache.
 const rememberedTimelinePositions = new Map<string, RememberedTimelinePosition>();
+const timelinePositionReaders = new Map<string, () => void>();
+
+/** Capture synchronously before routing, while the outgoing list still owns its DOM. */
+export function retainTimelinePosition(threadKey: string) {
+  timelinePositionReaders.get(threadKey)?.();
+}
+
+export function registerTimelinePositionReader(threadKey: string, read: () => void) {
+  timelinePositionReaders.set(threadKey, read);
+  return () => {
+    if (timelinePositionReaders.get(threadKey) === read) timelinePositionReaders.delete(threadKey);
+  };
+}
 
 export function readTimelinePosition(threadKey: string) {
   return rememberedTimelinePositions.get(threadKey);

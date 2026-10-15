@@ -1,5 +1,9 @@
 import * as Option from "effect/Option";
-import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+import type {
+  EnvironmentThreadShell,
+  ThreadRunSummary,
+  ThreadRuntimeSummary,
+} from "@t3tools/client-runtime/state/shell";
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
   type AssetCreateUrlInput,
@@ -12,6 +16,7 @@ import {
   type MessageId,
   type ModelSelection,
   type OrchestrationV2ProjectedTurnItem,
+  type OrchestrationV2ThreadProjection,
   type PreviewAnnotationPayload,
   type ProviderInteractionMode,
   ProviderDriverKind,
@@ -57,7 +62,12 @@ import { stripInlineContextReferences } from "~/lib/composerContextReferences";
 import type { DraftThreadEnvMode } from "../composerDraftStore";
 import { collapseExpandedComposerCursor, type ComposerSubmissionIntent } from "../composer-logic";
 import type { ReviewCommentContext } from "../reviewCommentContext";
-import { derivePhase, type TimelineEntry } from "../session-logic";
+import {
+  deriveActivePlanState,
+  derivePhase,
+  isLatestRunSettled,
+  type TimelineEntry,
+} from "../session-logic";
 import type { PreviewMiniPlayerSource } from "../previewMiniPlayerStore";
 import type { DesktopPreviewOverlay } from "../previewStateStore";
 import type { RightPanelSurface } from "../rightPanelStore";
@@ -71,6 +81,23 @@ export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "t3code:last-invoked-script-by
 export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 
 export const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
+
+/** Pi's selected checklist belongs to the conversation; other plans belong to a run. */
+export function deriveVisibleComposerPlan(
+  projection: OrchestrationV2ThreadProjection | null,
+  latestRun: Pick<ThreadRunSummary, "runId" | "startedAt" | "completedAt" | "status"> | null,
+  runtime: Pick<ThreadRuntimeSummary, "status" | "activeRunId"> | null,
+) {
+  const plan = deriveActivePlanState(projection, latestRun?.runId);
+  if (plan === null) return null;
+  const providerThread = projection?.providerThreads.find(
+    (thread) => thread.id === projection.thread.activeProviderThreadId,
+  );
+  if (providerThread?.driver === "pi" && plan.runId === null) return plan;
+  return isLatestRunSettled(latestRun, runtime) || plan.runId !== (latestRun?.runId ?? null)
+    ? null
+    : plan;
+}
 
 export function agentControlledBrowserCloseConfirmation(
   surfaces: readonly RightPanelSurface[],

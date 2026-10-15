@@ -107,7 +107,7 @@ import {
   clearThreadComposerError,
   threadComposerErrorsAtom,
 } from "../../state/thread-composer-error";
-import { threadEnvironment } from "../../state/threads";
+import { threadEnvironment, useEnvironmentThread } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useDelayedStatus } from "../../lib/useDelayedStatus";
 import type {
@@ -144,6 +144,8 @@ import {
 import { ComposerPopoverHost } from "./ComposerPopoverHost";
 import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
 import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
+import { readThreadReadingPosition } from "./thread-reading-position";
+import * as Option from "effect/Option";
 import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
 import { useThreadQueuedCount } from "./ThreadQueueControl";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
@@ -423,6 +425,13 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const composerEditorRef = useRef<ComposerEditorHandle>(null);
   // A provider-native subagent shows status instead of a composer.
   const isProviderSubagent = isProviderNativeSubagentThread(props.selectedThread.source);
+  const parentThread = useEnvironmentThread(
+    props.environmentId,
+    props.selectedThread.lineage.parentThreadId,
+  );
+  const nativeWorker = Option.getOrNull(parentThread.data)?.subagents.find(
+    (agent) => agent.childThreadId === props.selectedThread.id,
+  )?.nativeWorker;
   // Entering edit mode from the queue sheet should land in a ready composer,
   // not require a second tap on a composer already holding the message.
   const editingRunId = props.queuedRunEdit?.runId ?? null;
@@ -947,7 +956,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     setAnchorMessageId(null);
     setSubmittedMessageId(null);
     lastScrolledSubmittedMessageIdRef.current = null;
-    setEndFollowEnabled(true);
+    setEndFollowEnabled(readThreadReadingPosition(selectedThreadKey)?.follow ?? true);
     freeze.set(false);
   }, [freeze, selectedThreadKey]);
 
@@ -1412,6 +1421,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                           reportedModelSelection,
                         )}
                         status={props.providerSubagentStatus ?? null}
+                        nativeWorker={nativeWorker}
                         onOpenParent={
                           props.selectedThread.lineage.parentThreadId === null
                             ? null

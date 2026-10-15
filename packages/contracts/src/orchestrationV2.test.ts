@@ -30,8 +30,19 @@ import {
   OrchestrationV2LimitRecoveryUpdate,
   OrchestrationV2DomainEvent,
   OrchestrationV2ProviderCapabilities,
+  OrchestrationV2PlanArtifact,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderThreadJson,
+  PiChecklistCapture,
+  PiChecklistSelectionPointer,
+  PiNativeWorkerLaunch,
+  PiNativeWorkerSummary,
+  PiNativeWorkerCheckpoint,
+  PiNativeWorkerRecordProvenance,
+  OrchestrationV2ProviderThreadNativeMetadata,
+  applyChecklistPointerWrite,
+  mergeChecklistSelectionMetadata,
+  pointerFromCapture,
   OrchestrationV2RpcSchemas,
   OrchestrationV2ShellSnapshot,
   OrchestrationV2SubscribeThreadInput,
@@ -127,6 +138,13 @@ const encodeOrchestrationV2ProviderThreadJson = Schema.encodeSync(
   OrchestrationV2ProviderThreadJson,
 );
 const decodeOrchestrationV2ProviderThread = Schema.decodeUnknownSync(OrchestrationV2ProviderThread);
+const decodePiChecklistCapture = Schema.decodeUnknownSync(PiChecklistCapture);
+const decodePiChecklistSelectionPointer = Schema.decodeUnknownSync(PiChecklistSelectionPointer);
+const decodePiNativeWorkerLaunch = Schema.decodeUnknownSync(PiNativeWorkerLaunch);
+const decodePiNativeWorkerSummary = Schema.decodeUnknownSync(PiNativeWorkerSummary);
+const decodePiNativeWorkerCheckpoint = Schema.decodeUnknownSync(PiNativeWorkerCheckpoint);
+const decodePiNativeWorkerRecordProvenance = Schema.decodeUnknownSync(PiNativeWorkerRecordProvenance);
+const decodeOrchestrationV2PlanArtifact = Schema.decodeUnknownSync(OrchestrationV2PlanArtifact);
 const decodeOrchestrationV2ThreadShell = Schema.decodeUnknownSync(OrchestrationV2ThreadShell);
 const decodeOrchestrationV2ProviderCapabilities = Schema.decodeUnknownSync(
   OrchestrationV2ProviderCapabilities,
@@ -926,9 +944,59 @@ describe("orchestration V2 contracts", () => {
     expect(subagent.origin).toBe("provider_native");
     expect(subagent.progress).toBe("Inspecting package metadata");
     expect(subagent.childThreadId).toBeNull();
+    expect(subagent.nativeWorker).toBeUndefined();
+    expect(turnItem.nativeWorkerLaunch).toBeUndefined();
+    expect(turnItem.nativeWorkerRecord).toBeUndefined();
     expect(turnItem.type).toBe("subagent");
     if (turnItem.type !== "subagent") throw new Error("expected subagent item");
     expect(turnItem.progress).toBe("Inspecting package metadata");
+    const launch = decodePiNativeWorkerLaunch({
+      source: "team_assign", instanceId: "worker", assignmentId: "assignment", roleId: "researcher",
+      providerInstanceId: "pi", providerSessionId: "session",
+      parentThreadId: "thread-1", parentProviderThreadId: "parent-thread", parentProviderTurnId: "parent-turn",
+      runId: "run-1", runAttemptId: "attempt", toolNodeId: "tool-node", coordinatorSessionId: "native-session", toolCallId: "tool-call",
+    });
+    const summary = decodePiNativeWorkerSummary({
+      launch, capture: "open", availability: "ready", gaps: [], execution: "running",
+      selected: { model: "requested", reasoning: "high" }, activated: null,
+    });
+    const enriched = { ...subagent, nativeWorker: summary };
+    const subagentJson = Schema.fromJsonString(OrchestrationV2SubagentJson);
+    expect(Schema.decodeUnknownSync(subagentJson)(Schema.encodeSync(subagentJson)(enriched))).toEqual(enriched);
+    const provenance = decodePiNativeWorkerRecordProvenance({
+      instanceId: "worker", owner: { processId: "process", coordinatorSessionId: "native-session", epoch: "owner" },
+      captureEpoch: "capture", id: "start-record", binding: 0, revision: 5, sequence: 1,
+      order: 0, nativeOrder: null, occurredAt: null, observedAt: 1, nativeTime: null,
+      nativeEntryId: null, parentEntryId: null, toolCallId: "same-logical-tool",
+    });
+    const enrichedItem = { ...turnItem, nativeWorkerLaunch: launch,
+      nativeWorkerRecords: [provenance, { ...provenance, id: "result-record", revision: 1 }] };
+    const itemJson = Schema.fromJsonString(OrchestrationV2TurnItemJson);
+    expect(Schema.decodeUnknownSync(itemJson)(Schema.encodeSync(itemJson)(enrichedItem))).toEqual(enrichedItem);
+  });
+
+  it("round-trips fragment restart and omissions without persisting partial transcript bytes", () => {
+    const launch = decodePiNativeWorkerLaunch({
+      source: "agent_spawn", instanceId: "worker",
+      providerInstanceId: "pi", providerSessionId: "session",
+      parentThreadId: "thread", parentProviderThreadId: "parent-thread", parentProviderTurnId: "parent-turn",
+      runId: "run", runAttemptId: "attempt", toolNodeId: "tool-node", coordinatorSessionId: "native-session", toolCallId: "tool-call",
+    });
+    const fragment = { id: "record", binding: 0, revision: 2, epoch: "capture", sequence: 1, totalBytes: 65536, cursor: "fragment-start" };
+    const checkpoint = decodePiNativeWorkerCheckpoint({
+      launch, owner: { processId: "process", coordinatorSessionId: "native-session", epoch: "owner" },
+      ownerGeneration: 1, captureEpoch: "capture", bindings: [], bindingGeneration: 0,
+      bindingCursors: [{ generation: 0, cursor: "fragment-start", cut: 1, recovery: false, more: false, fragment, omission: "invalid_record" }],
+      cursor: "fragment-start", cut: 1, recovery: false, capture: "incomplete", finalSequence: null, fragment, gaps: ["invalid_record"],
+    });
+    const codec = Schema.fromJsonString(OrchestrationV2ProviderThreadNativeMetadata);
+    const metadata = { nativeWorkerCheckpoint: checkpoint };
+    const stored = Schema.encodeSync(codec)(metadata);
+    expect(Schema.decodeUnknownSync(codec)(stored)).toEqual(metadata);
+    expect(stored).not.toContain("chunks");
+    expect(Schema.decodeUnknownSync(codec)("{}").nativeWorkerCheckpoint).toBeUndefined();
+    expect(() => decodePiNativeWorkerLaunch({ ...launch, source: "agent_run" })).toThrow();
+    expect(() => decodePiNativeWorkerCheckpoint({ ...checkpoint, ownerGeneration: -1 })).toThrow();
   });
 
   it.each(["  indented prompt\n", "\n \t\n"])(
@@ -1270,6 +1338,262 @@ describe("orchestration V2 contracts", () => {
     expect(runtimeThread.pendingBackgroundTasks).toEqual([]);
     expect(runtimeThread.contextUsage).toBeNull();
     expect(runtimeThread.nativeMetadata).toBeNull();
+  });
+
+  it("round-trips a checklist pointer on Type and JSON codecs and keeps legacy todo lists", () => {
+    const pointer = decodePiChecklistSelectionPointer({
+      state: "ready",
+      list: { threadId: "thread-1", providerInstanceId: "pi", nativeSessionId: "session-a" },
+      ownerGeneration: 1,
+      sessionGeneration: 2,
+      captureVersion: 3,
+      sourceEntryId: "entry-1",
+      planId: "plan-1",
+    });
+    const providerThread = decodeOrchestrationV2ProviderThreadJson(
+      encodeOrchestrationV2ProviderThreadJson(
+        decodeOrchestrationV2ProviderThreadJson({
+          id: "provider-thread-pi",
+          driver: "pi",
+          providerInstanceId: "pi",
+          providerSessionId: null,
+          appThreadId: "thread-1",
+          ownerNodeId: null,
+          nativeThreadRef: null,
+          nativeConversationHeadRef: null,
+          status: "idle",
+          firstRunOrdinal: null,
+          lastRunOrdinal: null,
+          handoffIds: [],
+          forkedFrom: null,
+          nativeMetadata: { checklistSelection: pointer },
+          createdAt: "2026-04-20T00:00:00.000Z",
+          updatedAt: "2026-04-20T00:00:00.000Z",
+        }),
+      ),
+    );
+    expect(providerThread.nativeMetadata?.checklistSelection).toEqual(pointer);
+
+    const legacyPlan = {
+      id: "plan-legacy",
+      threadId: "thread-1",
+      runId: "run-1",
+      nodeId: "node-1",
+      kind: "todo_list",
+      status: "active",
+      steps: [{ id: "step-1", text: "Verify", status: "pending" }],
+    };
+    expect(decodeOrchestrationV2PlanArtifact(legacyPlan)).toMatchObject({ kind: "todo_list" });
+    expect(decodeOrchestrationV2PlanArtifact(legacyPlan)).not.toHaveProperty(
+      "piChecklistProvenance",
+    );
+    const legacyItem = decodeOrchestrationV2TurnItemJson({
+      id: "item-1",
+      threadId: "thread-1",
+      runId: "run-1",
+      nodeId: "node-1",
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 0,
+      status: "completed",
+      title: null,
+      startedAt: "2026-04-20T00:00:00.000Z",
+      completedAt: "2026-04-20T00:00:00.000Z",
+      updatedAt: "2026-04-20T00:00:00.000Z",
+      type: "todo_list",
+      planId: "plan-legacy",
+      steps: [{ id: "step-1", text: "Verify", status: "pending" }],
+    });
+    expect(legacyItem).toMatchObject({ type: "todo_list" });
+    expect(legacyItem).not.toHaveProperty("piChecklistProvenance");
+  });
+
+  it("accepts a capture only when the expected pointer matches and rejects an older version", () => {
+    const capture = decodePiChecklistCapture({
+      list: { threadId: "thread-1", providerInstanceId: "pi", nativeSessionId: "session-a" },
+      ownerGeneration: 1,
+      sessionGeneration: 1,
+      captureVersion: 2,
+      expectedPointer: { kind: "absent" },
+      authority: "capture",
+      source: { state: "ready", sourceEntryId: "entry-1", tasks: [] },
+    });
+    const first = applyChecklistPointerWrite(undefined, { kind: "capture", capture });
+    expect(first.accepted).toBe(true);
+    const stale = applyChecklistPointerWrite(first.pointer, {
+      kind: "capture",
+      capture: decodePiChecklistCapture({
+        ...capture,
+        captureVersion: 1,
+        expectedPointer: { kind: "current", pointer: first.pointer },
+      }),
+    });
+    expect(stale).toEqual({ accepted: false, pointer: first.pointer });
+    expect(
+      applyChecklistPointerWrite(first.pointer, {
+        kind: "capture",
+        capture: {
+          ...capture,
+          expectedPointer: { kind: "current", pointer: first.pointer },
+          source: { ...capture.source, sourceEntryId: "different-selection-same-version" },
+        },
+      }),
+    ).toEqual({ accepted: false, pointer: first.pointer });
+    const ordinary = mergeChecklistSelectionMetadata(
+      { checklistSelection: first.pointer, title: "old" },
+      {
+        title: "new",
+        checklistSelection: pointerFromCapture(
+          decodePiChecklistCapture({ ...capture, captureVersion: 9 }),
+        ),
+      },
+      { kind: "ordinary" },
+    );
+    expect(ordinary).toEqual({ title: "new", checklistSelection: first.pointer });
+    const reset = applyChecklistPointerWrite(first.pointer, {
+      kind: "session_reset",
+      capture: decodePiChecklistCapture({
+        ...capture,
+        captureVersion: 0,
+        authority: "session_reset",
+        sessionGeneration: 2,
+        expectedPointer: { kind: "current", pointer: first.pointer },
+        list: { ...capture.list, nativeSessionId: "session-b" },
+        source: { state: "unavailable", sourceEntryId: null, tasks: [] },
+      }),
+    });
+    expect(reset.accepted).toBe(true);
+    expect(reset.pointer).toMatchObject({ state: "unavailable", planId: null });
+  });
+
+  it("admits only positive safe native task numbers at the capture boundary", () => {
+    const capture = {
+      list: { threadId: "thread-1", providerInstanceId: "pi", nativeSessionId: "session-a" },
+      ownerGeneration: 1,
+      sessionGeneration: 1,
+      captureVersion: 1,
+      expectedPointer: { kind: "absent" },
+      authority: "capture",
+      source: {
+        state: "ready",
+        sourceEntryId: "entry-a",
+        tasks: [{ id: 1, identityEntryId: "first-life", subject: "Task", status: "pending" }],
+      },
+    };
+    expect(decodePiChecklistCapture(capture).source.tasks[0]?.id).toBe(1);
+    for (const id of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity]) {
+      expect(() =>
+        decodePiChecklistCapture({
+          ...capture,
+          source: { ...capture.source, tasks: [{ ...capture.source.tasks[0], id }] },
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("fences resets by the observed pointer and owner/session generations across native sessions", () => {
+    const initial = decodePiChecklistCapture({
+      list: { threadId: "thread-1", providerInstanceId: "pi", nativeSessionId: "session-a" },
+      ownerGeneration: 2,
+      sessionGeneration: 3,
+      captureVersion: 8,
+      expectedPointer: { kind: "absent" },
+      authority: "capture",
+      source: { state: "ready", sourceEntryId: "entry-a", tasks: [] },
+    });
+    const stored = pointerFromCapture(initial);
+    const reset = decodePiChecklistCapture({
+      ...initial,
+      list: { ...initial.list, nativeSessionId: "session-b" },
+      sessionGeneration: 4,
+      captureVersion: 0,
+      authority: "session_reset",
+      expectedPointer: { kind: "current", pointer: stored },
+      source: { state: "unavailable", sourceEntryId: null, tasks: [] },
+    });
+    const accepted = applyChecklistPointerWrite(stored, { kind: "session_reset", capture: reset });
+    expect(accepted).toEqual({ accepted: true, pointer: pointerFromCapture(reset) });
+    for (const capture of [
+      reset, // A competing reset observed session-a, but session-b has committed.
+      { ...reset, expectedPointer: { kind: "absent" } },
+      {
+        ...reset,
+        expectedPointer: { kind: "current", pointer: accepted.pointer },
+        ownerGeneration: 1,
+      },
+      {
+        ...reset,
+        expectedPointer: { kind: "current", pointer: accepted.pointer },
+        sessionGeneration: 3,
+      },
+      {
+        ...reset,
+        expectedPointer: { kind: "current", pointer: accepted.pointer },
+        ownerGeneration: 3,
+        list: initial.list, // A new owner alone cannot reintroduce an arbitrary old session.
+      },
+      {
+        ...reset,
+        expectedPointer: { kind: "current", pointer: accepted.pointer },
+        ownerGeneration: 1,
+        sessionGeneration: 5,
+        list: initial.list, // Nor can session progress revive a stale owner across sessions.
+      },
+    ]) {
+      expect(
+        applyChecklistPointerWrite(accepted.pointer, {
+          kind: "session_reset",
+          capture: decodePiChecklistCapture(capture),
+        }),
+      ).toEqual({ accepted: false, pointer: accepted.pointer });
+    }
+    // Legitimate next owner/session can restart its local capture version.
+    const nextOwner = decodePiChecklistCapture({
+      ...reset,
+      ownerGeneration: 3,
+      sessionGeneration: 5,
+      list: { ...initial.list, nativeSessionId: "session-c" },
+      expectedPointer: { kind: "current", pointer: accepted.pointer },
+    });
+    expect(
+      applyChecklistPointerWrite(accepted.pointer, {
+        kind: "session_reset",
+        capture: nextOwner,
+      }),
+    ).toEqual({ accepted: true, pointer: pointerFromCapture(nextOwner) });
+    expect(applyChecklistPointerWrite(stored, { kind: "capture", capture: reset }).accepted).toBe(
+      false,
+    );
+    expect(
+      applyChecklistPointerWrite(stored, {
+        kind: "capture",
+        capture: { ...reset, authority: "capture" },
+      }).accepted,
+    ).toBe(false);
+    expect(
+      applyChecklistPointerWrite(stored, {
+        kind: "session_reset",
+        capture: {
+          ...initial,
+          authority: "session_reset",
+          captureVersion: 7,
+          expectedPointer: reset.expectedPointer,
+        },
+      }).accepted,
+    ).toBe(false);
+    expect(
+      applyChecklistPointerWrite(stored, {
+        kind: "capture",
+        capture: {
+          ...initial,
+          ownerGeneration: 3,
+          captureVersion: 1,
+          expectedPointer: reset.expectedPointer,
+        },
+      }).accepted,
+    ).toBe(true);
   });
 
   it("decodes historical thread shell JSON without pendingBackgroundTasks as empty roster", () => {

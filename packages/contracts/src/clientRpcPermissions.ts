@@ -2,8 +2,6 @@ import * as Schema from "effect/Schema";
 import { GitPreparePullRequestThreadInput } from "./git.ts";
 import {
   AuthOrchestrationOperateScope,
-  AuthOrchestrationReadScope,
-  AuthDiagnosticsReadScope,
   AuthSettingsWriteScope,
   AuthProvidersManageScope,
   AuthSourceControlWriteScope,
@@ -17,22 +15,6 @@ import { ProviderInstanceMutation } from "./providerInstance.ts";
 /** Incremental client enforcement; the server still authorizes every request. */
 export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.serverUpdateSettings]: AuthSettingsWriteScope,
-  [WS_METHODS.workerObserve]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerOpenView]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerList]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerDetail]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerRequests]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerActivity]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerResult]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerHistoryList]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerCloseView]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerAcknowledge]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerHistoryRead]: AuthOrchestrationReadScope,
-  [WS_METHODS.workerRouteRead]: AuthDiagnosticsReadScope,
-  [WS_METHODS.workerControlDetail]: AuthOrchestrationOperateScope,
-  [WS_METHODS.workerActivate]: AuthOrchestrationOperateScope,
-  [WS_METHODS.workerAction]: AuthOrchestrationOperateScope,
-  [WS_METHODS.workerReceipt]: AuthOrchestrationOperateScope,
   [WS_METHODS.serverRunStorageCleanup]: AuthSettingsWriteScope,
   // Endpoint checks exist to configure exports, so they need the same grant as saving them.
   [WS_METHODS.serverCheckOtlpEndpoint]: AuthSettingsWriteScope,
@@ -73,11 +55,6 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 
 const decodePrepareThread = Schema.decodeUnknownSync(GitPreparePullRequestThreadInput);
-const decodeWorkerGrant = Schema.decodeUnknownSync(
-  Schema.Struct({
-    grant: Schema.Literals(["history", "route"]),
-  }),
-);
 const decodeSettingsUpdate = Schema.decodeUnknownSync(
   Schema.Struct({
     patch: ServerSettingsPatch,
@@ -96,10 +73,6 @@ export function clientRpcRequiredScopes(
     return Object.values(payload.patch).every((value) => value === undefined)
       ? [AuthProvidersManageScope]
       : [...new Set([...scopes, AuthProvidersManageScope])];
-  }
-  if (method === WS_METHODS.workerAcknowledge) {
-    const payload = decodeWorkerGrant(input);
-    return [payload.grant === "route" ? AuthDiagnosticsReadScope : AuthOrchestrationReadScope];
   }
   if (method === WS_METHODS.gitPreparePullRequestThread && input !== undefined) {
     const payload = decodePrepareThread(input);

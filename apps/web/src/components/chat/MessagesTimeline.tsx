@@ -183,6 +183,7 @@ import {
   CHAT_TIMELINE_ANCHOR_OFFSET,
   readTimelinePosition,
   rememberTimelinePosition,
+  registerTimelinePositionReader,
   timelineContentOverflowsViewport,
 } from "./timelineScrollAnchoring";
 import { MessageCopyButton } from "./MessageCopyButton";
@@ -1308,6 +1309,10 @@ const ConversationTimeline = memo(function ConversationTimeline({
   }, [handleScroll, rows.length]);
 
   const savedLiveFollowEnabledRef = useRef(liveFollowEnabled);
+  useLayoutEffect(
+    () => registerTimelinePositionReader(listIdentityKey, handleScroll),
+    [listIdentityKey, handleScroll],
+  );
   useLayoutEffect(() => {
     const wasFollowing = savedLiveFollowEnabledRef.current;
     savedLiveFollowEnabledRef.current = liveFollowEnabled;

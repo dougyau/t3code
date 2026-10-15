@@ -115,6 +115,14 @@
       "types": "./src/schemaYaml.ts",
       "import": "./src/schemaYaml.ts"
     },
+    "./piTodo": {
+      "types": "./src/piTodo.ts",
+      "import": "./src/piTodo.ts"
+    },
+    "./checklist": {
+      "types": "./src/checklist.ts",
+      "import": "./src/checklist.ts"
+    },
     "./toolActivity": {
       "types": "./src/toolActivity.ts",
       "import": "./src/toolActivity.ts"

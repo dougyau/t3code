@@ -91,6 +91,7 @@ beforeEach(() => {
 const legendListTestState = vi.hoisted(() => ({
   data: undefined as unknown,
   onScroll: undefined as (() => void) | undefined,
+  maintainScrollAtEnd: false,
 }));
 
 vi.mock("@legendapp/list/react", async () => {
@@ -133,6 +134,7 @@ vi.mock("@legendapp/list/react", async () => {
   }) => {
     legendListTestState.data = props.data;
     legendListTestState.onScroll = props.onScroll;
+    legendListTestState.maintainScrollAtEnd = Boolean(props.maintainScrollAtEnd);
     if (props.anchoredEndSpace) {
       props.anchoredEndSpace.onSizeChanged?.(240);
       props.anchoredEndSpace.onReady?.({ anchorIndex: props.anchoredEndSpace.anchorIndex });
@@ -774,10 +776,24 @@ describe("MessagesTimeline", () => {
       get scrollTop() {
         return timeline.scrollTop;
       },
+      scrollHeight: 2000,
+      clientHeight: 600,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      ownerDocument: { addEventListener: vi.fn(), removeEventListener: vi.fn() },
       getBoundingClientRect: () => ({ top: 0 }),
     };
     props.listRef.current = {
       getScrollableNode: () => viewport,
+      scrollToIndex: vi.fn(async ({ viewOffset }: { viewOffset: number }) => {
+        timeline.scrollTop = -viewOffset;
+      }),
+      scrollToOffset: vi.fn(async ({ offset }: { offset: number }) => {
+        timeline.scrollTop = offset;
+      }),
+      scrollToEnd: vi.fn(async () => {
+        timeline.scrollTop = 1400;
+      }),
       getState: () => ({
         data: legendListTestState.data,
         scroll: timeline.scrollTop,
@@ -791,6 +807,54 @@ describe("MessagesTimeline", () => {
     } as unknown as LegendListRef;
     return timeline;
   }
+
+  it("retains the coordinator anchor before opening a worker and restores without following streamed rows", async () => {
+    const { retainTimelinePosition, readTimelinePosition } =
+      await import("./timelineScrollAnchoring");
+    const timeline = stubFollowTimeline("environment-remote:coordinator-reading");
+    const { props } = timeline;
+    timeline.scrollTop = 840;
+    const entries = [buildUserTimelineEntry("Coordinator prompt")];
+    const render = () => (
+      <MessagesTimeline {...props} timelineEntries={entries} liveFollowEnabled={false} />
+    );
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(render());
+      });
+      // Navigation captures synchronously, even before the queued scroll frame.
+      retainTimelinePosition(props.routeThreadKey);
+      expect(readTimelinePosition(props.routeThreadKey)).toMatchObject({
+        atEnd: false,
+        scrollOffset: 840,
+      });
+      await act(() => renderer?.unmount());
+      timeline.scrollTop = 0;
+      await act(() => {
+        renderer = create(render());
+      });
+      await timeline.flushFrame();
+      await timeline.flushFrame();
+      expect(timeline.scrollTop).toBe(840);
+      expect(props.listRef.current?.scrollToEnd).not.toHaveBeenCalled();
+
+      await act(() =>
+        renderer?.update(
+          <MessagesTimeline
+            {...props}
+            timelineEntries={[...entries, buildUserTimelineEntry("Later public event")]}
+            liveFollowEnabled={false}
+          />,
+        ),
+      );
+      await timeline.flushFrame();
+      expect(timeline.scrollTop).toBe(840);
+      expect(legendListTestState.maintainScrollAtEnd).toBe(false);
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
 
   it("remembers a manual reading position when the chat closes before the next frame", async () => {
     const { readTimelinePosition } = await import("./timelineScrollAnchoring");

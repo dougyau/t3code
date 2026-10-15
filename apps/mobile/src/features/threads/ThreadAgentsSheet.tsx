@@ -21,7 +21,6 @@ import { useUniwindTheme } from "../../lib/useUniwindTheme";
 import { environmentThreadDetails } from "../../state/threads";
 import { NativeStackScreenOptions, nativeHeaderScrollEdgeEffects } from "../../native/StackHeader";
 import { SubagentRow } from "./SubagentRow";
-import { PitakoWorkersPanel } from "./PitakoWorkersPanel";
 import { MaterialScreenContent } from "../../components/MaterialScreenContent";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
 
@@ -41,6 +40,15 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
   const theme = useUniwindTheme();
   const turn = useThreadTurnSubagents(target);
   const subagents = turn?.subagents ?? [];
+  const projection = useAtomValue(environmentThreadDetails.threadAtom(target))?.projection;
+  const currentIds = new Set(subagents.map((agent) => agent.id));
+  const earlier = (projection?.subagents ?? []).filter(
+    (agent) => agent.nativeWorker && !currentIds.has(agent.id),
+  );
+  const individual = subagents.filter(
+    (agent) => agent.nativeWorker?.launch.source !== "team_assign",
+  );
+  const team = subagents.filter((agent) => agent.nativeWorker?.launch.source === "team_assign");
   const hasLiveAgent = (turn?.liveCount ?? 0) > 0;
 
   const openChildThread = (childThreadId: ThreadId) => {
@@ -65,20 +73,30 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
       contentContainerClassName="px-5 pb-6"
       contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 8 }}
     >
-      <PitakoWorkersPanel {...target} />
-      {subagents.length === 0 ? (
+      {subagents.length === 0 && earlier.length === 0 ? (
         <Text className="pt-6 text-center text-sm text-foreground-muted">
           No agents in this turn.
         </Text>
       ) : (
-        subagents.map((subagent) => (
-          <AgentRow
-            key={subagent.id}
-            subagent={subagent}
-            environmentId={target.environmentId}
-            tickSeconds={hasLiveAgent}
-            onOpen={openChildThread}
-          />
+        [
+          { label: null, members: individual },
+          { label: "Team assignments", members: team },
+          { label: "Lineage · earlier assignments", members: earlier },
+        ].map(({ label, members }) => (
+          <View key={label ?? "individual"}>
+            {label && members.length > 0 ? (
+              <Text className="pt-3 font-t3-bold text-sm text-foreground">{label}</Text>
+            ) : null}
+            {members.map((subagent) => (
+              <AgentRow
+                key={subagent.id}
+                subagent={subagent}
+                environmentId={target.environmentId}
+                tickSeconds={hasLiveAgent}
+                onOpen={openChildThread}
+              />
+            ))}
+          </View>
         ))
       )}
     </ScrollView>

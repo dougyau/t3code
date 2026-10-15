@@ -107,6 +107,10 @@ import { useUniwindTheme } from "../../lib/useUniwindTheme";
 import { IOS_NAV_BAR_HEIGHT } from "../../lib/layoutMetrics";
 import { useFontFamily } from "../../lib/useFontFamily";
 import { scopedThreadKey } from "../../lib/scopedEntities";
+import {
+  readThreadReadingPosition,
+  rememberThreadReadingPosition,
+} from "./thread-reading-position";
 import { copyTextWithHaptic } from "../../lib/copyTextWithHaptic";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { downloadAndShareAttachment } from "../../lib/attachmentDownload";
@@ -1727,8 +1731,13 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   // which yanked users off history they were reading every time a stream chunk
   // grew a row. Follow breaks when the user scrolls up and away, and re-arms
   // only when the list actually returns to the end (or on send / thread switch).
-  const [endFollowEnabled, setEndFollowEnabled] = useState(true);
-  const endFollowEnabledRef = useRef(true);
+  const feedThreadKey = scopedThreadKey(props.environmentId, props.threadId);
+  const rememberedPosition = useMemo(
+    () => readThreadReadingPosition(feedThreadKey),
+    [feedThreadKey],
+  );
+  const [endFollowEnabled, setEndFollowEnabled] = useState(rememberedPosition?.follow ?? true);
+  const endFollowEnabledRef = useRef(endFollowEnabled);
   // A "user scroll session" spans from drag start through the end of its
   // momentum; scroll events only break follow inside that session, so MVCP
   // compensations and programmatic scrolls never strand a follower.
@@ -1757,9 +1766,9 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
     readonly expandedTurnIds: ReadonlySet<RunId>;
   }>({
     copiedRowId: null,
-    expandedWorkGroups: {},
-    expandedWorkRows: {},
-    expandedTurnIds: new Set(),
+    expandedWorkGroups: rememberedPosition?.disclosures.expandedWorkGroups ?? {},
+    expandedWorkRows: rememberedPosition?.disclosures.expandedWorkRows ?? {},
+    expandedTurnIds: rememberedPosition?.disclosures.expandedTurnIds ?? new Set(),
   });
   const { copiedRowId, expandedWorkGroups, expandedWorkRows, expandedTurnIds } = interactionState;
   const [expandedFile, setExpandedFile] = useState<FilePreviewSource | null>(null);
@@ -2151,21 +2160,33 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   // Thread identity is env-scoped: two environments can hold the same
   // ThreadId, and keying resets (or the list mount) on the bare id would
   // carry stale scroll/follow state across an environment switch.
-  const feedThreadKey = scopedThreadKey(props.environmentId, props.threadId);
   // Virtualized groups can unmount without losing the reader's place. This cache
   // belongs to this thread view only and never causes per-scroll React updates.
   const workGroupScrollPositions = useMemo(
-    () => new Map<string, ThreadWorkGroupScrollPosition>(),
-    [feedThreadKey],
+    () =>
+      rememberedPosition?.disclosures.workGroupScrollPositions ??
+      new Map<string, ThreadWorkGroupScrollPosition>(),
+    [rememberedPosition],
   );
-  // A thread switch opens pinned to the end; a send explicitly returns to the
-  // live edge (ThreadDetailScreen scrolls the new message into place). Both
-  // re-arm follow regardless of where the user had scrolled before.
-  useEffect(() => {
+  // Restore the reader's intent on return; sending still explicitly follows.
+  useLayoutEffect(() => {
     clearUserScrollSettle();
     userScrollSessionRef.current = false;
-    transitionEndFollow({ type: "reset" });
-  }, [clearUserScrollSettle, feedThreadKey, transitionEndFollow]);
+    setEndFollow(rememberedPosition?.follow ?? true);
+    props.onEndFollowEnabledChange?.(rememberedPosition?.follow ?? true);
+    setInteractionState({
+      copiedRowId: null,
+      expandedWorkGroups: rememberedPosition?.disclosures.expandedWorkGroups ?? {},
+      expandedWorkRows: rememberedPosition?.disclosures.expandedWorkRows ?? {},
+      expandedTurnIds: rememberedPosition?.disclosures.expandedTurnIds ?? new Set(),
+    });
+  }, [
+    clearUserScrollSettle,
+    feedThreadKey,
+    rememberedPosition,
+    setEndFollow,
+    props.onEndFollowEnabledChange,
+  ]);
   useEffect(() => {
     if (props.submittedMessageId !== null) {
       clearUserScrollSettle();
@@ -2224,6 +2245,39 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   // content: the list must still remount, and so open at the end, when they
   // arrive.
   const listMountKey = `${feedThreadKey}:${presentedFeed.some((entry) => entry.type !== "thinking") ? "filled" : "empty"}`;
+  const restoreIndex =
+    rememberedPosition?.follow === false
+      ? presentedFeed.findIndex((entry) => entry.id === rememberedPosition.rowId)
+      : -1;
+  const retainReadingPosition = useCallback(() => {
+    const state = props.listRef.current?.getState();
+    if (!state || state.data !== presentedFeed || presentedFeed.length === 0) return;
+    const index = Math.max(0, state.start);
+    const row = presentedFeed[index];
+    if (!row) return;
+    rememberThreadReadingPosition(feedThreadKey, {
+      rowId: row.id,
+      offsetWithinRow: state.scroll - state.positionAtIndex(index),
+      scrollOffset: state.scroll,
+      follow: endFollowEnabledRef.current,
+      disclosures: {
+        expandedWorkGroups,
+        expandedWorkRows,
+        expandedTurnIds,
+        workGroupScrollPositions,
+      },
+    });
+  }, [
+    feedThreadKey,
+    presentedFeed,
+    props.listRef,
+    expandedWorkGroups,
+    expandedWorkRows,
+    expandedTurnIds,
+    workGroupScrollPositions,
+  ]);
+  // Focus cleanup runs before the sheet/child takes the main space.
+  useFocusEffect(useCallback(() => retainReadingPosition, [retainReadingPosition]));
   useLayoutEffect(() => {
     const bottom = props.contentInsetEndAdjustment.value;
     if (bottom > 0) {
@@ -2733,7 +2787,17 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
             // composer instead of under the header. No effect on threads that
             // overflow the viewport (the padding clamps to zero).
             alignItemsAtEnd
-            initialScrollAtEnd
+            initialScrollAtEnd={rememberedPosition?.follow !== false}
+            {...(restoreIndex >= 0 && rememberedPosition
+              ? {
+                  initialScrollIndex: {
+                    index: restoreIndex,
+                    viewOffset: -rememberedPosition.offsetWithinRow,
+                  },
+                }
+              : rememberedPosition?.follow === false
+                ? { initialScrollOffset: rememberedPosition.scrollOffset }
+                : {})}
             onScroll={handleScroll}
             onScrollBeginDrag={handleScrollBeginDrag}
             onScrollEndDrag={handleScrollEndDrag}

@@ -101,7 +101,6 @@ import {
   type PullRequestRef,
   WS_METHODS,
   WsCoreRpcGroup,
-  ProviderWorkersRpcGroup,
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 import {
@@ -209,7 +208,6 @@ import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
-import * as WorkerRpc from "./providerWorkers/rpc.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as DefectReporter from "./observability/DefectReporter.ts";
@@ -544,8 +542,6 @@ const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
 // Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
 const ServerCoreRpcGroup = WsCoreRpcGroup.middleware(RpcInstrumentation);
-const ServerWorkerRpcGroup = ProviderWorkersRpcGroup.middleware(RpcInstrumentation);
-const ServerWsRpcGroup = ServerCoreRpcGroup.merge(ServerWorkerRpcGroup);
 // When a resuming client's cursor is more than this many events behind the
 // current head, skip the per-event catch-up replay and send a fresh shell
 // snapshot instead. Replaying each intervening event costs a shell refetch;
@@ -3140,7 +3136,7 @@ const layerWsRpc = (
       });
       return handlers;
     }),
-  ).pipe(Layer.merge(ServerWorkerRpcGroup.toLayer(WorkerRpc.makeHandlers(currentSession))));
+  );
 
 // A defect in a handler's effect fails only its own request. RpcServer's default
 // sends a socket-level Defect frame instead, and the client ends every pending
@@ -3194,7 +3190,7 @@ export const layer = Layer.unwrap(
         yield* analytics.record("client.connected", clientAnalyticsProps);
         const rpcWebSocketHttpEffect = yield* Effect.gen(function* () {
           const { protocol, httpEffect } = yield* RpcServer.makeProtocolWithHttpEffectWebsocket;
-          yield* RpcServer.make(ServerWsRpcGroup, WS_RPC_SERVER_OPTIONS).pipe(
+          yield* RpcServer.make(ServerCoreRpcGroup, WS_RPC_SERVER_OPTIONS).pipe(
             Effect.provideService(RpcServer.Protocol, withTerminalOutputWindow(protocol)),
             Effect.provide(
               Layer.merge(RpcAuthorization.layer(session.scopes), rpcInstrumentationLayer),

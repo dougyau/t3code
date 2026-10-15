@@ -18,6 +18,13 @@ import {
   OrchestrationV2RuntimeRequest,
   OrchestrationV2Subagent,
   OrchestrationV2TurnItem,
+  PiChecklistCapture,
+  PiNativeWorkerLaunch,
+  PiNativeWorkerSummary,
+  PiNativeWorkerCheckpoint,
+  PiNativeWorkerRecord,
+  PiNativeWorkerBinding,
+  PiNativeWorkerOwner,
   ProviderApprovalDecision,
   ProviderInteractionMode,
   ProviderDriverKind,
@@ -38,7 +45,6 @@ import * as Schema from "effect/Schema";
 import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
-import type { ProviderWorkersPort } from "./ProviderWorkers.ts";
 
 import type {
   ProviderSelectionTransitionInput,
@@ -124,6 +130,8 @@ export const ProviderAdapterV2Event = Schema.Union([
     type: Schema.Literal("turn_item.updated"),
     driver: ProviderDriverKind,
     turnItem: OrchestrationV2TurnItem,
+    /** Present when the accepted tool result also captured the conversation checklist. */
+    checklistCapture: Schema.optional(PiChecklistCapture),
   }),
   Schema.Struct({
     type: Schema.Literal("runtime_request.updated"),
@@ -448,12 +456,31 @@ export interface ProviderAdapterV2RuntimeRequestResponseInput {
   readonly response?: unknown;
 }
 
+/** Typed checklist supplement. Not a provider-thread column; callers split it before a row write. */
+export type ProviderThreadChecklistSupplement = {
+  readonly checklistCapture?: PiChecklistCapture;
+};
+
+export type ProviderAdapterV2EnsuredThread = OrchestrationV2ProviderThread &
+  ProviderThreadChecklistSupplement;
+
+export function splitProviderThreadChecklistCapture<T extends ProviderAdapterV2EnsuredThread>(
+  value: T,
+): {
+  readonly providerThread: OrchestrationV2ProviderThread;
+  readonly checklistCapture: PiChecklistCapture | undefined;
+} {
+  const { checklistCapture, ...providerThread } = value;
+  return { providerThread, checklistCapture };
+}
+
 export interface ProviderAdapterV2ThreadSnapshot {
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly providerTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
   readonly messages: ReadonlyArray<OrchestrationV2ConversationMessage>;
   readonly runtimeRequests: ReadonlyArray<OrchestrationV2RuntimeRequest>;
   readonly providerPayload?: unknown;
+  readonly checklistCapture?: PiChecklistCapture;
 }
 
 export interface ProviderAdapterV2ReadThreadSnapshotInput {
@@ -532,13 +559,45 @@ export interface ProviderAdapterV2McpApps {
   }) => Effect.Effect<{ readonly contents: ReadonlyArray<unknown> }, ProviderAdapterV2Error>;
 }
 
+/** Internal passive source. Only the ordered run subscriber admits launch membership. */
+export interface ProviderNativeWorkersPort {
+  readonly ownerGeneration: number;
+  /** Protocol-2 handshake owner, absent before binding or after invalidation. */
+  readonly owner: PiNativeWorkerOwner | undefined;
+  /** Coalescible read hints, never launch admission or ordinary provider events. */
+  readonly hints: Stream.Stream<void>;
+  readonly reconcile: (launch: PiNativeWorkerLaunch) => Effect.Effect<PiNativeWorkerSummary, Error>;
+  readonly read: (
+    launch: PiNativeWorkerLaunch,
+    checkpoint?: PiNativeWorkerCheckpoint,
+  ) => Effect.Effect<ProviderNativeWorkerBatch, Error>;
+  /** Call only with launches already admitted by the ordered subscriber. */
+  readonly hasPendingWork: (admitted: ReadonlyArray<PiNativeWorkerLaunch>) => Effect.Effect<boolean>;
+}
+
+export interface ProviderNativeWorkerBatch {
+  readonly launch: PiNativeWorkerLaunch;
+  readonly summary: PiNativeWorkerSummary;
+  readonly expectedCheckpoint: PiNativeWorkerCheckpoint | undefined;
+  readonly checkpoint: PiNativeWorkerCheckpoint;
+  readonly records: ReadonlyArray<PiNativeWorkerRecord>;
+  /** Preserve historical bindings; todoHead is a selection, not newest arrival. */
+  readonly bindings: ReadonlyArray<PiNativeWorkerBinding>;
+  readonly result?: {
+    readonly status: "completed" | "failed" | "cancelled";
+    readonly text: string;
+    readonly complete: boolean;
+  };
+  readonly more: boolean;
+}
+
 export interface ProviderAdapterV2SessionRuntime {
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
   readonly providerSessionId: ProviderSessionId;
   readonly providerSession: OrchestrationV2ProviderSession;
   readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
-  readonly workers?: ProviderWorkersPort;
+  readonly nativeWorkers?: ProviderNativeWorkersPort;
   /**
    * Manager-owned runtimes expose a synchronous subscription so concurrent
    * provider threads receive independent copies of the process event stream.
@@ -575,13 +634,13 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly canReuseContextUsage?: (previous: ModelSelection, next: ModelSelection) => boolean;
   readonly ensureThread: (
     input: ProviderAdapterV2EnsureThreadInput,
-  ) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
+  ) => Effect.Effect<ProviderAdapterV2EnsuredThread, ProviderAdapterV2Error>;
   readonly resumeThread: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly threadId?: ThreadId;
     readonly modelSelection?: ModelSelection;
     readonly runtimePolicy?: ProviderAdapterV2RuntimePolicy;
-  }) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
+  }) => Effect.Effect<ProviderAdapterV2EnsuredThread, ProviderAdapterV2Error>;
   /** False means the native protocol explicitly does not support history injection. */
   readonly injectHistory?: (
     input: ProviderAdapterV2HistoricalContext & {
@@ -642,7 +701,7 @@ export interface ProviderAdapterV2SessionRuntime {
   ) => Effect.Effect<ProviderAdapterV2ThreadSnapshot, ProviderAdapterV2Error>;
   readonly forkThread: (
     input: ProviderAdapterV2ForkThreadInput,
-  ) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
+  ) => Effect.Effect<ProviderAdapterV2EnsuredThread, ProviderAdapterV2Error>;
 }
 
 export class ProviderAdapterV2 extends Context.Service<

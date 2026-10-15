@@ -18,7 +18,6 @@ export * from "./provider.ts";
 export * from "./providerInstance.ts";
 export * from "./providerSetup.ts";
 export * from "./providerRuntime.ts";
-export * from "./providerWorkers.ts";
 export * from "./providerUsageLimits.ts";
 export * from "./usageLimitSourceId.ts";
 export * from "./providerPolicy.ts";

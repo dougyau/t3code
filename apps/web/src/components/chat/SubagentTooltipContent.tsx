@@ -10,6 +10,7 @@ import type {
 import {
   resolveSubagentMetadata,
   subagentDetailPreview,
+  nativeWorkerPresentation,
 } from "@t3tools/client-runtime/state/subagent-display";
 import { getModelSelectionStringOptionValue, resolveSelectableModel } from "@t3tools/shared/model";
 import { getTraitsSpeedDisplay, TraitsSpeedIcon } from "./TraitsSpeed";
@@ -36,6 +37,7 @@ export function SubagentTooltipContent(props: {
   providerInstanceId: ProviderInstanceId;
   origin: OrchestrationV2Subagent["origin"];
   modelSelection?: OrchestrationV2Subagent["modelSelection"];
+  nativeWorker?: OrchestrationV2Subagent["nativeWorker"];
   provider?: ServerProvider | undefined;
   /** The environment's instances; with several accounts on one provider, the card names this one. */
   providers?: ReadonlyArray<ServerProvider> | undefined;
@@ -51,6 +53,19 @@ export function SubagentTooltipContent(props: {
   result?: string | null | undefined;
   progress?: string | null | undefined;
 }) {
+  const native = props.nativeWorker ? nativeWorkerPresentation(props.nativeWorker) : null;
+  if (native) {
+    return (
+      <ThreadHoverCard title={props.title}>
+        <div className="grid gap-1">
+          <span>{native.identity ?? native.role}</span>
+          <span>{native.task}</span>
+          <span>{native.status}</span>
+          <span>Effective model: {native.model ?? "Not reported"}</span>
+        </div>
+      </ThreadHoverCard>
+    );
+  }
   const { modelLabel, workspace: metadata } = resolveSubagentMetadata(props);
   const preview = subagentDetailPreview(props);
   const model = props.model?.trim();

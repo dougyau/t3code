@@ -257,7 +257,10 @@ export const layer: Layer.Layer<
               };
             });
 
-      const snapshot =
+      const snapshot: Pick<
+        ProviderAdapter.ProviderAdapterV2ThreadSnapshot,
+        "providerThread" | "checklistCapture"
+      > =
         runsToRollback.length === 0
           ? { providerThread }
           : yield* session.rollbackThread({
@@ -348,7 +351,22 @@ export const layer: Layer.Layer<
               );
             }
           }
-          yield* eventSink.write({ events });
+          yield* eventSink.write({
+            events,
+            ...(runsToRollback.length === 0 || providerThread.driver !== "pi"
+              ? {}
+              : {
+                  resetChecklistSession: providerThread.id,
+                  ...(snapshot.checklistCapture === undefined
+                    ? {}
+                    : {
+                        checklistCapture: {
+                          providerThreadId: providerThread.id,
+                          capture: snapshot.checklistCapture,
+                        },
+                      }),
+                }),
+          });
         }),
       );
     });

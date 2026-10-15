@@ -53,10 +53,6 @@ const settings = Schema.decodeSync(PiSettings)({
   binaryPath: "pi",
   launchArgs: "",
   customModels: [],
-  workerBridge: true,
-  workerHistory: true,
-  workerRoute: true,
-  workerControl: true,
 });
 
 describe("PiProvider", () => {

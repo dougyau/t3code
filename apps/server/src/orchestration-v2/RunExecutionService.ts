@@ -1,3 +1,4 @@
+import * as NodeUtil from "node:util";
 import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -1245,7 +1246,53 @@ export const layer: Layer.Layer<
                   const isRootProviderThreadUpdate =
                     event.type === "provider_thread.updated" &&
                     event.providerThread.id === input.providerThread.id;
-                  const storedEvents = yield* providerEventIngestor.ingestNormalized({
+                  const launch = deliveredEvent.type === "turn_item.updated"
+                    ? deliveredEvent.turnItem.nativeWorkerLaunch : undefined;
+                  const port = input.session.nativeWorkers;
+                  const isNativeLaunch = launch !== undefined &&
+                    !rootTerminalAlreadySeen &&
+                    deliveredEvent.type === "turn_item.updated" &&
+                    deliveredEvent.turnItem.type === "dynamic_tool" &&
+                    deliveredEvent.turnItem.toolName === launch.source &&
+                    deliveredEvent.turnItem.status === "completed" &&
+                    deliveredEvent.turnItem.nodeId === launch.toolNodeId &&
+                    deliveredEvent.turnItem.threadId === launch.parentThreadId &&
+                    deliveredEvent.turnItem.providerTurnId === launch.parentProviderTurnId &&
+                    launch.providerInstanceId === input.run.providerInstanceId &&
+                    launch.providerSessionId === input.providerSessionId &&
+                    launch.parentThreadId === input.run.threadId &&
+                    launch.parentProviderThreadId === input.providerThread.id &&
+                    launch.runId === input.run.id &&
+                    launch.runAttemptId === input.attempt.id;
+                  const reconcileAdmission = Effect.gen(function* () {
+                    const owner = port?.owner;
+                    const ownerGeneration = port?.ownerGeneration;
+                    if (!isNativeLaunch || launch === undefined || port === undefined ||
+                      owner === undefined || ownerGeneration === undefined ||
+                      launch.coordinatorSessionId !== owner.coordinatorSessionId) return undefined;
+                    const summary = yield* port.reconcile(launch).pipe(Effect.mapError(
+                      (cause) => new RunExecutionIngestError({ runId: input.run.id, cause }),
+                    ));
+                    if (!NodeUtil.isDeepStrictEqual(summary.launch, launch) ||
+                      !NodeUtil.isDeepStrictEqual(port.owner, owner) ||
+                      port.ownerGeneration !== ownerGeneration) return undefined;
+                    return {
+                      summary,
+                      checkpoint: {
+                        launch, owner, ownerGeneration,
+                        captureEpoch: null, bindings: [], bindingGeneration: null,
+                        bindingCursors: [], cursor: null, cut: 0, recovery: false,
+                        capture: "opening" as const, finalSequence: null, gaps: [],
+                      },
+                      isConnected: Effect.sync(() =>
+                        NodeUtil.isDeepStrictEqual(port.owner, owner) &&
+                        port.ownerGeneration === ownerGeneration),
+                    };
+                  });
+                  const ingest = (
+                    nativeWorkerAdmission: Effect.Success<typeof reconcileAdmission>,
+                  ) => providerEventIngestor.ingestNormalized({
+                    ...(nativeWorkerAdmission === undefined ? {} : { nativeWorkerAdmission }),
                     analyticsContext: {
                       modelSelection: input.modelSelection,
                       runtimeMode: input.runtimePolicy.runtimeMode,
@@ -1257,7 +1304,14 @@ export const layer: Layer.Layer<
                     runId: input.run.id,
                     nodeId: input.rootNode.id,
                     event: deliveredEvent,
-                    ...(isRootProviderThreadUpdate
+                    ...(isNativeLaunch
+                      ? {
+                          writeIfRunCurrent: {
+                            runId: input.run.id, activeAttemptId: input.attempt.id,
+                            expectedStatus: "running" as const,
+                          },
+                        }
+                      : isRootProviderThreadUpdate
                       ? rootTerminalAlreadySeen
                         ? {
                             writeIfProviderThreadOwner: {
@@ -1276,6 +1330,17 @@ export const layer: Layer.Layer<
                           }
                       : {}),
                   });
+                  const admission = yield* reconcileAdmission;
+                  let storedEvents = yield* ingest(admission);
+                  if (storedEvents.length === 0 && admission !== undefined) {
+                    // A connection fence can reject the entire launch batch after
+                    // reconciliation. Finish this event before advancing the stream.
+                    const currentAdmission = yield* reconcileAdmission;
+                    if (currentAdmission !== undefined) storedEvents = yield* ingest(currentAdmission);
+                    // A second owner race must not spin or discard the ordinary tool.
+                    // Keep the original run/attempt fence, but do not fabricate a child.
+                    if (storedEvents.length === 0) storedEvents = yield* ingest(undefined);
+                  }
                   storedEventCount = storedEvents.length;
                   if (
                     isRootProviderThreadUpdate &&
