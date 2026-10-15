@@ -16,6 +16,7 @@ import {
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
   type OrchestrationV2TurnItem,
+  type OrchestrationV2ProjectedTurnItem,
   type OrchestrationV2ThreadProjection,
   type PiNativeWorkerLaunch,
   type PiNativeWorkerCheckpoint,
@@ -38,6 +39,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import { vi } from "vite-plus/test";
 
 import { toolOutputImages } from "@t3tools/shared/toolOutput";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -255,6 +257,129 @@ const seedNativeWorker = Effect.fnUntraced(function* (admit = true) {
 });
 
 layer("native worker persisted import", (it) => {
+  it.effect("persists native message diagnostics and presents tool-only turns without empty rows", () =>
+    Effect.gen(function* () {
+      // Load the real client builders through Vite: mobile is a CommonJS package
+      // and both clients use Bundler resolution, unlike this server project.
+      type MessageRow = { message: { text: string } };
+      type WebEntry = ({ kind: "message" } & MessageRow) | { kind: "work" };
+      type WebInput = { visibleTurnItems: ReadonlyArray<OrchestrationV2ProjectedTurnItem>; optimisticMessages: [] };
+      type WebState = { entries: ReadonlyArray<WebEntry> };
+      const { deriveTimelineEntriesFromVisibleTurnItems, deriveTimelineEntriesFromVisibleTurnItemsWithState } =
+        yield* Effect.promise(() => vi.importActual<{
+          deriveTimelineEntriesFromVisibleTurnItems: (input: WebInput) => ReadonlyArray<WebEntry>;
+          deriveTimelineEntriesFromVisibleTurnItemsWithState: (input: WebInput, previous?: WebState) => WebState;
+        }>("../../../web/src/session-logic.ts"));
+      const { buildThreadFeed } = yield* Effect.promise(() => vi.importActual<{
+        buildThreadFeed: (rows: ReadonlyArray<OrchestrationV2ProjectedTurnItem>) =>
+          ReadonlyArray<({ type: "message" } & MessageRow) | { type: "activity-group" }>;
+      }>("../../../mobile/src/lib/threadActivity.ts"));
+      const f = yield* seedNativeWorker();
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const message = (id: string, order: number,
+        payload: Extract<PiNativeWorkerRecord, { kind: "message" }>["payload"]): PiNativeWorkerRecord => ({
+        kind: "message", provenance: { ...f.record(id, 1, "").provenance,
+          order, nativeOrder: order, toolCallId: null }, payload,
+      });
+      const toolCall = { type: "toolCall", toolCallId: "read-call", name: "read", arguments: {} } as const;
+      const first = message("tool-only", 0, { role: "assistant", blocks: [toolCall], stopReason: "toolUse" });
+      const tool: PiNativeWorkerRecord = { ...f.record("read", 1, ""), kind: "tool",
+        provenance: { ...f.record("read", 1, "").provenance, order: 1, toolCallId: "read-call" },
+        payload: { name: "read", status: "completed", argsState: "available", args: {},
+          result: [{ type: "omitted", reason: "unsupported_content" }], isError: false } };
+      const final = message("final", 2, { role: "assistant",
+        blocks: [{ type: "text", text: "Final response" }], stopReason: "stop" });
+      const page = f.batch(f.checkpoint, 1, [first, tool, final], null);
+      assert.isTrue((yield* f.ingestor.ingestNativeWorker(page)).sourceProgress);
+      const child = yield* projections.getThreadProjection(f.member.childThreadId!);
+      assert.lengthOf(child.turnItems, 4);
+      assert.lengthOf(child.messages, 2);
+      const nativeItems = child.turnItems.filter((item) => item.nativeWorkerRecord !== undefined);
+      assert.deepEqual(nativeItems.map((item) => item.nativeWorkerRecords),
+        [first, tool, final].map((record) => [record.provenance]));
+      assert.deepEqual(child.providerThreads[0]?.nativeMetadata?.nativeWorkerCheckpoint, page.checkpoint);
+      const rows = nativeItems.map((item, position) => ({
+        item, position, visibility: "local" as const, sourceThreadId: item.threadId, sourceItemId: item.id,
+      }));
+      const input: WebInput = { visibleTurnItems: rows, optimisticMessages: [] };
+      const web = deriveTimelineEntriesFromVisibleTurnItemsWithState(input);
+      assert.deepEqual(web.entries.map((entry) => entry.kind), ["work", "message"]);
+      assert.deepEqual(deriveTimelineEntriesFromVisibleTurnItems(input), web.entries);
+      const mobile = buildThreadFeed(rows);
+      assert.deepEqual(mobile.map((entry) => entry.type), ["activity-group", "message"]);
+      assert.deepEqual(mobile.flatMap((entry) => entry.type === "message" ? [entry.message.text] : []), ["Final response"]);
+      const sequence = yield* f.sink.latestSequence();
+      assert.isFalse((yield* f.ingestor.ingestNativeWorker(page)).committed);
+      assert.isFalse((yield* f.ingestor.ingestNativeWorker({ ...page, expectedCheckpoint: page.checkpoint })).sourceProgress);
+      assert.equal(yield* f.sink.latestSequence(), sequence);
+      assert.deepEqual(yield* projections.getThreadProjection(f.member.childThreadId!), child);
+
+      const revised = { kind: "message" as const, provenance: { ...first.provenance, revision: 2, sequence: 4 },
+        payload: { role: "assistant" as const, blocks: [{ type: "text" as const, text: "Now visible" }] } };
+      const next = f.batch(page.checkpoint, 2, [revised], null);
+      yield* f.ingestor.ingestNativeWorker(next);
+      const updated = yield* projections.getThreadProjection(f.member.childThreadId!);
+      assert.lengthOf(updated.turnItems, 4);
+      assert.lengthOf(updated.messages, 2);
+      assert.deepEqual(updated.turnItems.map((item) => [item.id, item.ordinal]),
+        child.turnItems.map((item) => [item.id, item.ordinal]));
+      assert.deepEqual(updated.turnItems.find((item) => item.id === nativeItems[0]?.id)?.nativeWorkerRecords, [revised.provenance]);
+      assert.deepEqual(updated.providerThreads[0]?.nativeMetadata?.nativeWorkerCheckpoint, next.checkpoint);
+      const updatedRows = updated.turnItems.filter((item) => item.nativeWorkerRecord !== undefined).map((item, position) => ({
+        ...rows[position]!, item,
+      }));
+      const updatedInput = { ...input, visibleTurnItems: updatedRows };
+      const updatedWeb = deriveTimelineEntriesFromVisibleTurnItemsWithState(updatedInput, web);
+      assert.deepEqual(updatedWeb.entries, deriveTimelineEntriesFromVisibleTurnItems(updatedInput));
+      assert.deepEqual(updatedWeb.entries.map((entry) => entry.kind), ["message", "work", "message"]);
+      assert.deepEqual(buildThreadFeed(updatedRows).map((entry) => entry.type), ["message", "activity-group", "message"]);
+      assert.isFalse((yield* f.ingestor.ingestNativeWorker(next)).committed);
+
+      const cases = [
+        { payload: { role: "assistant", blocks: [{ type: "text", text: "one" }, toolCall, { type: "text", text: "two" }] },
+          text: "one\ntwo" },
+        { payload: { role: "assistant", blocks: [{ type: "omitted", reason: "unsupported_content" }] },
+          text: "[T3 notice] Some content is unavailable." },
+        { payload: { role: "assistant", blocks: [toolCall], stopReason: "error", errorMessage: "Provider failed" },
+          text: "[T3 notice] Provider failed" },
+        { payload: { role: "assistant", blocks: [{ type: "text", text: "Partial" }, toolCall],
+          stopReason: "stop", errorMessage: "Still report this" },
+          text: "Partial\n\n[T3 notice] Still report this" },
+        { payload: { role: "assistant", blocks: [], stopReason: "error" },
+          text: "[T3 notice] The response failed." },
+        { payload: { role: "assistant", blocks: [], stopReason: "error", errorMessage: " \n" },
+          text: "[T3 notice] The response failed." },
+        { payload: { role: "assistant", blocks: [{ type: "text", text: "Partial" }, toolCall],
+          stopReason: "aborted", errorMessage: "Disconnected" },
+          text: "Partial\n\n[T3 notice] Disconnected\n\n[T3 notice] The response was aborted." },
+        { payload: { role: "assistant", blocks: [{ type: "text", text: "Partial" }], stopReason: "length" },
+          text: "Partial\n\n[T3 notice] The response reached its length limit." },
+        ...(["pending", "stop", "toolUse", "deferred"] as const).map((stopReason) => ({
+          payload: { role: "assistant" as const, blocks: [toolCall], stopReason }, text: "",
+        })),
+        { payload: { role: "user", blocks: [{ type: "text", text: "  user" },
+          { type: "omitted", reason: "unsupported_content" }, { type: "text", text: "text  " }],
+          stopReason: "error", errorMessage: "Do not add" }, text: "  user\ntext  " },
+      ] satisfies ReadonlyArray<{ payload: Extract<PiNativeWorkerRecord, { kind: "message" }>["payload"]; text: string }>;
+      const diagnostics = f.batch(next.checkpoint, 3,
+        cases.map((test, index) => message(`diagnostic-${index}`, index + 3, test.payload)), null);
+      yield* f.ingestor.ingestNativeWorker(diagnostics);
+      const persisted = yield* projections.getThreadProjection(f.member.childThreadId!);
+      assert.deepEqual(persisted.messages.slice(2).map((entry) => entry.text), cases.map((test) => test.text));
+      const diagnosticItems = persisted.turnItems.filter((item) => item.nativeWorkerRecord?.id.startsWith("diagnostic-"));
+      assert.deepEqual(diagnosticItems.map((item) => "text" in item ? item.text : null), cases.map((test) => test.text));
+      const diagnosticRows = diagnosticItems.map((item, position) => ({
+        item, position, visibility: "local" as const, sourceThreadId: item.threadId, sourceItemId: item.id,
+      }));
+      const expectedTexts = cases.map((test) => test.text).filter((text) => text.trim().length > 0);
+      assert.deepEqual(deriveTimelineEntriesFromVisibleTurnItems({
+        visibleTurnItems: diagnosticRows, optimisticMessages: [],
+      }).flatMap((entry) => entry.kind === "message" ? [entry.message.text] : []), expectedTexts);
+      assert.deepEqual(buildThreadFeed(diagnosticRows).flatMap((entry) =>
+        entry.type === "message" ? [entry.message.text] : []), expectedTexts);
+      assert.lengthOf(persisted.turnItems.filter((item) => item.type === "dynamic_tool"), 1);
+    }));
+
   it.effect("keeps one child and immutable admission when the same worker is replayed in another attempt", () =>
     Effect.gen(function* () {
       const f = yield* seedNativeWorker();
@@ -553,7 +678,8 @@ layer("native worker persisted import", (it) => {
         ...page, checkpoint: { ...page.checkpoint, fragment: restart, gaps: ["unsupported_content"] },
       })).committed);
       const child = yield* projections.getThreadProjection(f.member.childThreadId!);
-      assert.deepEqual(child.messages.map((entry) => entry.text), ["complete message"]);
+      assert.deepEqual(child.messages.map((entry) => entry.text),
+        ["complete message\n\n[T3 notice] Some content is unavailable."]);
       const storedTool = child.turnItems.find((entry) => entry.type === "dynamic_tool");
       assert.equal(storedTool?.type, "dynamic_tool");
       if (storedTool?.type !== "dynamic_tool") return;

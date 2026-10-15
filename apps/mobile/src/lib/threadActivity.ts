@@ -4,6 +4,7 @@ import type {
   ThreadUserInputQuestion,
 } from "@t3tools/client-runtime/state/thread-requests";
 import { turnItemIsWorkspacePreparation } from "@t3tools/client-runtime/state/turn-item-presentation";
+import { shouldOmitNativeWorkerMessage } from "@t3tools/client-runtime/native-worker-message";
 import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
 import { isLiveSubagentTurnItem } from "@t3tools/client-runtime/state/subagentRuntime";
 import { extractToolActivityPresentation } from "@t3tools/client-runtime/work-log/tool-presentation";
@@ -1766,6 +1767,7 @@ export function buildThreadFeed(
   },
 ): ThreadFeedEntry[] {
   const entries: RawThreadFeedEntry[] = [];
+  const omittedMessageIds = new Set<string>();
   const attemptByRootNodeId = new Map(
     (options?.attempts ?? []).map((attempt) => [attempt.rootNodeId, attempt] as const),
   );
@@ -1795,6 +1797,10 @@ export function buildThreadFeed(
   );
   for (const row of visibleTurnItems) {
     const item = row.item;
+    if (shouldOmitNativeWorkerMessage(item) && item.type === "assistant_message") {
+      omittedMessageIds.add(item.messageId);
+      continue;
+    }
     if (turnItemIsWorkspacePreparation(item)) continue;
     if (item.type === "todo_list" || item.type === "checkpoint") continue;
     if (item.type === "user_message" && foldedAnswerMessageIds.has(item.messageId)) continue;
@@ -1928,6 +1934,7 @@ export function buildThreadFeed(
     }
   }
   const retainedMessageIds = new Set([
+    ...omittedMessageIds,
     ...foldedAnswerMessageIds,
     ...entries.flatMap((entry) => (entry.type === "message" ? [entry.id] : [])),
   ]);

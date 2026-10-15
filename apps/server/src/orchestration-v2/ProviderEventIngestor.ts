@@ -898,8 +898,28 @@ export const layer: Layer.Layer<
             };
             let item: OrchestrationV2TurnItem;
             if (record.kind === "message") {
-              const text = record.payload.blocks.filter((block) => block.type === "text")
+              let text = record.payload.blocks.filter((block) => block.type === "text")
                 .map((block) => block.text).join("\n");
+              if (record.payload.role === "assistant") {
+                const notices: string[] = [];
+                if (record.payload.blocks.some((block) => block.type === "omitted")) {
+                  notices.push("[T3 notice] Some content is unavailable.");
+                }
+                const diagnostic = record.payload.errorMessage?.trim();
+                if (diagnostic) {
+                  notices.push(`[T3 notice] ${diagnostic}`);
+                } else if (record.payload.stopReason === "error") {
+                  notices.push("[T3 notice] The response failed.");
+                }
+                if (record.payload.stopReason === "aborted") {
+                  notices.push("[T3 notice] The response was aborted.");
+                } else if (record.payload.stopReason === "length") {
+                  notices.push("[T3 notice] The response reached its length limit.");
+                }
+                if (notices.length > 0) {
+                  text = [...(text.length > 0 ? [text] : []), ...notices].join("\n\n");
+                }
+              }
               const artifacts = makeSubagentConversationArtifacts({
                 messageId: MessageId.make(`${id}:message`), turnItemId: id,
                 threadId: childThreadId, rootNodeId: subagent.id,

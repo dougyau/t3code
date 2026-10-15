@@ -10,8 +10,29 @@ import {
   ThreadId,
   type OrchestrationV2Subagent,
   type PiNativeWorkerSummary,
+  type PiNativeWorkerRecordProvenance,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+
+export function nativeWorkerRecordFixture(): PiNativeWorkerRecordProvenance {
+  return {
+    instanceId: "reviewer-instance",
+    owner: { processId: "process", coordinatorSessionId: "coordinator", epoch: "epoch" },
+    captureEpoch: "capture",
+    id: "message",
+    binding: 1,
+    revision: 1,
+    sequence: 1,
+    order: 1,
+    nativeOrder: 1,
+    occurredAt: null,
+    observedAt: 1,
+    nativeTime: null,
+    nativeEntryId: "message",
+    parentEntryId: null,
+    toolCallId: null,
+  };
+}
 
 export function nativeWorkerFixture(
   overrides: Partial<PiNativeWorkerSummary> = {},
