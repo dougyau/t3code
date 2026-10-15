@@ -7,7 +7,76 @@ import { PiWorkerBridge, WorkerSourceError, NativeRecordAssembler, classifyPiWor
 import { BridgeError } from "./pitako/bridge/client.js";
 import { errors, type PublicWorkerDetail, type PublicRecord, type PublicConversationPage, type PublicFragment } from "./pitako/bridge/protocol.js";
 import { workerWireFixture } from "./workerBridge.wire.fixture.ts";
+import { handoffWorkerRows, invalidHandoffWorkerRows, legacyWorkerRow } from "../../../contracts/src/providerWorkers.fixture.ts";
 import { PiNativeWorkerLaunch } from "@t3tools/contracts";
+
+describe("passive worker handoff wire boundary", () => {
+  const owner = { processId: "process", coordinatorSessionId: "session", epoch: "epoch" };
+  it.effect("conserves every public combination through real list and subscription replies", () =>
+    Effect.gen(function* () {
+      const f = yield* workerWireFixture(owner);
+      for (const row of handoffWorkerRows) {
+        const roster = { owner, revision: 1, cursor: null, items: [row] };
+        f.policy.roster = roster;
+        assert.deepEqual(yield* Effect.promise(() => f.client.list()), roster);
+        const changed = Promise.withResolvers<unknown>();
+        const subscription = yield* Effect.promise(() => f.client.subscribe(changed.resolve));
+        assert.deepEqual(subscription.snapshot, roster);
+        f.policy.roster = { ...roster, revision: 2 };
+        f.notify(2);
+        assert.deepEqual(yield* Effect.promise(() => changed.promise), {
+          version: 2, method: "changed", owner, clientId: f.client.lease.clientId,
+          subscriptionId: "subscription", revision: 2, refreshRequired: true, gap: false,
+        });
+        assert.deepEqual(yield* Effect.promise(() => subscription.refresh()), f.policy.roster);
+        yield* Effect.promise(() => subscription.dispose());
+      }
+      assert.deepEqual(f.calls, ["connect", ...handoffWorkerRows.flatMap(() => [
+        "workers.list", "subscribe", "workers.list", "unsubscribe",
+      ])]);
+      yield* Effect.promise(() => f.client.disconnect());
+    }).pipe(Effect.scoped));
+
+  it.effect("returns observable transport errors for invalid list and subscription payloads", () =>
+    Effect.gen(function* () {
+      const f = yield* workerWireFixture(owner);
+      const badPages = [
+        ...invalidHandoffWorkerRows.map((row) => ({ owner, revision: 1, cursor: null, items: [row] })),
+        { owner, revision: 1, cursor: null, items: [{ ...legacyWorkerRow, futureField: true }] },
+        { owner, revision: 1, cursor: null, items: [{ ...handoffWorkerRows[3], handoff: {
+          collection: "collected", bookkeeping: "pending", delivery: "offered", continuation: "requested", futureField: true,
+        } }] },
+        { owner, revision: 1, cursor: null, items: Array.from({ length: 51 }, () => handoffWorkerRows[3]) },
+        { owner: { ...owner, epoch: "foreign" }, revision: 1, cursor: null, items: [legacyWorkerRow] },
+      ];
+      for (const page of badPages) {
+        for (const method of ["list", "subscribe"] as const) {
+          const client = yield* Effect.promise(() => f.open());
+          f.policy.roster = page;
+          const error = yield* Effect.tryPromise(async () => method === "list"
+            ? client.list() : client.subscribe(() => assert.fail("Invalid subscription must not notify"))).pipe(Effect.flip);
+          assert.deepEqual(classifyPiWorkerFailure(error.cause), { kind: "transport", code: "invalid_reply" });
+          yield* Effect.promise(() => client.disconnect());
+        }
+      }
+      assert.isTrue(f.calls.every((call) => ["connect", "workers.list", "subscribe"].includes(call)));
+    }).pipe(Effect.scoped));
+
+  it.effect("keeps bounded pagination revisions and stale cursor errors on the passive client", () =>
+    Effect.gen(function* () {
+      const f = yield* workerWireFixture(owner);
+      const first = { owner, revision: 7, cursor: "next-page", items: handoffWorkerRows.slice(0, 50) };
+      f.policy.roster = first;
+      assert.deepEqual(yield* Effect.promise(() => f.client.list()), first);
+      const second = { ...first, cursor: null, items: handoffWorkerRows.slice(50) };
+      f.policy.roster = second;
+      assert.deepEqual(yield* Effect.promise(() => f.client.list(first.cursor, first.revision)), second);
+      assert.deepEqual(f.requests.at(-1)?.params, { after: "next-page", revision: 7 });
+      f.policy.pageError = "stale_cursor";
+      const error = yield* Effect.tryPromise(() => f.client.list(first.cursor, first.revision)).pipe(Effect.flip);
+      assert.deepEqual(classifyPiWorkerFailure(error.cause), { kind: "coded", code: "stale_cursor" });
+    }).pipe(Effect.scoped));
+});
 
 describe("Pi worker failure provenance", () => {
   it.effect("rejects protocol 1 before connecting without downgrading the public client", () =>

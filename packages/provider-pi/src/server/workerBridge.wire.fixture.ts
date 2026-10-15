@@ -18,17 +18,22 @@ export const workerWireFixture = (owner: BridgeClient["owner"], ownedDirectory?:
     const sockets = new Set<NodeNet.Socket>();
     const joins: Array<Promise<void>> = [];
     const calls: string[] = [];
+    const requests: Request[] = [];
     const policy = {
       resumeError: undefined as ErrorCode | undefined, malformed: false,
       subscribeError: false,
       reply: undefined as ((request: Request) => unknown) | undefined,
+      roster: { owner, revision: 1, cursor: null, items: [] } as unknown,
+      pageError: undefined as ErrorCode | undefined,
     };
+    let notify: ((revision: number) => void) | undefined;
     const server = NodeNet.createServer((socket) => {
       sockets.add(socket);
       joins.push(new Promise<void>((resolve) => socket.once("close", () => { sockets.delete(socket); resolve(); })));
       const receive = frames((value) => {
         if (!isRequest(value)) throw new Error("Invalid fixture request");
         calls.push(value.method);
+        requests.push(value);
         if (value.method === "connect") {
           if (value.params.token !== token || value.params.expectedSessionId !== owner.coordinatorSessionId)
             throw new Error("Unauthenticated fixture client");
@@ -41,13 +46,17 @@ export const workerWireFixture = (owner: BridgeClient["owner"], ownedDirectory?:
           socket.write("not-json\n");
         } else if (value.method === "subscribe") {
           socket.write(frame(policy.subscribeError ? failure(value, "unsupported_method") :
-            success(value, { subscriptionId: "subscription", snapshot: { owner, revision: 1, items: [], cursor: null } })));
+            success(value, { subscriptionId: "subscription", snapshot: policy.roster })));
+          notify = (revision) => socket.write(frame({
+            version: 2, method: "changed", owner, clientId: value.clientId,
+            subscriptionId: "subscription", revision, refreshRequired: true,
+          }));
         } else if (value.method === "unsubscribe") {
           socket.write(frame(success(value, { subscriptionId: value.params.subscriptionId })));
         } else if (policy.reply) {
           socket.write(frame(success(value, policy.reply(value))));
         } else if (value.method === "workers.list") {
-          socket.write(frame(success(value, { owner, revision: 1, items: [], cursor: null })));
+          socket.write(frame(policy.pageError ? failure(value, policy.pageError) : success(value, policy.roster)));
         } else throw new Error(`Unexpected fixture method: ${value.method}`);
       });
       socket.on("data", receive);
@@ -70,7 +79,12 @@ export const workerWireFixture = (owner: BridgeClient["owner"], ownedDirectory?:
       return client;
     };
     const client = await open();
-    return { client, open, descriptor, calls, policy, sockets, joinSockets: () => Promise.all(joins), async close() {
+    return { client, open, descriptor, calls, requests, policy, sockets,
+      notify: (revision: number) => {
+        if (!notify) throw new Error("No subscription");
+        notify(revision);
+      },
+      joinSockets: () => Promise.all(joins), async close() {
       await Promise.all([...clients].map((client) => client.disconnect()));
       for (const socket of sockets) socket.destroy();
       await Promise.all(joins);
