@@ -9,6 +9,28 @@ import { formatModelSlugName, resolveSelectableModel } from "@t3tools/shared/mod
 import { fileBasename } from "@t3tools/shared/path";
 import { isTerminalSubagentStatus } from "./subagentRuntime.ts";
 
+export type NativeWorkerBriefPresentation =
+  | { state: "missing" }
+  | { state: "available"; text: string; completeness: "complete" | "partial" | "unknown" };
+
+/** Preserve the original brief, including empty text, and its reported completeness. */
+export function nativeWorkerBriefPresentation(
+  worker: PiNativeWorkerSummary,
+): NativeWorkerBriefPresentation {
+  return worker.brief === undefined
+    ? { state: "missing" }
+    : {
+        state: "available",
+        text: worker.brief,
+        completeness:
+          worker.briefComplete === undefined
+            ? "unknown"
+            : worker.briefComplete
+              ? "complete"
+              : "partial",
+      };
+}
+
 /** Public lifecycle fields are independent: observation failure is not execution failure. */
 export function nativeWorkerPresentation(worker: PiNativeWorkerSummary) {
   const launch = worker.launch;

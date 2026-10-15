@@ -195,7 +195,7 @@ it("keeps persisted Lineage navigable when the selected turn has no roster", asy
   }
 });
 
-it("presents native lifecycle without an editor or worker controls and offers only the parent return", async () => {
+it("keeps the native footer compact and read-only while preserving the parent return", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   await act(async () => {
     renderer = create(
@@ -210,7 +210,12 @@ it("presents native lifecycle without an editor or worker controls and offers on
     );
   });
   const text = JSON.stringify(renderer.toJSON());
-  expect(text).toContain("Availability unavailable");
+  expect(text).not.toContain("Availability unavailable");
+  expect(text).not.toContain("Capture open");
+  expect(text).not.toContain("assignment-review");
+  expect(text).not.toContain("Review the public changes");
+  expect(text).toContain("reviewer");
+  expect(text).toContain("gpt-effective");
   expect(text).toContain("Execution completed");
   expect(text).not.toContain("Execution failed");
   expect(renderer.root.findAll((node) => String(node.type) === "TextInput")).toHaveLength(0);

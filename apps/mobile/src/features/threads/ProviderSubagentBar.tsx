@@ -26,37 +26,34 @@ export function ProviderSubagentBar(props: {
   /** Null until the subagent's root turn arrives. */
   readonly status: ProviderSubagentStatus | null;
   readonly onOpenParent: (() => void) | null;
+  readonly onOpenAssignment?: (() => void) | undefined;
   readonly nativeWorker?: PiNativeWorkerSummary | undefined;
 }) {
   const native = props.nativeWorker ? nativeWorkerPresentation(props.nativeWorker) : null;
+  const nativeRole = native?.role ?? props.nativeWorker?.launch.source;
   const live = !native && props.status !== null && isOrchestrationV2WorkActive(props.status.status);
   const nowMs = useVisibleSecondClock(live);
-  const statusLabel = native?.status ?? formatProviderSubagentStatus(props.status, nowMs);
+  const statusLabel = native
+    ? `Execution ${props.nativeWorker?.execution ?? "unknown"}`
+    : formatProviderSubagentStatus(props.status, nowMs);
   const modelLabel = native ? (native.model ?? "Not reported") : props.modelLabel;
   const effortLabel = native ? null : props.effortLabel;
   const modelDescription = effortLabel === null ? modelLabel : `${modelLabel}, ${effortLabel}`;
 
   return (
     <View>
-      {native ? (
-        <View className="gap-1 px-4 pb-2">
-          <Text className="text-xs text-foreground-secondary">
-            {native.identity ?? native.role}
-          </Text>
-          <Text className="text-xs text-foreground-secondary">{native.task}</Text>
-          <Text className="text-xs text-foreground-secondary">{native.status}</Text>
-          <Text className="text-xs text-foreground-secondary">
-            Effective model: {native.model ?? "Not reported"}
-          </Text>
-        </View>
-      ) : null}
       <View className="flex-row items-center gap-3 rounded-[20px] border border-border-subtle bg-card-alt py-2 pe-2 ps-4">
         {/* Only the text is one element, so "Open parent" stays reachable. */}
         <View
           accessible
-          accessibilityLabel={`${modelDescription} subagent, ${statusLabel}. It runs on its own and cannot take messages.`}
+          accessibilityLabel={`${native ? `${nativeRole}, ` : ""}${modelDescription} subagent, ${statusLabel}. It runs on its own and cannot take messages.`}
           className="min-w-0 flex-1 gap-0.5"
         >
+          {native ? (
+            <Text numberOfLines={1} className="font-t3-bold text-sm text-foreground">
+              {nativeRole}
+            </Text>
+          ) : null}
           <View className="min-w-0 flex-row items-center gap-1.5">
             {props.provider ? (
               <ProviderIcon
@@ -85,6 +82,13 @@ export function ProviderSubagentBar(props: {
             {statusLabel} · Runs on its own
           </Text>
         </View>
+        {native && props.onOpenAssignment ? (
+          <RequestActionButton
+            label="Assignment"
+            tone="secondary"
+            onPress={props.onOpenAssignment}
+          />
+        ) : null}
         {props.onOpenParent ? (
           <RequestActionButton label="Open parent" tone="secondary" onPress={props.onOpenParent} />
         ) : null}

@@ -52,16 +52,22 @@ import {
   makeSubagentConversationArtifacts,
 } from "@t3tools/provider-core/server/subagentProjection";
 
-const encodeNativeWorkerIdentity = Schema.encodeSync(Schema.fromJsonString(
-  Schema.Tuple([ProviderInstanceId, Schema.String, Schema.String]),
-));
-const decodeNativeTodoSnapshot = Schema.decodeUnknownOption(Schema.Struct({
-  format: Schema.Literal("rpiv-todo-v1"),
-  tasks: Schema.Array(Schema.Struct({
-    id: Schema.Number, identityEntryId: Schema.String, subject: Schema.String,
-    status: Schema.Literals(["pending", "in_progress", "completed", "deleted"]),
-  })),
-}));
+const encodeNativeWorkerIdentity = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Tuple([ProviderInstanceId, Schema.String, Schema.String])),
+);
+const decodeNativeTodoSnapshot = Schema.decodeUnknownOption(
+  Schema.Struct({
+    format: Schema.Literal("rpiv-todo-v1"),
+    tasks: Schema.Array(
+      Schema.Struct({
+        id: Schema.Number,
+        identityEntryId: Schema.String,
+        subject: Schema.String,
+        status: Schema.Literals(["pending", "in_progress", "completed", "deleted"]),
+      }),
+    ),
+  }),
+);
 
 export class ProviderEventNormalizeError extends Schema.TaggedError<ProviderEventNormalizeError>()(
   "ProviderEventNormalizeError",
@@ -768,71 +774,116 @@ export const layer: Layer.Layer<
     const nativeAdmissionEvents = Effect.fnUntraced(function* (input: ProviderEventIngestInput) {
       const admission = input.nativeWorkerAdmission;
       if (admission === undefined || input.event.type !== "turn_item.updated") return [];
-      if (admission.summary.gaps.some((gap) => gap === "provenance_mismatch" || gap === "stale_owner")) {
+      if (
+        admission.summary.gaps.some((gap) => gap === "provenance_mismatch" || gap === "stale_owner")
+      ) {
         return [];
       }
       const launch = admission.summary.launch;
       const existing = yield* eventSink.nativeWorkers(input.providerSessionId);
-      if (existing.some((member) => NodeUtil.isDeepStrictEqual(member.nativeWorker?.launch, launch))) return [];
+      if (
+        existing.some((member) => NodeUtil.isDeepStrictEqual(member.nativeWorker?.launch, launch))
+      )
+        return [];
       const now = yield* DateTime.now;
       const parent = yield* projections.getThread(input.threadId);
-      const identity = Hex.encode(yield* NodeCrypto.make.digest(
-        "SHA-256", new TextEncoder().encode(encodeNativeWorkerIdentity([
-          launch.providerInstanceId, launch.coordinatorSessionId, launch.instanceId,
-        ])),
-      ));
+      const identity = Hex.encode(
+        yield* NodeCrypto.make.digest(
+          "SHA-256",
+          new TextEncoder().encode(
+            encodeNativeWorkerIdentity([
+              launch.providerInstanceId,
+              launch.coordinatorSessionId,
+              launch.instanceId,
+            ]),
+          ),
+        ),
+      );
       const id = NodeId.make(`pi-worker:${identity}`);
       if (existing.some((member) => member.id === id)) return [];
       const childThreadId = ThreadId.make(`pi-worker:${identity}`);
       const providerThreadId = ProviderThreadId.make(`pi-worker:${identity}`);
-      const selection: ModelSelection = admission.summary.activated != null
-        ? {
-            instanceId: input.providerInstanceId,
-            model: admission.summary.activated.model,
-            options: [{ id: "thinking", value: admission.summary.activated.reasoning }],
-          }
-        : admission.summary.selected !== undefined
+      const selection: ModelSelection =
+        admission.summary.activated != null
           ? {
               instanceId: input.providerInstanceId,
-              model: admission.summary.selected.model,
-              ...(admission.summary.selected.reasoning === undefined ? {} : {
-                options: [{ id: "thinking", value: admission.summary.selected.reasoning }],
-              }),
+              model: admission.summary.activated.model,
+              options: [{ id: "thinking", value: admission.summary.activated.reasoning }],
             }
-          : parent.modelSelection;
+          : admission.summary.selected !== undefined
+            ? {
+                instanceId: input.providerInstanceId,
+                model: admission.summary.selected.model,
+                ...(admission.summary.selected.reasoning === undefined
+                  ? {}
+                  : {
+                      options: [{ id: "thinking", value: admission.summary.selected.reasoning }],
+                    }),
+              }
+            : parent.modelSelection;
       const subagent: OrchestrationV2Subagent = {
-        id, threadId: input.threadId, runId: launch.runId,
-        parentNodeId: launch.toolNodeId, origin: "provider_native", createdBy: "agent",
-        driver: input.event.driver, providerInstanceId: input.providerInstanceId,
-        providerThreadId, childThreadId, nativeTaskRef: null,
-        prompt: admission.summary.brief ?? "", title: admission.summary.roleId ?? launch.instanceId,
-        model: selection.model, modelSelection: selection,
-        status: admission.summary.execution === "accepted" ? "pending"
-          : admission.summary.execution ?? "pending",
-        nativeWorker: admission.summary, result: null,
-        startedAt: now, completedAt: null, updatedAt: now,
+        id,
+        threadId: input.threadId,
+        runId: launch.runId,
+        parentNodeId: launch.toolNodeId,
+        origin: "provider_native",
+        createdBy: "agent",
+        driver: input.event.driver,
+        providerInstanceId: input.providerInstanceId,
+        providerThreadId,
+        childThreadId,
+        nativeTaskRef: null,
+        prompt: admission.summary.brief ?? "",
+        title: admission.summary.roleId ?? launch.instanceId,
+        model: selection.model,
+        modelSelection: selection,
+        status:
+          admission.summary.execution === "accepted"
+            ? "pending"
+            : (admission.summary.execution ?? "pending"),
+        nativeWorker: admission.summary,
+        result: null,
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
       };
       return [
         yield* makeDomainEvent(input, {
-          type: "thread.created", threadId: childThreadId,
+          type: "thread.created",
+          threadId: childThreadId,
           payload: makeSubagentChildThread({
-            parentThread: parent, childThreadId, parentNodeId: id,
+            parentThread: parent,
+            childThreadId,
+            parentNodeId: id,
             activeProviderThreadId: providerThreadId,
-            providerInstanceId: input.providerInstanceId, modelSelection: selection,
-            title: subagent.title ?? launch.instanceId, now,
-            createdBy: "agent", creationSource: "provider",
+            providerInstanceId: input.providerInstanceId,
+            modelSelection: selection,
+            title: subagent.title ?? launch.instanceId,
+            now,
+            createdBy: "agent",
+            creationSource: "provider",
           }),
         }),
         yield* makeDomainEvent(input, {
-          type: "provider-thread.updated", threadId: childThreadId,
+          type: "provider-thread.updated",
+          threadId: childThreadId,
           payload: {
-            id: providerThreadId, driver: input.event.driver, providerInstanceId: input.providerInstanceId,
-            providerSessionId: input.providerSessionId, appThreadId: childThreadId,
-            ownerNodeId: id, nativeThreadRef: null, nativeConversationHeadRef: null,
-            status: "not_loaded", firstRunOrdinal: null, lastRunOrdinal: null,
-            handoffIds: [], forkedFrom: null,
+            id: providerThreadId,
+            driver: input.event.driver,
+            providerInstanceId: input.providerInstanceId,
+            providerSessionId: input.providerSessionId,
+            appThreadId: childThreadId,
+            ownerNodeId: id,
+            nativeThreadRef: null,
+            nativeConversationHeadRef: null,
+            status: "not_loaded",
+            firstRunOrdinal: null,
+            lastRunOrdinal: null,
+            handoffIds: [],
+            forkedFrom: null,
             nativeMetadata: { nativeWorkerCheckpoint: admission.checkpoint },
-            createdAt: now, updatedAt: now,
+            createdAt: now,
+            updatedAt: now,
           },
         }),
         yield* makeDomainEvent(input, { type: "subagent.updated", nodeId: id, payload: subagent }),
@@ -840,210 +891,329 @@ export const layer: Layer.Layer<
     });
 
     return ProviderEventIngestorV2.of({
-      ingestNativeWorker: (batch, isConnected) => eventSink.writeNativeWorker({
-        ...(isConnected === undefined ? {} : { isConnected }),
-        launch: batch.launch,
-        ownerGeneration: batch.checkpoint.ownerGeneration,
-        expectedCheckpoint: batch.expectedCheckpoint,
-        checkpoint: batch.checkpoint,
-        build: (subagent, providerThread) => Effect.gen(function* () {
-          if (!NodeUtil.isDeepStrictEqual(batch.summary.launch, batch.launch) ||
-            !NodeUtil.isDeepStrictEqual(batch.checkpoint.bindings, batch.bindings)) {
-            return yield* Effect.die(new Error("Native batch provenance mismatch."));
-          }
-          const summary = { ...subagent.nativeWorker, ...batch.summary };
-          const childThreadId = subagent.childThreadId!;
-          const previous = yield* projections.getThreadRecords(childThreadId, ["turnItems"]);
-          const now = yield* DateTime.now;
-          const input: ProviderEventIngestInput = {
-            threadId: childThreadId, providerInstanceId: batch.launch.providerInstanceId,
-            providerSessionId: batch.launch.providerSessionId,
-            event: { type: "subagent.updated", driver: subagent.driver, subagent },
-          };
-          const events: Array<OrchestrationV2DomainEvent> = [];
-          const items = new Map(previous.turnItems.map((item) => [item.id, item]));
-          let sourceProgress = false;
-          for (const record of batch.records) {
-            const p = record.provenance;
-            if (p.instanceId !== batch.launch.instanceId ||
-              !NodeUtil.isDeepStrictEqual(p.owner, batch.checkpoint.owner) ||
-              p.captureEpoch !== batch.checkpoint.captureEpoch ||
-              !batch.bindings.some((binding) => binding.generation === p.binding)) {
-              return yield* Effect.die(new Error("Native record provenance mismatch."));
-            }
-            if (record.kind === "branch_changed") continue;
-            const key = record.kind === "tool" ? p.toolCallId ?? p.id : p.id;
-            const id = TurnItemId.make(`pi-worker:${subagent.id}:${p.binding}:${record.kind}:${key}`);
-            const stored = items.get(id);
-            const ledger = stored?.nativeWorkerRecords ??
-              (stored?.nativeWorkerRecord === undefined ? [] : [stored.nativeWorkerRecord]);
-            const sameRecord = (entry: typeof p) => entry.id === p.id && entry.binding === p.binding &&
-              entry.captureEpoch === p.captureEpoch && entry.instanceId === p.instanceId &&
-              NodeUtil.isDeepStrictEqual(entry.owner, p.owner);
-            if ((ledger.find(sameRecord)?.revision ?? 0) >= p.revision) continue;
-            const nativeWorkerRecords = [...ledger.filter((entry) => !sameRecord(entry)), p];
-            const rendered = stored?.nativeWorkerRecord;
-            const updatesRenderedRecord = rendered === undefined || p.order >= rendered.order ||
-              sameRecord(rendered);
-            sourceProgress = true;
-            const base = {
-              id, threadId: childThreadId, runId: null, nodeId: subagent.id,
-              providerThreadId: providerThread.id, providerTurnId: null,
-              nativeItemRef: null, parentItemId: record.kind === "tool" && record.parentToolCallId !== undefined
-                ? TurnItemId.make(`pi-worker:${subagent.id}:${p.binding}:tool:${record.parentToolCallId}`) : null,
-              ordinal: stored?.ordinal ?? p.order + 1,
-              title: null, startedAt: stored?.startedAt ?? now,
-              completedAt: null, updatedAt: now,
-              nativeWorkerRecord: updatesRenderedRecord ? p : rendered, nativeWorkerRecords,
-            };
-            let item: OrchestrationV2TurnItem;
-            if (record.kind === "message") {
-              let text = record.payload.blocks.filter((block) => block.type === "text")
-                .map((block) => block.text).join("\n");
-              if (record.payload.role === "assistant") {
-                const notices: string[] = [];
-                if (record.payload.blocks.some((block) => block.type === "omitted")) {
-                  notices.push("[T3 notice] Some content is unavailable.");
+      ingestNativeWorker: (batch, isConnected) =>
+        eventSink.writeNativeWorker({
+          ...(isConnected === undefined ? {} : { isConnected }),
+          launch: batch.launch,
+          ownerGeneration: batch.checkpoint.ownerGeneration,
+          expectedCheckpoint: batch.expectedCheckpoint,
+          checkpoint: batch.checkpoint,
+          build: (subagent, providerThread) =>
+            Effect.gen(function* () {
+              if (
+                !NodeUtil.isDeepStrictEqual(batch.summary.launch, batch.launch) ||
+                !NodeUtil.isDeepStrictEqual(batch.checkpoint.bindings, batch.bindings)
+              ) {
+                return yield* Effect.die(new Error("Native batch provenance mismatch."));
+              }
+              const summary = { ...subagent.nativeWorker, ...batch.summary };
+              const childThreadId = subagent.childThreadId!;
+              const previous = yield* projections.getThreadRecords(childThreadId, ["turnItems"]);
+              const now = yield* DateTime.now;
+              const input: ProviderEventIngestInput = {
+                threadId: childThreadId,
+                providerInstanceId: batch.launch.providerInstanceId,
+                providerSessionId: batch.launch.providerSessionId,
+                event: { type: "subagent.updated", driver: subagent.driver, subagent },
+              };
+              const events: Array<OrchestrationV2DomainEvent> = [];
+              const items = new Map(previous.turnItems.map((item) => [item.id, item]));
+              let sourceProgress = false;
+              for (const record of batch.records) {
+                const p = record.provenance;
+                if (
+                  p.instanceId !== batch.launch.instanceId ||
+                  !NodeUtil.isDeepStrictEqual(p.owner, batch.checkpoint.owner) ||
+                  p.captureEpoch !== batch.checkpoint.captureEpoch ||
+                  !batch.bindings.some((binding) => binding.generation === p.binding)
+                ) {
+                  return yield* Effect.die(new Error("Native record provenance mismatch."));
                 }
-                const diagnostic = record.payload.errorMessage?.trim();
-                if (diagnostic) {
-                  notices.push(`[T3 notice] ${diagnostic}`);
-                } else if (record.payload.stopReason === "error") {
-                  notices.push("[T3 notice] The response failed.");
+                if (record.kind === "branch_changed") continue;
+                const key = record.kind === "tool" ? (p.toolCallId ?? p.id) : p.id;
+                const id = TurnItemId.make(
+                  `pi-worker:${subagent.id}:${p.binding}:${record.kind}:${key}`,
+                );
+                const stored = items.get(id);
+                const ledger =
+                  stored?.nativeWorkerRecords ??
+                  (stored?.nativeWorkerRecord === undefined ? [] : [stored.nativeWorkerRecord]);
+                const sameRecord = (entry: typeof p) =>
+                  entry.id === p.id &&
+                  entry.binding === p.binding &&
+                  entry.captureEpoch === p.captureEpoch &&
+                  entry.instanceId === p.instanceId &&
+                  NodeUtil.isDeepStrictEqual(entry.owner, p.owner);
+                if ((ledger.find(sameRecord)?.revision ?? 0) >= p.revision) continue;
+                const nativeWorkerRecords = [...ledger.filter((entry) => !sameRecord(entry)), p];
+                const rendered = stored?.nativeWorkerRecord;
+                const updatesRenderedRecord =
+                  rendered === undefined || p.order >= rendered.order || sameRecord(rendered);
+                sourceProgress = true;
+                const base = {
+                  id,
+                  threadId: childThreadId,
+                  runId: null,
+                  nodeId: subagent.id,
+                  providerThreadId: providerThread.id,
+                  providerTurnId: null,
+                  nativeItemRef: null,
+                  parentItemId:
+                    record.kind === "tool" && record.parentToolCallId !== undefined
+                      ? TurnItemId.make(
+                          `pi-worker:${subagent.id}:${p.binding}:tool:${record.parentToolCallId}`,
+                        )
+                      : null,
+                  ordinal: stored?.ordinal ?? p.order + 1,
+                  title: null,
+                  startedAt: stored?.startedAt ?? now,
+                  completedAt: null,
+                  updatedAt: now,
+                  nativeWorkerRecord: updatesRenderedRecord ? p : rendered,
+                  nativeWorkerRecords,
+                };
+                let item: OrchestrationV2TurnItem;
+                if (record.kind === "message") {
+                  let text = record.payload.blocks
+                    .filter((block) => block.type === "text")
+                    .map((block) => block.text)
+                    .join("\n");
+                  if (record.payload.role === "assistant") {
+                    const notices: string[] = [];
+                    const diagnostic = record.payload.errorMessage?.trim();
+                    if (diagnostic) {
+                      notices.push(`[T3 notice] ${diagnostic}`);
+                    } else if (record.payload.stopReason === "error") {
+                      notices.push("[T3 notice] The response failed.");
+                    }
+                    if (record.payload.stopReason === "aborted") {
+                      notices.push("[T3 notice] The response was aborted.");
+                    } else if (record.payload.stopReason === "length") {
+                      notices.push("[T3 notice] The response reached its length limit.");
+                    }
+                    if (notices.length > 0) {
+                      text = [...(text.length > 0 ? [text] : []), ...notices].join("\n\n");
+                    }
+                  }
+                  const artifacts = makeSubagentConversationArtifacts({
+                    messageId: MessageId.make(`${id}:message`),
+                    turnItemId: id,
+                    threadId: childThreadId,
+                    rootNodeId: subagent.id,
+                    providerThreadId: providerThread.id,
+                    providerTurnId: null,
+                    nativeItemRef: null,
+                    role: record.payload.role,
+                    text,
+                    ordinal: base.ordinal,
+                    now,
+                  });
+                  events.push(
+                    yield* makeDomainEvent(input, {
+                      type: "message.updated",
+                      payload: artifacts.message,
+                    }),
+                  );
+                  item = { ...artifacts.turnItem, nativeWorkerRecord: p, nativeWorkerRecords };
+                } else {
+                  const oldTool = stored?.type === "dynamic_tool" ? stored : undefined;
+                  item = {
+                    ...base,
+                    type: "dynamic_tool",
+                    toolName: updatesRenderedRecord
+                      ? record.payload.name
+                      : (oldTool?.toolName ?? record.payload.name),
+                    status:
+                      !updatesRenderedRecord && oldTool !== undefined
+                        ? oldTool.status
+                        : record.payload.status === "started" || record.payload.status === "updated"
+                          ? "running"
+                          : record.payload.status === "error"
+                            ? "failed"
+                            : "completed",
+                    input:
+                      record.payload.argsState === "available"
+                        ? record.payload.args
+                        : oldTool?.input,
+                    output: updatesRenderedRecord
+                      ? (record.payload.todoSnapshot ?? record.payload.result ?? oldTool?.output)
+                      : oldTool?.output,
+                  };
                 }
-                if (record.payload.stopReason === "aborted") {
-                  notices.push("[T3 notice] The response was aborted.");
-                } else if (record.payload.stopReason === "length") {
-                  notices.push("[T3 notice] The response reached its length limit.");
-                }
-                if (notices.length > 0) {
-                  text = [...(text.length > 0 ? [text] : []), ...notices].join("\n\n");
+                items.set(id, item);
+                events.push(
+                  yield* makeDomainEvent(input, { type: "turn-item.updated", payload: item }),
+                );
+              }
+              const old = batch.expectedCheckpoint;
+              const summaryChanged = !NodeUtil.isDeepStrictEqual(subagent.nativeWorker, summary);
+              sourceProgress ||=
+                !NodeUtil.isDeepStrictEqual(old?.bindings, batch.bindings) ||
+                old?.capture !== batch.checkpoint.capture ||
+                old?.finalSequence !== batch.checkpoint.finalSequence ||
+                subagent.nativeWorker?.execution !== summary.execution ||
+                subagent.nativeWorker?.capture !== summary.capture ||
+                subagent.nativeWorker?.result !== summary.result ||
+                (batch.result?.complete === true && subagent.result !== batch.result.text);
+              const selection: ModelSelection | undefined =
+                summary.activated != null
+                  ? {
+                      instanceId: batch.launch.providerInstanceId,
+                      model: summary.activated.model,
+                      options: [{ id: "thinking", value: summary.activated.reasoning }],
+                    }
+                  : summary.selected !== undefined
+                    ? {
+                        instanceId: batch.launch.providerInstanceId,
+                        model: summary.selected.model,
+                        ...(summary.selected.reasoning === undefined
+                          ? {}
+                          : {
+                              options: [{ id: "thinking", value: summary.selected.reasoning }],
+                            }),
+                      }
+                    : undefined;
+              if (selection !== undefined) {
+                const child = yield* projections.getThread(childThreadId);
+                if (!modelSelectionsEqual(child.modelSelection, selection)) {
+                  events.push(
+                    yield* makeDomainEvent(input, {
+                      type: "thread.model-selection-updated",
+                      payload: { ...child, modelSelection: selection, updatedAt: now },
+                    }),
+                  );
                 }
               }
-              const artifacts = makeSubagentConversationArtifacts({
-                messageId: MessageId.make(`${id}:message`), turnItemId: id,
-                threadId: childThreadId, rootNodeId: subagent.id,
-                providerThreadId: providerThread.id, providerTurnId: null,
-                nativeItemRef: null, role: record.payload.role, text,
-                ordinal: base.ordinal, now,
-              });
-              events.push(yield* makeDomainEvent(input, { type: "message.updated", payload: artifacts.message }));
-              item = { ...artifacts.turnItem, nativeWorkerRecord: p, nativeWorkerRecords };
-            } else {
-              const oldTool = stored?.type === "dynamic_tool" ? stored : undefined;
-              item = {
-                ...base, type: "dynamic_tool", toolName: updatesRenderedRecord
-                  ? record.payload.name : oldTool?.toolName ?? record.payload.name,
-                status: !updatesRenderedRecord && oldTool !== undefined ? oldTool.status :
-                  record.payload.status === "started" || record.payload.status === "updated"
-                  ? "running" : record.payload.status === "error" ? "failed" : "completed",
-                input: record.payload.argsState === "available" ? record.payload.args : oldTool?.input,
-                output: updatesRenderedRecord
-                  ? record.payload.todoSnapshot ?? record.payload.result ?? oldTool?.output : oldTool?.output,
+              let checklistCapture:
+                | { providerThreadId: ProviderThreadId; capture: PiChecklistCapture }
+                | undefined;
+              const active = batch.bindings.find((binding) => binding.state === "active");
+              const head = active?.todoHead;
+              const selected =
+                head?.state === "ready" && head.sourceEntryId !== null
+                  ? [...items.values()].find(
+                      (item) =>
+                        item.type === "dynamic_tool" &&
+                        (
+                          item.nativeWorkerRecords ??
+                          (item.nativeWorkerRecord === undefined ? [] : [item.nativeWorkerRecord])
+                        ).some(
+                          (entry) =>
+                            entry.binding === active?.generation &&
+                            entry.nativeEntryId === head.sourceEntryId,
+                        ),
+                    )
+                  : undefined;
+              if (active !== undefined) {
+                const snapshot =
+                  selected?.type === "dynamic_tool"
+                    ? decodeNativeTodoSnapshot(selected.output)
+                    : undefined;
+                const pointer = providerThread.nativeMetadata?.checklistSelection;
+                const source = normalizePiTodoSelection({
+                  head,
+                  snapshot: snapshot?._tag === "Some" ? snapshot.value : undefined,
+                });
+                const oldSelected = previous.turnItems.find((item) => item.id === selected?.id);
+                const changed =
+                  pointer?.state !== source.state ||
+                  pointer.list.nativeSessionId !== active.sessionId ||
+                  pointer.sessionGeneration !== active.generation ||
+                  pointer.sourceEntryId !== source.sourceEntryId ||
+                  (selected?.type === "dynamic_tool" &&
+                    oldSelected?.type === "dynamic_tool" &&
+                    !NodeUtil.isDeepStrictEqual(selected.output, oldSelected.output));
+                if (changed) {
+                  checklistCapture = {
+                    providerThreadId: providerThread.id,
+                    capture: {
+                      list: {
+                        threadId: childThreadId,
+                        providerInstanceId: batch.launch.providerInstanceId,
+                        nativeSessionId: active.sessionId,
+                      },
+                      ownerGeneration: batch.checkpoint.ownerGeneration,
+                      sessionGeneration: active.generation,
+                      captureVersion: (pointer?.captureVersion ?? 0) + 1,
+                      expectedPointer:
+                        pointer === undefined ? { kind: "absent" } : { kind: "current", pointer },
+                      authority:
+                        pointer !== undefined && pointer.list.nativeSessionId !== active.sessionId
+                          ? "session_reset"
+                          : "capture",
+                      source,
+                    },
+                  };
+                }
+              }
+              events.push(
+                yield* makeDomainEvent(input, {
+                  type: "provider-thread.updated",
+                  payload: {
+                    ...providerThread,
+                    nativeThreadRef:
+                      active === undefined
+                        ? providerThread.nativeThreadRef
+                        : {
+                            driver: subagent.driver,
+                            strength: "strong",
+                            nativeId: active.sessionId,
+                          },
+                    nativeMetadata: {
+                      ...providerThread.nativeMetadata,
+                      nativeWorkerCheckpoint: batch.checkpoint,
+                    },
+                    updatedAt: now,
+                  },
+                }),
+                yield* makeDomainEvent(input, {
+                  type: "subagent.updated",
+                  threadId: subagent.threadId,
+                  runId: subagent.runId,
+                  payload: {
+                    ...subagent,
+                    nativeWorker: summary,
+                    status:
+                      summary.execution === "accepted"
+                        ? "pending"
+                        : (summary.execution ?? subagent.status),
+                    ...(selection === undefined
+                      ? {}
+                      : { model: selection.model, modelSelection: selection }),
+                    result: batch.result?.complete === true ? batch.result.text : subagent.result,
+                    updatedAt: now,
+                  },
+                }),
+              );
+              return {
+                events:
+                  !sourceProgress &&
+                  checklistCapture === undefined &&
+                  !summaryChanged &&
+                  NodeUtil.isDeepStrictEqual(old, batch.checkpoint)
+                    ? []
+                    : events,
+                ...(checklistCapture === undefined ? {} : { checklistCapture }),
+                sourceProgress,
               };
-            }
-            items.set(id, item);
-            events.push(yield* makeDomainEvent(input, { type: "turn-item.updated", payload: item }));
-          }
-          const old = batch.expectedCheckpoint;
-          const summaryChanged = !NodeUtil.isDeepStrictEqual(subagent.nativeWorker, summary);
-          sourceProgress ||= !NodeUtil.isDeepStrictEqual(old?.bindings, batch.bindings) ||
-            old?.capture !== batch.checkpoint.capture || old?.finalSequence !== batch.checkpoint.finalSequence ||
-            subagent.nativeWorker?.execution !== summary.execution ||
-            subagent.nativeWorker?.capture !== summary.capture ||
-            subagent.nativeWorker?.result !== summary.result ||
-            (batch.result?.complete === true && subagent.result !== batch.result.text);
-          const selection: ModelSelection | undefined = summary.activated != null
-            ? { instanceId: batch.launch.providerInstanceId, model: summary.activated.model,
-                options: [{ id: "thinking", value: summary.activated.reasoning }] }
-            : summary.selected !== undefined
-              ? { instanceId: batch.launch.providerInstanceId, model: summary.selected.model,
-                  ...(summary.selected.reasoning === undefined ? {} : {
-                    options: [{ id: "thinking", value: summary.selected.reasoning }],
-                  }) }
-              : undefined;
-          if (selection !== undefined) {
-            const child = yield* projections.getThread(childThreadId);
-            if (!modelSelectionsEqual(child.modelSelection, selection)) {
-              events.push(yield* makeDomainEvent(input, { type: "thread.model-selection-updated",
-                payload: { ...child, modelSelection: selection, updatedAt: now } }));
-            }
-          }
-          let checklistCapture: { providerThreadId: ProviderThreadId; capture: PiChecklistCapture } | undefined;
-          const active = batch.bindings.find((binding) => binding.state === "active");
-          const head = active?.todoHead;
-          const selected = head?.state === "ready" && head.sourceEntryId !== null
-            ? [...items.values()].find((item) =>
-                item.type === "dynamic_tool" && (item.nativeWorkerRecords ??
-                  (item.nativeWorkerRecord === undefined ? [] : [item.nativeWorkerRecord])).some((entry) =>
-                  entry.binding === active?.generation && entry.nativeEntryId === head.sourceEntryId))
-            : undefined;
-          if (active !== undefined) {
-            const snapshot = selected?.type === "dynamic_tool"
-              ? decodeNativeTodoSnapshot(selected.output) : undefined;
-            const pointer = providerThread.nativeMetadata?.checklistSelection;
-            const source = normalizePiTodoSelection({
-              head, snapshot: snapshot?._tag === "Some" ? snapshot.value : undefined,
-            });
-            const oldSelected = previous.turnItems.find((item) => item.id === selected?.id);
-            const changed = pointer?.state !== source.state ||
-              pointer.list.nativeSessionId !== active.sessionId ||
-              pointer.sessionGeneration !== active.generation ||
-              pointer.sourceEntryId !== source.sourceEntryId ||
-              (selected?.type === "dynamic_tool" && oldSelected?.type === "dynamic_tool" &&
-                !NodeUtil.isDeepStrictEqual(selected.output, oldSelected.output));
-            if (changed) {
-              checklistCapture = { providerThreadId: providerThread.id, capture: {
-                list: { threadId: childThreadId, providerInstanceId: batch.launch.providerInstanceId,
-                  nativeSessionId: active.sessionId },
-                ownerGeneration: batch.checkpoint.ownerGeneration,
-                sessionGeneration: active.generation,
-                captureVersion: (pointer?.captureVersion ?? 0) + 1,
-                expectedPointer: pointer === undefined ? { kind: "absent" } : { kind: "current", pointer },
-                authority: pointer !== undefined && pointer.list.nativeSessionId !== active.sessionId
-                  ? "session_reset" : "capture",
-                source,
-              } };
-            }
-          }
-          events.push(
-            yield* makeDomainEvent(input, {
-              type: "provider-thread.updated",
-              payload: {
-                ...providerThread,
-                nativeThreadRef: active === undefined ? providerThread.nativeThreadRef
-                  : { driver: subagent.driver, strength: "strong", nativeId: active.sessionId },
-                nativeMetadata: { ...providerThread.nativeMetadata, nativeWorkerCheckpoint: batch.checkpoint },
-                updatedAt: now,
-              },
             }),
-            yield* makeDomainEvent(input, {
-              type: "subagent.updated", threadId: subagent.threadId, runId: subagent.runId,
-              payload: {
-                ...subagent, nativeWorker: summary,
-                status: summary.execution === "accepted" ? "pending"
-                  : summary.execution ?? subagent.status,
-                ...(selection === undefined ? {} : { model: selection.model, modelSelection: selection }),
-                result: batch.result?.complete === true ? batch.result.text : subagent.result,
-                updatedAt: now,
-              },
-            }),
-          );
-          return {
-            events: !sourceProgress && checklistCapture === undefined &&
-              !summaryChanged && NodeUtil.isDeepStrictEqual(old, batch.checkpoint) ? [] : events,
-            ...(checklistCapture === undefined ? {} : { checklistCapture }), sourceProgress,
-          };
         }),
-      }),
       normalize,
       ingestNormalized: (input) =>
         Effect.gen(function* () {
-          const events = [...(yield* normalize(input)), ...(yield* nativeAdmissionEvents(input).pipe(
-            Effect.mapError((cause) => new ProviderEventPublishError({
-              providerSessionId: input.providerSessionId, eventCount: 3, cause,
-            })),
-          ))];
+          const events = [
+            ...(yield* normalize(input)),
+            ...(yield* nativeAdmissionEvents(input).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderEventPublishError({
+                    providerSessionId: input.providerSessionId,
+                    eventCount: 3,
+                    cause,
+                  }),
+              ),
+            )),
+          ];
           if (events.length === 0) {
             return [];
           }
@@ -1088,9 +1258,11 @@ export const layer: Layer.Layer<
           }
           const result = yield* eventSink
             .writeIfRunCurrent({
-              ...(input.nativeWorkerAdmission?.isConnected === undefined ? {} : {
-                isConnected: input.nativeWorkerAdmission.isConnected,
-              }),
+              ...(input.nativeWorkerAdmission?.isConnected === undefined
+                ? {}
+                : {
+                    isConnected: input.nativeWorkerAdmission.isConnected,
+                  }),
               ...(checklistCapture === undefined ? {} : { checklistCapture }),
               guardPendingUserInputCancellations: true,
               ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
