@@ -3,12 +3,19 @@ import {
   type ProviderSubagentStatus,
 } from "@t3tools/client-runtime/state/thread-execution";
 import { isOrchestrationV2WorkActive } from "@t3tools/contracts";
+import type { PiNativeWorkerSummary } from "@t3tools/contracts";
+import { nativeWorkerPresentation } from "@t3tools/client-runtime/state/subagent-display";
 import { ArrowUpLeftIcon } from "lucide-react";
-import { useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 import type { ProviderInstanceEntry } from "../../providerInstances";
 import { Button } from "../ui/button";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
+import {
+  ComposerTasksContent,
+  type ComposerTasksProgress,
+  type ComposerTaskStep,
+} from "./ComposerTasksBadge";
 
 /**
  * Stands in for the composer on a provider-native subagent thread. The
@@ -26,68 +33,94 @@ export function ProviderSubagentBar(props: {
   /** Null until the subagent's root turn arrives. */
   readonly status: ProviderSubagentStatus | null;
   readonly onOpenParent: (() => void) | null;
+  readonly nativeWorker?: PiNativeWorkerSummary | undefined;
+  readonly tasksProgress?: ComposerTasksProgress | null | undefined;
+  readonly taskSteps?: readonly ComposerTaskStep[] | null | undefined;
 }) {
+  const [tasksExpanded, setTasksExpanded] = useState(false);
+  const native = props.nativeWorker ? nativeWorkerPresentation(props.nativeWorker) : null;
   const statusRef = useRef<HTMLSpanElement>(null);
   const { status } = props;
-  const live = status !== null && isOrchestrationV2WorkActive(status.status);
-  const modelDescription =
-    props.effortLabel === null ? props.modelLabel : `${props.modelLabel}, ${props.effortLabel}`;
+  const live = !native && status !== null && isOrchestrationV2WorkActive(status.status);
+  const modelLabel = native ? (native.model ?? "Not reported") : props.modelLabel;
+  const effortLabel = native ? null : props.effortLabel;
+  const modelDescription = effortLabel === null ? modelLabel : `${modelLabel}, ${effortLabel}`;
   // Announced once per transition; the ticking label below is not.
-  const announcement = formatProviderSubagentStatus(
-    status === null ? null : { ...status, startedAt: null },
-    0,
-  );
+  const announcement =
+    native?.status ??
+    formatProviderSubagentStatus(status === null ? null : { ...status, startedAt: null }, 0);
 
   // The label is written from an effect, and live bars tick through DOM
   // writes, so a running timer never re-renders the chat view.
   useLayoutEffect(() => {
     const update = () => {
       if (statusRef.current) {
-        statusRef.current.textContent = formatProviderSubagentStatus(status, Date.now());
+        statusRef.current.textContent =
+          native?.status ?? formatProviderSubagentStatus(status, Date.now());
       }
     };
     update();
     if (!live) return;
     const id = setInterval(update, 1_000);
     return () => clearInterval(id);
-  }, [live, status]);
+  }, [live, status, native?.status]);
 
   return (
-    <div className="flex min-h-12 items-center gap-3 rounded-3xl py-2 ps-5 pe-2 text-sm">
-      <span className="flex min-w-0 items-center gap-2">
-        {props.provider ? (
-          <ProviderInstanceIcon
-            driverKind={props.provider.driverKind}
-            displayName={props.provider.displayName}
-            accentColor={props.provider.accentColor}
-            acpRegistryAgentId={props.provider.acpRegistryAgentId}
-            acpRegistryIconUrl={props.provider.acpRegistryIconUrl}
-            showBadge={props.showInstanceBadge}
-            className="size-4 shrink-0"
-            iconClassName="size-4"
-            badgeClassName="right-[-0.125rem] bottom-[-0.125rem] h-3 min-w-3 px-0.5 text-5xs"
-          />
-        ) : null}
-        <span className="min-w-0 truncate font-medium text-foreground">{props.modelLabel}</span>
-        {props.effortLabel === null ? null : (
-          <span className="shrink-0 text-muted-foreground">{props.effortLabel}</span>
-        )}
-      </span>
-      <span
-        ref={statusRef}
-        aria-hidden
-        className="min-w-0 truncate text-muted-foreground tabular-nums"
-      />
-      <span role="status" className="sr-only">
-        {`${modelDescription} subagent: ${announcement}`}
-      </span>
-      <span className="ms-auto shrink-0 text-muted-foreground max-sm:hidden">Runs on its own</span>
-      {props.onOpenParent ? (
-        <Button size="sm" variant="ghost" onClick={props.onOpenParent}>
-          <ArrowUpLeftIcon />
-          Open parent
-        </Button>
+    <div>
+      {props.tasksProgress && props.taskSteps ? (
+        <ComposerTasksContent
+          progress={props.tasksProgress}
+          steps={props.taskSteps}
+          expanded={tasksExpanded}
+          onToggle={() => setTasksExpanded((expanded) => !expanded)}
+        />
       ) : null}
+      {native ? (
+        <div className="grid gap-1 px-5 pt-2 text-xs text-muted-foreground">
+          <span>{native.identity ?? native.role}</span>
+          <span>{native.task}</span>
+          <span>{native.status}</span>
+          <span>Effective model: {native.model ?? "Not reported"}</span>
+        </div>
+      ) : null}
+      <div className="flex min-h-12 items-center gap-3 rounded-3xl py-2 ps-5 pe-2 text-sm">
+        <span className="flex min-w-0 items-center gap-2">
+          {props.provider ? (
+            <ProviderInstanceIcon
+              driverKind={props.provider.driverKind}
+              displayName={props.provider.displayName}
+              accentColor={props.provider.accentColor}
+              acpRegistryAgentId={props.provider.acpRegistryAgentId}
+              acpRegistryIconUrl={props.provider.acpRegistryIconUrl}
+              showBadge={props.showInstanceBadge}
+              className="size-4 shrink-0"
+              iconClassName="size-4"
+              badgeClassName="right-[-0.125rem] bottom-[-0.125rem] h-3 min-w-3 px-0.5 text-5xs"
+            />
+          ) : null}
+          <span className="min-w-0 truncate font-medium text-foreground">{modelLabel}</span>
+          {effortLabel === null ? null : (
+            <span className="shrink-0 text-muted-foreground">{effortLabel}</span>
+          )}
+        </span>
+        <span
+          ref={statusRef}
+          aria-hidden
+          className="min-w-0 truncate text-muted-foreground tabular-nums"
+        />
+        <span role="status" className="sr-only">
+          {`${modelDescription} subagent: ${announcement}`}
+        </span>
+        <span className="ms-auto shrink-0 text-muted-foreground max-sm:hidden">
+          Runs on its own
+        </span>
+        {props.onOpenParent ? (
+          <Button size="sm" variant="ghost" onClick={props.onOpenParent}>
+            <ArrowUpLeftIcon />
+            Open parent
+          </Button>
+        ) : null}
+      </div>
     </div>
   );
 }

@@ -1,10 +1,10 @@
 import { useAtomValue } from "@effect/atom-react";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
-import { PitakoWorkersPanel } from "./PitakoWorkersPanel";
 import { ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
 import { CollapsibleSectionHeader, SectionHeaderStatus } from "../ui/collapsible-section-header";
 import { SubagentTooltipContent } from "./SubagentTooltipContent";
+import { retainTimelinePosition } from "./timelineScrollAnchoring";
 import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
@@ -12,7 +12,11 @@ import {
   projectedSubagentsToRuntime,
   type RuntimeSubagent,
 } from "@t3tools/client-runtime/state/subagentRuntime";
-import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
+import {
+  formatSubagentDisplayTitle,
+  nativeWorkerPresentation,
+} from "@t3tools/client-runtime/state/subagent-display";
+import { isOpenNativeWorker } from "@t3tools/client-runtime/state/thread-subagents";
 import {
   deriveThreadRelationshipGraph,
   immediateThreadRelationships,
@@ -223,12 +227,7 @@ export function ThreadRelationshipsPanel(props: {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
 }) {
-  return (
-    <>
-      <ThreadRelationshipRows {...props} />
-      <PitakoWorkersPanel {...props} />
-    </>
-  );
+  return <ThreadRelationshipRows {...props} />;
 }
 
 function ThreadRelationshipRows(props: {
@@ -260,6 +259,7 @@ function ThreadRelationshipRows(props: {
             providerInstanceId: subagent.providerInstanceId,
             origin: subagent.origin,
             modelSelection: subagent.modelSelection,
+            nativeWorker: subagent.nativeWorker,
           },
         ]),
     );
@@ -324,11 +324,15 @@ function ThreadRelationshipRows(props: {
 
   const {
     related = [],
+    team = [],
     active = [],
     previous = [],
   } = groupBy(relationshipRows, ({ edge }) => {
     if (edge.kind !== "subagent" || isParentThreadRelationship(edge, props.threadId))
       return "related";
+    const agent = subagentsByThreadId.get(edge.targetThreadId);
+    if (agent?.nativeWorker?.launch.source === "team_assign") return "team";
+    if (agent && isOpenNativeWorker(agent)) return "active";
     return ["completed", "failed", "error", "cancelled", "interrupted", "idle"].includes(
       edge.status ?? "",
     )
@@ -338,6 +342,7 @@ function ThreadRelationshipRows(props: {
   const groups = [
     { id: "related", label: null, rows: related, expanded: true },
     { id: "active", label: null, rows: active, expanded: true },
+    { id: "team", label: "Team assignments", rows: team, expanded: true },
     { id: "previous", label: "Previous agents", rows: previous, expanded: false },
   ];
   // Subagents without a child thread yet have no row, so count them separately.
@@ -351,6 +356,7 @@ function ThreadRelationshipRows(props: {
   }
 
   const openThread = (threadId: ThreadId) => {
+    retainTimelinePosition(scopedThreadKey(ref));
     void navigate({
       to: "/$environmentId/$threadId",
       params: buildThreadRouteParams(scopeThreadRef(props.environmentId, threadId)),
@@ -474,6 +480,9 @@ function ThreadRelationshipRows(props: {
               const agent = workflowGroup
                 ? projectedAgent
                 : currentSubagent(projectedAgent, node?.thread);
+              const native = agent?.nativeWorker
+                ? nativeWorkerPresentation(agent.nativeWorker)
+                : null;
               const failed = rowStatus === "failed" || rowStatus === "error";
               const canStop =
                 agent &&
@@ -521,6 +530,7 @@ function ThreadRelationshipRows(props: {
                   providerInstanceId={agent.providerInstanceId}
                   origin={agent.origin}
                   modelSelection={agent.modelSelection}
+                  nativeWorker={agent.nativeWorker}
                   provider={provider}
                   providers={providers}
                   driver={providerDriver}
@@ -548,6 +558,13 @@ function ThreadRelationshipRows(props: {
                     <span className="block truncate text-left text-sm font-medium leading-4 text-foreground/85">
                       {threadTitle}
                     </span>
+                    {native ? (
+                      <span className="block truncate text-left text-2xs text-muted-foreground">
+                        {native.identity ?? native.role}
+                        {" · "}
+                        {native.status}
+                      </span>
+                    ) : null}
                   </span>
                   {agent ? null : (
                     <ArrowRightIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
@@ -584,6 +601,7 @@ function ThreadRelationshipRows(props: {
                         size="sm"
                         variant="ghost"
                         part={workflowGroup ? "primary" : "row"}
+                        aria-label={native ? `Open ${threadTitle}` : undefined}
                         disabled={node?.missing === true}
                         onClick={() => openThread(threadId)}
                       />
@@ -615,7 +633,10 @@ function ThreadRelationshipRows(props: {
                 );
               }
               return (
-                <li key={threadId} className="group relative flex h-8 items-center rounded-lg">
+                <li
+                  key={threadId}
+                  className={`group relative flex ${native ? "min-h-12" : "h-8"} items-center rounded-lg`}
+                >
                   {isMergeTarget ? (
                     <div className={THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS}>
                       <Tooltip>

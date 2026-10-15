@@ -590,7 +590,10 @@ export const layer: Layer.Layer<
       // Only the provider's own thread load fails the run on the last attempt;
       // store, id and handoff failures around it keep their typed errors.
       const loadFromProvider = (
-        load: Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapter.ProviderAdapterV2Error>,
+        load: Effect.Effect<
+          ProviderAdapter.ProviderAdapterV2EnsuredThread,
+          ProviderAdapter.ProviderAdapterV2Error
+        >,
       ) =>
         Effect.gen(function* () {
           const loaded = yield* Effect.result(load);
@@ -604,7 +607,7 @@ export const layer: Layer.Layer<
           return undefined;
         });
       let effectiveHandoffs = handoffs;
-      const loadedProviderThread = yield* Effect.gen(function* () {
+      const loaded = yield* Effect.gen(function* () {
         if (nativeForkTransfer !== undefined) {
           const sourceProjection = yield* projectionStore.getThreadRecords(
             nativeForkTransfer.sourceThreadId,
@@ -777,7 +780,9 @@ export const layer: Layer.Layer<
         return replacement;
       });
       // The last attempt already failed the run.
-      if (loadedProviderThread === undefined) return;
+      if (loaded === undefined) return;
+      const { providerThread: loadedProviderThread, checklistCapture } =
+        ProviderAdapter.splitProviderThreadChecklistCapture(loaded);
       if (!(yield* isCurrentAttemptInStatus("starting"))) {
         return;
       }
@@ -935,6 +940,17 @@ export const layer: Layer.Layer<
         },
       ];
       const runningWrite = yield* eventSink.writeIfRunCurrent({
+        ...(checklistCapture === undefined
+          ? {}
+          : {
+              checklistCapture: {
+                providerThreadId: runningProviderThread.id,
+                capture: checklistCapture,
+              },
+            }),
+        ...(runningProviderThread.driver === "pi"
+          ? { resetChecklistSession: runningProviderThread.id }
+          : {}),
         threadId: projection.thread.id,
         runId: run.id,
         activeAttemptId: attempt.id,
@@ -942,6 +958,18 @@ export const layer: Layer.Layer<
         events,
       });
       if (!runningWrite.committed) {
+        if (checklistCapture !== undefined && (yield* isCurrentAttemptInStatus("starting"))) {
+          const error = new ProviderTurnStartError({
+            runId,
+            cause: new Error("Pi checklist selection changed while loading the provider thread."),
+          });
+          if (input.willRetry === true) return yield* error;
+          yield* settleStartFailure({
+            signal: "provider-thread-load-failure",
+            title: "Provider turn failed to start",
+            error,
+          });
+        }
         return;
       }
       const routableSubagents = projection.subagents.filter((subagent) =>

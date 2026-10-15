@@ -63,6 +63,7 @@ import {
   ThreadId,
   TurnItemId,
   NodeId,
+  piChecklistTurnItemId,
 } from "@t3tools/contracts";
 import {
   createOrchestrationV2TurnItemVisibility,
@@ -538,7 +539,7 @@ export class ProjectionStoreV2 extends Context.Service<ProjectionStoreV2, Projec
   "t3/orchestration-v2/ProjectionStore/ProjectionStoreV2",
 ) {}
 
-export const ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION = 2;
+export const ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION = 3;
 
 function needsRecovery(
   projection: OrchestrationV2ThreadProjection,
@@ -1099,6 +1100,34 @@ const decodeProviderSessionPayload = Schema.decodeUnknownEffect(
 const decodeProviderThreadPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderThreadJsonSchema),
 );
+/** Durable launch membership, including workers whose parent run has settled. */
+export const readNativeWorkers = Effect.fnUntraced(function* (
+  sql: SqlClient.SqlClient,
+  providerSessionId: ProviderSessionId,
+) {
+  const rows = yield* sql<PayloadRow>`
+    SELECT payload_json FROM orchestration_v2_projection_subagents
+    WHERE json_extract(payload_json, '$.nativeWorker.launch.providerSessionId') = ${providerSessionId}
+      AND json_extract(payload_json, '$.origin') = 'provider_native'
+    ORDER BY subagent_id
+  `;
+  return yield* Effect.forEach(rows, (row) => decodeSubagentPayload(row.payload_json));
+});
+/** Selector preimage read that also works before a thread-created batch is applied. */
+export const readProviderThread = Effect.fnUntraced(function* (
+  sql: SqlClient.SqlClient,
+  threadId: ThreadId,
+  providerThreadId: ProviderThreadId,
+) {
+  const rows = yield* sql<PayloadRow>`
+    SELECT payload_json FROM orchestration_v2_projection_provider_threads
+    WHERE thread_id = ${threadId} AND provider_thread_id = ${providerThreadId}
+    LIMIT 1
+  `;
+  return rows[0] === undefined
+    ? undefined
+    : yield* decodeProviderThreadPayload(rows[0].payload_json);
+});
 const decodeProviderTurnPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderTurnJsonSchema),
 );
@@ -2728,6 +2757,21 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         if (!threadRow) {
           return yield* new ProjectionStoreThreadNotFoundError({ threadId });
         }
+        const thread = yield* decodeThreadPayload(threadRow.payload_json);
+        const activeProviderThread =
+          window !== undefined &&
+          window.requiredRunId === undefined &&
+          thread.activeProviderThreadId !== null
+            ? yield* readProviderThread(sql, threadId, thread.activeProviderThreadId)
+            : undefined;
+        const checklistSelection =
+          activeProviderThread?.driver === "pi" &&
+          activeProviderThread.nativeMetadata?.checklistSelection?.state === "ready" &&
+          activeProviderThread.nativeMetadata.checklistSelection.sourceEntryId !== null
+            ? activeProviderThread.nativeMetadata.checklistSelection
+            : undefined;
+        const checklistItemId =
+          checklistSelection === undefined ? null : piChecklistTurnItemId(checklistSelection.list);
 
         const boundedTurnItemRows =
           fields !== undefined && !fields.includes("turnItems")
@@ -2854,6 +2898,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     )
                     AND request.type = 'run_interrupt_request'
                   UNION
+                  SELECT checklist.rowid AS item_rowid, checklist.ordinal, checklist.turn_item_id
+                  FROM orchestration_v2_projection_turn_items AS checklist
+                  WHERE checklist.thread_id = ${threadId}
+                    AND checklist.turn_item_id = ${checklistItemId}
+                  UNION
                   SELECT latest.item_rowid, latest.ordinal, latest.turn_item_id
                   FROM (
                     SELECT rowid AS item_rowid, ordinal, turn_item_id
@@ -2946,7 +2995,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         const cohortHandoffIds = cohortJson("contextHandoffId");
 
         const [
-          thread,
           runRows,
           attemptRows,
           nodeRows,
@@ -2962,7 +3010,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           contextHandoffRows,
           contextTransferRows,
         ] = yield* Effect.all([
-          decodeThreadPayload(threadRow.payload_json),
           fields !== undefined && !fields.includes("runs")
             ? Effect.succeed([])
             : window === undefined
@@ -3084,6 +3131,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             WHERE (thread_id = ${threadId} AND status = 'active')
               OR provider_thread_id IN (SELECT value FROM json_each(${cohortProviderThreadIds}))
               OR owner_node_id IN (SELECT value FROM json_each(${cohortNodeIds}))
+              OR provider_thread_id = ${activeProviderThread?.driver === "pi" ? activeProviderThread.id : null}
             ORDER BY COALESCE(first_run_ordinal, 0), provider_thread_id ASC
           `,
           fields !== undefined && !fields.includes("providerTurns")
@@ -3161,6 +3209,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     OR plan.plan_id IN (
                       SELECT value FROM json_each(${cohortPlanIds})
                     )
+                    OR plan.plan_id = ${checklistSelection?.planId ?? null}
                   )
                 ORDER BY plan_id ASC
               `,

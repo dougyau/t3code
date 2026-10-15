@@ -2,8 +2,10 @@ import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CheckpointId,
+  applyChecklistPointerWrite,
   EnvironmentId,
   NodeId,
+  pointerFromCapture,
   ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
@@ -50,6 +52,7 @@ import {
   type PiAdapterV2Options,
 } from "./adapter.ts";
 import { makePiRpcConnection, type PiRpcRecord } from "./rpc.ts";
+import { nativeTodoBranch, withNativeTodo } from "./piTodo.native.fixture.ts";
 import { loadMcpBridge } from "./mcpBridge.testkit.ts";
 import { turnItemOutputText } from "../../../client-runtime/src/work-log/itemDetail.ts";
 
@@ -157,6 +160,8 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
   let deferredLifecycle: string | undefined;
   let sessionFile = FAKE_SESSION_FILE;
   let sessionGeneration = 0;
+  let model: unknown;
+  let thinkingLevel: unknown;
   let models: ReadonlyArray<unknown> = [];
   let stdinBuffer = "";
 
@@ -178,14 +183,19 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
       success: true,
     };
     switch (record["type"]) {
-      case "get_state":
+      case "get_state": {
         if (failState) {
           failState = false;
           return { ...base, success: false, error: "state unavailable" };
         }
         // Queued data overrides fields of the recorded idle state, so a test
         // that only cares about the session file still gets a real shape.
-        return { ...base, data: { ...recordedIdleState(sessionFile), ...stateQueue.shift() } };
+        const next = stateQueue.shift();
+        if (next && Object.hasOwn(next, "model")) model = next.model;
+        if (next && Object.hasOwn(next, "thinkingLevel")) thinkingLevel = next.thinkingLevel;
+        return { ...base, data: { ...recordedIdleState(sessionFile), ...(model === undefined ? {} : { model }),
+          ...(thinkingLevel === undefined ? {} : { thinkingLevel }), ...next } };
+      }
       case "get_available_models":
         return { ...base, data: { models } };
       case "new_session": {
@@ -244,7 +254,8 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
     env: {},
   };
   const spawner = ChildProcessSpawner.make((command) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
+      const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
       if (ChildProcess.isStandardCommand(command)) {
         lastSpawn = {
           args: command.args,
@@ -253,11 +264,13 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
       }
       return ChildProcessSpawner.makeHandle({
         pid: ChildProcessSpawner.ProcessId(FAKE_PID),
-        exitCode: Effect.never,
+        exitCode: Deferred.await(exited),
         isRunning: Effect.succeed(true),
         kill: () => Effect.void,
         unref: Effect.succeed(Effect.void),
-        stdin: Sink.forEach(handleStdinChunk),
+        stdin: Sink.forEach(handleStdinChunk).pipe(
+          Sink.ensuring(Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0)).pipe(Effect.asVoid)),
+        ),
         stdout: Stream.fromQueue(stdout),
         stderr: Stream.empty,
         all: Stream.empty,
@@ -493,7 +506,564 @@ const expectModelFailure = (errorMessage: string) =>
   }).pipe(Effect.scoped, Effect.provide(layerTest));
 
 describe("PiAdapterV2", () => {
-  it.effect("captures legacy auto as approval-required in the worker port", () =>
+  it.effect.each([
+    { tool: "agent_spawn", details: { instanceId: "child" }, started: true, isError: false, admitted: true },
+    { tool: "team_assign", details: { id: "assignment", instanceId: "child", roleId: "researcher" }, started: true, isError: false, admitted: true },
+    { tool: "agent_run", details: { instanceId: "child" }, started: true, isError: false, admitted: false },
+    { tool: "agent_spawn", details: { instanceId: "child" }, started: true, isError: true, admitted: false },
+    { tool: "agent_spawn", details: { instanceId: "" }, started: true, isError: false, admitted: false },
+    { tool: "team_assign", details: { id: "assignment", instanceId: "child" }, started: true, isError: false, admitted: false },
+    { tool: "agent_spawn", details: { instanceId: "child" }, started: false, isError: false, admitted: false },
+  ])("supplements only typed successful $tool launches started=$started error=$isError", (test) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID, modelSelection: modelSelection("default"), runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      if (test.started) {
+        yield* fake.emit({ type: "tool_execution_start", toolName: test.tool, toolCallId: "launch-call", args: {} });
+      }
+      const start = test.started ? yield* takeEvent((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool" && event.turnItem.status === "running") : undefined;
+      yield* fake.emit({ type: "tool_execution_end", toolName: test.tool, toolCallId: "launch-call", isError: test.isError,
+        result: { content: [{ type: "text", text: "ordinary tool output" }], details: {
+          ...test.details, coordinatorSessionId: "forged", parentThreadId: "forged", toolNodeId: "forged",
+        } } });
+      const end = yield* takeEvent((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool" && event.turnItem.status !== "running");
+      if (end.type !== "turn_item.updated" || end.turnItem.type !== "dynamic_tool") throw new Error("Missing tool item");
+      assert.equal(end.turnItem.output, "ordinary tool output");
+      const launch = end.turnItem.nativeWorkerLaunch;
+      if (!test.admitted) {
+        assert.isUndefined(launch);
+        return;
+      }
+      assert.isDefined(launch);
+      if (!launch || start?.type !== "turn_item.updated") throw new Error("Missing typed launch");
+      assert.equal(launch.source, test.tool);
+      assert.equal(launch.instanceId, "child");
+      assert.equal(launch.toolNodeId, start.turnItem.nodeId);
+      assert.equal(launch.parentProviderTurnId, end.turnItem.providerTurnId);
+      assert.equal(launch.parentThreadId, THREAD_ID);
+      assert.equal(launch.parentProviderThreadId, providerThread.id);
+      assert.equal(launch.providerInstanceId, PI_INSTANCE_ID);
+      assert.equal(launch.providerSessionId, SESSION_ID);
+      assert.equal(launch.coordinatorSessionId, recordedIdleState(FAKE_SESSION_FILE).sessionId);
+      assert.equal(launch.toolCallId, "launch-call");
+      assert.equal(launch.runId, `run:${THREAD_ID}:1`);
+      assert.equal(launch.runAttemptId, `run-attempt:run:${THREAD_ID}:1:1`);
+      if (launch.source === "team_assign") {
+        assert.equal(launch.assignmentId, "assignment");
+        assert.equal(launch.roleId, "researcher");
+      }
+      assert.isUndefined(start.turnItem.nativeWorkerLaunch);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)));
+  it.effect.each(["ready", "invalid", "unappended"] as const)(
+    "settled native todo %s selection travels only on its ordinary final tool item",
+    (selection) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_start" });
+        const callId = "live-tool-call";
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolName: "todo",
+          toolCallId: callId,
+          args: { action: "list" },
+        });
+        const result = {
+          details: {
+            tasks: [{ id: 999, subject: "Not persisted", status: "pending" }],
+            nextId: 1000,
+          },
+        };
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolName: "todo",
+          toolCallId: callId,
+          result,
+          isError: false,
+        });
+        const entry = {
+          id: "native-entry",
+          type: "message",
+          parentId: null,
+          message: {
+            role: "toolResult",
+            toolName: "todo",
+            toolCallId: callId,
+            details: {
+              tasks: [
+                {
+                  id: 1,
+                  subject: "Persisted",
+                  status: selection === "invalid" ? "wrong" : "pending",
+                },
+              ],
+              nextId: 2,
+            },
+          },
+        };
+        const branch =
+          selection === "unappended"
+            ? { entries: [], leafId: null }
+            : { entries: [entry], leafId: entry.id };
+        fake.queueEntries(branch);
+        fake.queueEntries(branch);
+        yield* fake.emit({ type: "agent_settled" });
+        const end = yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "dynamic_tool" &&
+            event.turnItem.toolName === "todo" &&
+            event.turnItem.status === "completed",
+        );
+        if (end.type !== "turn_item.updated") return;
+        assert.equal(
+          end.checklistCapture?.source.state,
+          selection === "ready" ? "ready" : "unavailable",
+        );
+        assert.equal(
+          end.checklistCapture?.source.sourceEntryId,
+          selection === "ready" ? entry.id : null,
+        );
+        assert.deepEqual(
+          end.checklistCapture?.source.tasks,
+          selection === "ready"
+            ? [{ id: 1, subject: "Persisted", status: "pending", identityEntryId: entry.id }]
+            : [],
+        );
+        assert.equal(end.turnItem.nativeItemRef?.nativeId, callId);
+        assert.equal(end.turnItem.runId, RunId.make(`run:${THREAD_ID}:1`));
+        yield* takeEvent((event) => event.type === "turn.terminal");
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "rehydrates complete native membership and resets the same row after a vetoed resume",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime } = yield* openRuntime(fake);
+        const nativeEntry = {
+          id: "stored-native-result",
+          parentId: null,
+          type: "message",
+          message: {
+            role: "toolResult",
+            toolName: "todo",
+            details: {
+              tasks: [{ id: 1, subject: "Full membership", status: "deleted" }],
+              nextId: 2,
+            },
+          },
+        };
+        const branch = { entries: [nativeEntry], leafId: nativeEntry.id };
+        fake.queueEntries(branch);
+        const first = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        assert.isDefined(first.checklistCapture);
+        const initial = first.checklistCapture!;
+        assert.deepEqual(initial.source, {
+          state: "ready",
+          sourceEntryId: nativeEntry.id,
+          tasks: [
+            {
+              id: 1,
+              subject: "Full membership",
+              status: "deleted",
+              identityEntryId: nativeEntry.id,
+            },
+          ],
+        });
+        assert.deepEqual(initial.expectedPointer, { kind: "absent" });
+        fake.queueEntries(branch);
+        const resumed = yield* runtime.resumeThread({
+          providerThread: {
+            ...first,
+            nativeMetadata: {
+              ...first.nativeMetadata,
+              checklistSelection: pointerFromCapture(initial),
+            },
+          },
+        });
+        assert.deepEqual(resumed.checklistCapture?.expectedPointer, {
+          kind: "current",
+          pointer: pointerFromCapture(initial),
+        });
+        assert.equal(resumed.checklistCapture?.ownerGeneration, initial.ownerGeneration);
+        const resumedCapture = resumed.checklistCapture!;
+        fake.queueEntries(branch);
+        const snapshot = yield* runtime.readThreadSnapshot({ providerThread: resumed });
+        assert.deepEqual(snapshot.checklistCapture?.source, initial.source);
+        const persisted = {
+          ...resumed,
+          nativeMetadata: {
+            ...resumed.nativeMetadata,
+            checklistSelection: pointerFromCapture(resumedCapture),
+          },
+        };
+        fake.vetoNextSwitch();
+        const rejected = yield* runtime.resumeThread({ providerThread: persisted }).pipe(Effect.flip);
+        assert.equal(rejected._tag, "ProviderAdapterResumeThreadError");
+        fake.queueEntries({ entries: [], leafId: null });
+        fake.queueState({ sessionFile: "/fake/fallback-session.jsonl" });
+        const fallback = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          existingProviderThread: {
+            ...persisted,
+            nativeThreadRef: null,
+          },
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        assert.equal(fallback.id, first.id);
+        assert.equal(
+          fallback.checklistCapture?.list.nativeSessionId,
+          "/fake/fallback-session.jsonl",
+        );
+        assert.equal(fallback.checklistCapture?.authority, "session_reset");
+        assert.equal(
+          fallback.checklistCapture?.sessionGeneration,
+          resumedCapture.sessionGeneration + 1,
+        );
+        // Reading is an observation, not a persisted pointer transition.
+        assert.deepEqual(fallback.checklistCapture?.expectedPointer, {
+          kind: "current",
+          pointer: pointerFromCapture(resumedCapture),
+        });
+        assert.deepEqual(fallback.checklistCapture?.source, {
+          state: "ready",
+          sourceEntryId: null,
+          tasks: [],
+        });
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["resume", "fallback"] as const)(
+    "a reopened adapter takes persisted native metadata as its %s owner preimage",
+    (mode) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime } = yield* openRuntime(fake);
+        const first = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const capture = first.checklistCapture!;
+        const saved = {
+          ...first,
+          nativeMetadata: {
+            ...first.nativeMetadata,
+            checklistSelection: pointerFromCapture(capture),
+          },
+        };
+        const nextFake = yield* makeFakePi;
+        const next = yield* openRuntime(nextFake);
+        if (mode === "fallback")
+          nextFake.queueState({ sessionFile: "/fake/fresh-effective-session.jsonl" });
+        const reopened =
+          mode === "resume"
+            ? yield* next.runtime.resumeThread({ providerThread: saved })
+            : yield* next.runtime.ensureThread({
+                threadId: THREAD_ID,
+                existingProviderThread: { ...saved, nativeThreadRef: null },
+                modelSelection: modelSelection("default"),
+                runtimePolicy,
+              });
+        assert.equal(reopened.checklistCapture?.ownerGeneration, capture.ownerGeneration + 1);
+        assert.deepEqual(reopened.checklistCapture?.expectedPointer, {
+          kind: "current",
+          pointer: pointerFromCapture(capture),
+        });
+        assert.equal(reopened.id, saved.id);
+        assert.equal(
+          reopened.checklistCapture?.list.nativeSessionId,
+          mode === "resume" ? capture.list.nativeSessionId : "/fake/fresh-effective-session.jsonl",
+        );
+        assert.equal(
+          reopened.checklistCapture?.sessionGeneration,
+          capture.sessionGeneration + (mode === "fallback" ? 1 : 0),
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([
+    { mode: "resume", persisted: false },
+    { mode: "resume", persisted: true },
+    { mode: "ensure", persisted: false },
+    { mode: "ensure", persisted: true },
+    { mode: "replacement", persisted: false },
+    { mode: "replacement", persisted: true },
+  ] as const)(
+    "rebases $mode after repeated rejected startup captures, persisted=$persisted",
+    ({ mode, persisted }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const first = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const initial = first.checklistCapture!;
+        const stored = persisted ? pointerFromCapture(initial) : undefined;
+        const saved = {
+          ...first,
+          nativeMetadata: { ...first.nativeMetadata, checklistSelection: stored },
+        };
+        let previous = initial;
+        let restored = first;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          // The startup guard rejected the previous return: no selector commit.
+          if (mode === "replacement")
+            fake.queueState({ sessionFile: `/fake/rejected-replacement-${attempt}.jsonl` });
+          restored =
+            mode === "resume"
+              ? yield* runtime.resumeThread({ providerThread: saved })
+              : yield* runtime.ensureThread({
+                  threadId: THREAD_ID,
+                  existingProviderThread:
+                    mode === "replacement" ? { ...saved, nativeThreadRef: null } : saved,
+                  modelSelection: modelSelection("default"),
+                  runtimePolicy,
+                });
+          const capture = restored.checklistCapture!;
+          const decision = applyChecklistPointerWrite(stored, {
+            kind: capture.authority,
+            capture,
+          });
+          assert.isTrue(decision.accepted, "a rejected load must not poison the next CAS");
+          assert.deepEqual(
+            capture.expectedPointer,
+            stored === undefined ? { kind: "absent" } : { kind: "current", pointer: stored },
+          );
+          assert.equal(capture.ownerGeneration, initial.ownerGeneration);
+          assert.isAbove(capture.captureVersion, previous.captureVersion);
+          if (attempt > 0) {
+            assert.equal(
+              capture.sessionGeneration,
+              previous.sessionGeneration + (mode === "replacement" ? 1 : 0),
+            );
+          }
+          previous = capture;
+        }
+        const accepted = pointerFromCapture(previous);
+        assert.isFalse(
+          applyChecklistPointerWrite(accepted, {
+            kind: initial.authority,
+            capture: initial,
+          }).accepted,
+        );
+        const committed = {
+          ...restored,
+          nativeMetadata: { ...restored.nativeMetadata, checklistSelection: accepted },
+        };
+        // A read against the old row is observational even after a valid commit.
+        yield* runtime.readThreadSnapshot({ providerThread: restored });
+        yield* startTurn(runtime, committed);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_start" });
+        const callId = "independent-todo-call";
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolName: "todo",
+          toolCallId: callId,
+          args: { action: "list" },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolName: "todo",
+          toolCallId: callId,
+          result: { details: { tasks: [], nextId: 1 } },
+          isError: false,
+        });
+        fake.queueEntries({
+          leafId: "independent-native-result",
+          entries: [
+            {
+              id: "independent-native-result",
+              parentId: null,
+              type: "message",
+              message: {
+                role: "toolResult",
+                toolName: "todo",
+                toolCallId: callId,
+                details: { tasks: [], nextId: 1 },
+              },
+            },
+          ],
+        });
+        yield* fake.emit({ type: "agent_settled" });
+        const end = yield* takeEvent(
+          (event) => event.type === "turn_item.updated" && event.checklistCapture !== undefined,
+        );
+        if (end.type !== "turn_item.updated" || end.checklistCapture === undefined)
+          return yield* Effect.die("Expected the postappend native capture");
+        const live = end.checklistCapture;
+        assert.deepEqual(live.expectedPointer, { kind: "current", pointer: accepted });
+        assert.equal(live.captureVersion, previous.captureVersion + 1);
+        assert.isTrue(
+          applyChecklistPointerWrite(accepted, { kind: "capture", capture: live }).accepted,
+        );
+        assert.equal(live.source.sourceEntryId, "independent-native-result");
+        assert.equal(end.turnItem.nativeItemRef?.nativeId, callId);
+        assert.isNotNull(end.turnItem.runId);
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        const independentlyCommitted = {
+          ...pointerFromCapture(live),
+          ownerGeneration: live.ownerGeneration + 2,
+          sessionGeneration: live.sessionGeneration + 2,
+        };
+        const rebased = yield* runtime.resumeThread({
+          providerThread: {
+            ...restored,
+            nativeMetadata: {
+              ...restored.nativeMetadata,
+              checklistSelection: independentlyCommitted,
+            },
+          },
+        });
+        assert.deepEqual(rebased.checklistCapture?.expectedPointer, {
+          kind: "current",
+          pointer: independentlyCommitted,
+        });
+        assert.isTrue(
+          applyChecklistPointerWrite(independentlyCommitted, {
+            kind: rebased.checklistCapture!.authority,
+            capture: rebased.checklistCapture!,
+          }).accepted,
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.live.skipIf(
+    process.env.T3_PI_TODO_NATIVE_PI_ROOT === undefined ||
+      process.env.T3_PI_TODO_NATIVE_TODO_ROOT === undefined,
+  )("reconciles a real native preappend notification into the ordinary accepted tool result", () =>
+    withNativeTodo((fixture) =>
+      Effect.gen(function* () {
+        const created = yield* fixture.todo({ action: "create", subject: "Native task" });
+        yield* fixture.request({ type: "prompt", message: "/fixture-marker" });
+        const listed = yield* fixture.todo({ action: "list", status: "completed" });
+        const nativeBranch = nativeTodoBranch(listed.snapshot);
+        assert.isTrue(nativeBranch.some((entry) => entry.type === "custom"));
+        const fake = yield* makeFakePi;
+        fake.queueState({ sessionFile: listed.snapshot.sessionFile });
+        fake.queueEntries({ entries: [], leafId: null });
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* fake.takeRequest("get_entries");
+        fake.queueEntries(created.snapshot);
+        const rejected = yield* runtime.resumeThread({ providerThread });
+        yield* fake.takeRequest("get_entries");
+        // No startup write committed either capture; the row is still unchanged.
+        fake.queueEntries(listed.before);
+        const valid = yield* runtime.resumeThread({ providerThread });
+        yield* fake.takeRequest("get_entries");
+        const validCapture = valid.checklistCapture!;
+        assert.deepEqual(validCapture.expectedPointer, { kind: "absent" });
+        assert.isTrue(
+          applyChecklistPointerWrite(undefined, {
+            kind: validCapture.authority,
+            capture: validCapture,
+          }).accepted,
+        );
+        assert.isAbove(validCapture.captureVersion, rejected.checklistCapture!.captureVersion);
+        assert.deepEqual(validCapture.source.tasks, [
+          { id: 1, subject: "Native task", status: "pending", identityEntryId: created.result.id },
+        ]);
+        yield* startTurn(runtime, valid);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_start" });
+        const callId = listed.live["toolCallId"];
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: callId,
+          toolName: "todo",
+          args: { action: "list", status: "completed" },
+        });
+        yield* fake.emit(listed.live);
+        // Even a native boundary delivered before append cannot claim the
+        // live callId as a fictitious source entry or import the older result.
+        fake.queueEntries({ entries: listed.before.entries, leafId: listed.before.leafId });
+        yield* fake.emit({ type: "message_end", message: listed.result.message });
+        yield* fake.takeRequest("get_entries");
+        fake.queueEntries(listed.snapshot);
+        yield* fake.emit({ type: "turn_end" });
+        const completed = yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.status === "completed" &&
+            event.turnItem.type === "dynamic_tool" &&
+            event.turnItem.toolName === "todo",
+        );
+        assert.equal(completed.type, "turn_item.updated");
+        if (completed.type !== "turn_item.updated") return;
+        assert.equal(completed.checklistCapture?.source.sourceEntryId, listed.result.id);
+        assert.notEqual(completed.checklistCapture?.source.sourceEntryId, callId);
+        assert.deepEqual(completed.checklistCapture?.source.tasks, [
+          { id: 1, subject: "Native task", status: "pending", identityEntryId: created.result.id },
+        ]);
+        assert.equal(completed.turnItem.nativeItemRef?.nativeId, callId);
+        assert.equal(completed.turnItem.runId, RunId.make(`run:${THREAD_ID}:1`));
+        assert.equal(completed.checklistCapture?.list.nativeSessionId, listed.snapshot.sessionFile);
+        assert.isTrue(
+          applyChecklistPointerWrite(pointerFromCapture(validCapture), {
+            kind: completed.checklistCapture!.authority,
+            capture: completed.checklistCapture!,
+          }).accepted,
+        );
+        fake.queueEntries(listed.snapshot);
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        yield* fixture.request({ type: "compact" });
+        const compacted = yield* fixture.capture("adapter compaction ancestry");
+        assert.isTrue(nativeTodoBranch(compacted).some((entry) => entry.type === "compaction"));
+        fake.queueEntries(compacted);
+        const afterCompaction = yield* runtime.readThreadSnapshot({ providerThread });
+        assert.deepEqual(
+          afterCompaction.checklistCapture?.source,
+          completed.checklistCapture?.source,
+        );
+        const cleared = yield* fixture.todo({ action: "clear" });
+        fake.queueEntries(cleared.snapshot);
+        const afterClear = yield* runtime.readThreadSnapshot({ providerThread });
+        assert.deepEqual(afterClear.checklistCapture?.source, {
+          state: "ready",
+          sourceEntryId: cleared.result.id,
+          tasks: [],
+        });
+        const reused = yield* fixture.todo({ action: "create", subject: "Reused ID" });
+        fake.queueEntries(reused.snapshot);
+        const afterReuse = yield* runtime.readThreadSnapshot({ providerThread });
+        assert.deepEqual(afterReuse.checklistCapture?.source.tasks, [
+          { id: 1, subject: "Reused ID", status: "pending", identityEntryId: reused.result.id },
+        ]);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+    ),
+  );
+
+  it.effect("keeps legacy auto permission behavior independent of the native worker source", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;
       const adapter = yield* makeAdapter(fake);
@@ -503,8 +1073,8 @@ describe("PiAdapterV2", () => {
         modelSelection: modelSelection("default"),
         runtimePolicy: { ...runtimePolicy, runtimeMode: "auto" },
       });
-      assert.equal(runtime.workers?.runtimeMode, "approval-required");
-      assert.equal(runtime.workers?.observation.state, "disabled");
+      assert.isDefined(runtime.nativeWorkers);
+      assert.equal(fake.lastSpawn().env.T3_PI_RUNTIME_MODE, "approval-required");
       assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
@@ -1822,6 +2392,17 @@ describe("PiAdapterV2", () => {
       });
       forkFake.queueState({ sessionFile: forkFile });
       fake.queueState({ sessionFile: forkFile });
+      const inheritedTodo = {
+        id: "inherited-todo-entry",
+        type: "message",
+        parentId: null,
+        message: {
+          role: "toolResult",
+          toolName: "todo",
+          details: { tasks: [{ id: 1, subject: "Inherited", status: "pending" }], nextId: 2 },
+        },
+      };
+      fake.queueEntries({ entries: [inheritedTodo], leafId: inheritedTodo.id });
       const target = ThreadId.make("fork-target");
       const forked = yield* runtime.forkThread({
         sourceProviderThread: source,
@@ -1832,6 +2413,19 @@ describe("PiAdapterV2", () => {
       assert.equal(forked.appThreadId, target);
       assert.equal(forked.nativeThreadRef?.nativeId, forkFile);
       assert.notEqual(forked.id, source.id);
+      assert.deepEqual(forked.checklistCapture?.list, {
+        threadId: target,
+        providerInstanceId: PI_INSTANCE_ID,
+        nativeSessionId: forkFile,
+      });
+      assert.deepEqual(forked.checklistCapture?.source, {
+        state: "ready",
+        sourceEntryId: inheritedTodo.id,
+        tasks: [
+          { id: 1, subject: "Inherited", status: "pending", identityEntryId: inheritedTodo.id },
+        ],
+      });
+      assert.deepEqual(forked.checklistCapture?.expectedPointer, { kind: "absent" });
       assert.equal(source.nativeThreadRef?.nativeId, FAKE_SESSION_FILE);
       const args = forkFake.lastSpawn().args;
       assert.equal(args[args.indexOf("--fork") + 1], FAKE_SESSION_FILE);
@@ -1848,14 +2442,34 @@ describe("PiAdapterV2", () => {
       assert.isFalse(
         fake.allRequests().some((request) => request.type === "fork" || request.type === "clone"),
       );
+      let recovered = forked;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        // The fork binding was not committed; retries receive that same row.
+        fake.queueEntries({ entries: [inheritedTodo], leafId: inheritedTodo.id });
+        const next = yield* runtime.resumeThread({ providerThread: forked });
+        assert.deepEqual(next.checklistCapture?.expectedPointer, { kind: "absent" });
+        assert.isAbove(
+          next.checklistCapture!.captureVersion,
+          recovered.checklistCapture!.captureVersion,
+        );
+        assert.isTrue(
+          applyChecklistPointerWrite(undefined, {
+            kind: next.checklistCapture!.authority,
+            capture: next.checklistCapture!,
+          }).accepted,
+        );
+        recovered = next;
+      }
       // ProviderTurnStartService adopts the fork into its pending row.
-      const adopted = { ...forked, id: ProviderThreadId.make("pending-fork-row") };
+      const adopted = { ...recovered, id: ProviderThreadId.make("pending-fork-row") };
       yield* startTurn(runtime, adopted, "default", [], "Continue", undefined, 1, target);
       yield* fake.emit({ type: "agent_start" });
       yield* fake.emit({ type: "agent_settled" });
       const updated = yield* takeEvent(
         (event) =>
-          event.type === "provider_thread.updated" && event.providerThread.appThreadId === target,
+          event.type === "provider_thread.updated" &&
+          event.providerThread.appThreadId === target &&
+          event.providerThread.id === adopted.id,
       );
       assert.isTrue(
         updated.type === "provider_thread.updated" && updated.providerThread.id === adopted.id,
@@ -2649,6 +3263,13 @@ describe("PiAdapterV2", () => {
         modelSelection: modelSelection("default"),
         runtimePolicy,
       });
+      let committedThread = {
+        ...providerThread,
+        nativeMetadata: {
+          ...providerThread.nativeMetadata,
+          checklistSelection: pointerFromCapture(providerThread.checklistCapture!),
+        },
+      };
       const turn = (ordinal: number, entryId: string | null): OrchestrationV2ProviderTurn => ({
         id: ProviderTurnId.make(`turn-${ordinal}`),
         providerThreadId: providerThread.id,
@@ -2663,7 +3284,7 @@ describe("PiAdapterV2", () => {
       });
       const rollBackToFirst = (turns: ReadonlyArray<OrchestrationV2ProviderTurn>) =>
         runtime.rollbackThread({
-          providerThread,
+          providerThread: committedThread,
           target: {
             type: "provider_turn",
             checkpointId: CheckpointId.make("checkpoint-1"),
@@ -2679,11 +3300,75 @@ describe("PiAdapterV2", () => {
           .map((request) => request.entryId);
 
       // Only a turn that left nothing follows the target: already there.
-      yield* rollBackToFirst([turn(1, "u1"), turn(2, null)]);
+      const historicalTodo = {
+        id: "historical-todo",
+        type: "message",
+        parentId: null,
+        message: {
+          role: "toolResult",
+          toolName: "todo",
+          details: { tasks: [{ id: 1, subject: "Restored", status: "pending" }], nextId: 2 },
+        },
+      };
+      fake.queueEntries({ entries: [historicalTodo], leafId: historicalTodo.id });
+      const unchanged = yield* rollBackToFirst([turn(1, "u1"), turn(2, null)]);
+      assert.equal(unchanged.checklistCapture?.source.sourceEntryId, historicalTodo.id);
+      fake.queueEntries({ entries: [historicalTodo], leafId: historicalTodo.id });
+      const retried = yield* rollBackToFirst([turn(1, "u1"), turn(2, null)]);
+      assert.deepEqual(
+        retried.checklistCapture?.expectedPointer,
+        unchanged.checklistCapture?.expectedPointer,
+      );
+      assert.isTrue(
+        applyChecklistPointerWrite(committedThread.nativeMetadata.checklistSelection, {
+          kind: retried.checklistCapture!.authority,
+          capture: retried.checklistCapture!,
+        }).accepted,
+      );
+      committedThread = {
+        ...committedThread,
+        nativeMetadata: {
+          ...committedThread.nativeMetadata,
+          checklistSelection: pointerFromCapture(retried.checklistCapture!),
+        },
+      };
       assert.deepEqual(forkedEntries(), []);
       // Pi re-roots before the first later turn that left entries.
-      yield* rollBackToFirst([turn(1, "u1"), turn(2, null), turn(3, "u3")]);
-      assert.deepEqual(forkedEntries(), ["u3"]);
+      fake.queueState({ sessionFile: "/fake/rollback-session.jsonl" });
+      fake.queueEntries({ entries: [historicalTodo], leafId: historicalTodo.id });
+      const restored = yield* rollBackToFirst([turn(1, "u1"), turn(2, null), turn(3, "u3")]);
+      assert.deepEqual(restored.checklistCapture?.source, {
+        state: "ready",
+        sourceEntryId: historicalTodo.id,
+        tasks: [
+          { id: 1, subject: "Restored", status: "pending", identityEntryId: historicalTodo.id },
+        ],
+      });
+      assert.equal(restored.checklistCapture?.list.nativeSessionId, "/fake/rollback-session.jsonl");
+      assert.equal(restored.checklistCapture?.authority, "session_reset");
+      assert.equal(restored.providerThread.id, providerThread.id);
+      assert.deepEqual(restored.checklistCapture?.expectedPointer, {
+        kind: "current",
+        pointer: pointerFromCapture(retried.checklistCapture!),
+      });
+      fake.queueState({ sessionFile: "/fake/rollback-session.jsonl" });
+      fake.queueEntries({ entries: [historicalTodo], leafId: historicalTodo.id });
+      const retriedFork = yield* rollBackToFirst([turn(1, "u1"), turn(2, null), turn(3, "u3")]);
+      assert.deepEqual(
+        retriedFork.checklistCapture?.expectedPointer,
+        restored.checklistCapture?.expectedPointer,
+      );
+      assert.isTrue(
+        applyChecklistPointerWrite(committedThread.nativeMetadata.checklistSelection, {
+          kind: retriedFork.checklistCapture!.authority,
+          capture: retriedFork.checklistCapture!,
+        }).accepted,
+      );
+      assert.equal(
+        retriedFork.checklistCapture?.sessionGeneration,
+        restored.checklistCapture?.sessionGeneration,
+      );
+      assert.deepEqual(forkedEntries(), ["u3", "u3"]);
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
@@ -4205,14 +4890,14 @@ describe("PiRpc early process exit", () => {
         return makeHandle({
           exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
           stderr: Stream.fromIterable([new TextEncoder().encode(
-            "Error: Unknown options: --pitako-agent-bridge, --pitako-agent-bridge-grants\n",
+            "Error: Unknown option: --pitako-agent-bridge\n",
           )]),
         });
       }));
       const adapter = yield* makePiAdapterV2({
         instanceId: PI_INSTANCE_ID,
         settings: yield* decodePiSettings({
-          enabled: true, binaryPath: "pi", workerBridge: true, workerControl: true,
+          enabled: true, binaryPath: "pi",
         }),
         environment: { FIXTURE_RESOURCE: "preserved" },
       }).pipe(
@@ -4246,9 +4931,9 @@ describe("PiRpc early process exit", () => {
       assert.equal(winner.allRequests().filter((record) => record.type === "switch_session").length, 1);
       assert.equal(winner.allRequests().find((record) => record.type === "switch_session")?.sessionPath, target);
       assert.isFalse(winner.allRequests().some((record) => record.type === "prompt" || record.type === "new_session"));
-      assert.deepEqual(runtime.workers?.observation, { state: "error", code: "bridge_launch_failed" });
-      assert.equal(runtime.workers?.runtimeMode, "approval-required");
-      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      assert.isDefined(runtime.nativeWorkers);
+      assert.isFalse(yield* runtime.nativeWorkers!.hasPendingWork([]));
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
@@ -4273,7 +4958,7 @@ describe("PiRpc early process exit", () => {
         yield* Effect.gen(function* () {
           const adapter = yield* makePiAdapterV2({
             instanceId: PI_INSTANCE_ID,
-            settings: yield* decodePiSettings({ enabled: true, binaryPath: "pi", workerBridge: true }),
+            settings: yield* decodePiSettings({ enabled: true, binaryPath: "pi" }),
             environment: {},
           }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
           const error = yield* adapter.openSession({

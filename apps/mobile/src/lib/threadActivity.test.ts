@@ -17,8 +17,16 @@ import {
   TurnItemId,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2ProjectedTurnItem,
+  PiChecklistSelectionPointer,
+  PiChecklistCapture,
+  type OrchestrationV2PlanArtifact,
   type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+import { projectPiChecklist } from "@t3tools/shared/checklist";
+
+const decodePiChecklistSelectionPointer = Schema.decodeUnknownSync(PiChecklistSelectionPointer);
+const decodePiChecklistCapture = Schema.decodeUnknownSync(PiChecklistCapture);
 import { resolveUserMessagePresentation } from "@t3tools/client-runtime/user-message";
 import { summarizeToolGroup } from "@t3tools/client-runtime/work-log/presentation";
 import * as DateTime from "effect/DateTime";
@@ -37,6 +45,7 @@ import {
   setPendingUserInputCustomAnswer,
   isPendingUserInputOptionSelected,
   buildPendingUserInputAnswers,
+  currentChecklistPlan,
 } from "./threadActivity";
 
 const threadId = ThreadId.make("thread-1");
@@ -2612,5 +2621,212 @@ describe("MCP apps", () => {
 
   it("keeps a running app call an ordinary work row", () => {
     expect(feed("running").some((candidate) => candidate.type === "mcp-app")).toBe(false);
+  });
+});
+
+describe("currentChecklistPlan", () => {
+  it("uses the Pi pointer instead of the later todo list", () => {
+    const current: OrchestrationV2PlanArtifact = {
+      id: PlanId.make("plan-current"),
+      threadId,
+      runId: null,
+      nodeId: NodeId.make("node-current"),
+      kind: "todo_list",
+      status: "active",
+      piChecklistProvenance: "pi_native",
+      steps: [{ id: "step-current", text: "From the pointer", status: "pending" }],
+    };
+    const later: OrchestrationV2PlanArtifact = {
+      id: PlanId.make("plan-later"),
+      threadId,
+      runId,
+      nodeId: NodeId.make("node-later"),
+      kind: "todo_list",
+      status: "active",
+      steps: [{ id: "step-later", text: "Later run", status: "running" }],
+    };
+    const pointer = decodePiChecklistSelectionPointer({
+      state: "ready",
+      list: { threadId, providerInstanceId: "pi", nativeSessionId: "session-a" },
+      ownerGeneration: 1,
+      sessionGeneration: 1,
+      captureVersion: 2,
+      sourceEntryId: "entry-1",
+      planId: current.id,
+    });
+
+    expect(
+      currentChecklistPlan([current, later], {
+        driver: "pi",
+        nativeMetadata: { checklistSelection: pointer },
+      }),
+    ).toBe(current);
+    expect(
+      currentChecklistPlan([later], {
+        driver: "codex",
+        nativeMetadata: null,
+      }),
+    ).toBeUndefined();
+  });
+});
+
+describe("Pi checklist in the product feed", () => {
+  const capture = decodePiChecklistCapture({
+    list: { threadId, providerInstanceId: "pi", nativeSessionId: "native-session" },
+    ownerGeneration: 1,
+    sessionGeneration: 1,
+    captureVersion: 2,
+    expectedPointer: { kind: "absent" },
+    authority: "capture",
+    source: {
+      state: "ready",
+      sourceEntryId: "selected-entry",
+      tasks: [
+        { id: 1, identityEntryId: "first-life", subject: "Current task", status: "in_progress" },
+        { id: 2, identityEntryId: "deleted-life", subject: "Deleted task", status: "deleted" },
+      ],
+    },
+  });
+  const projection = projectPiChecklist({
+    capture,
+    updatedAt: DateTime.makeUnsafe("2026-09-04T00:00:00.000Z"),
+  });
+  const current = projection.plan;
+  const item = projection.turnItem;
+  if (current?.kind !== "todo_list" || item?.type !== "todo_list")
+    throw new Error("expected checklist artifacts");
+  const historical: OrchestrationV2PlanArtifact = {
+    ...current,
+    id: PlanId.make("historical-recovered-later"),
+    steps: [{ id: "historical", text: "Not current", status: "completed" }],
+  };
+  const checklist = {
+    plans: [current, historical],
+    turnItems: [item],
+    activeProviderThread: {
+      driver: "pi",
+      nativeMetadata: { checklistSelection: projection.pointer },
+    },
+  };
+  const activities = (entries: ReadonlyArray<ThreadFeedEntry>) =>
+    entries.flatMap((entry) => (entry.type === "activity-group" ? entry.activities : []));
+
+  it("shows the selected persisted list even outside the page, not a recovered later tool", () => {
+    const feed = buildThreadFeed(
+      [
+        projected(
+          {
+            ...item,
+            id: TurnItemId.make("historical-item"),
+            planId: historical.id,
+            steps: historical.steps,
+            updatedAt: DateTime.makeUnsafe("2026-10-04T00:00:00.000Z"),
+          },
+          0,
+        ),
+      ],
+      { checklist },
+    );
+    const rows = activities(feed);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.projectedItem.item).toMatchObject({
+      type: "todo_list",
+      planId: current.id,
+      runId: null,
+      steps: [{ text: "Current task", status: "running" }],
+    });
+    expect(rows[0]?.getFullDetail()).toBe("◐ Current task");
+    expect(rows[0]?.canExpand).toBe(true);
+    // Finished run folding must not hide conversation state.
+    expect(rows[0] && threadFeedActivityIsVisible(rows[0])).toBe(true);
+    expect(
+      activities(
+        deriveThreadFeedPresentation(
+          feed,
+          {
+            runId,
+            status: "completed",
+            startedAt: "2026-09-04T00:00:00.000Z",
+            completedAt: "2026-09-04T00:01:00.000Z",
+          },
+          new Set(),
+        ),
+      ).map((row) => row.projectedItem.item),
+    ).toEqual([rows[0]?.projectedItem.item]);
+    expect(rows[0]?.getCopyText()).not.toContain("Not current");
+    expect(rows[0]?.getCopyText()).not.toContain("Deleted task");
+  });
+
+  it("uses plan provenance and strips carried durations before readonly presentation", () => {
+    const rows = activities(
+      buildThreadFeed([], {
+        checklist: {
+          ...checklist,
+          plans: [
+            {
+              ...current,
+              steps: current.steps.map((step) => ({ ...step, durationMs: 999 })),
+            },
+          ],
+        },
+      }),
+    );
+    expect(rows[0]?.getFullDetail()).toBe("◐ Current task");
+    const shown = rows[0]?.projectedItem.item;
+    if (shown?.type !== "todo_list") throw new Error("expected checklist row");
+    expect(shown.steps[0]).not.toHaveProperty("durationMs");
+    expect(shown.startedAt).toBeNull();
+    expect(shown.completedAt).toBeNull();
+    expect(
+      activities(
+        buildThreadFeed([], {
+          checklist: { ...checklist, plans: [{ ...current, piChecklistProvenance: undefined }] },
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it("shows no stale list for unavailable, missing selection, or a proven empty branch", () => {
+    const empty = projectPiChecklist({
+      capture: { ...capture, source: { state: "ready", sourceEntryId: null, tasks: [] } },
+      updatedAt: item.updatedAt,
+    });
+    for (const selection of [
+      { ...projection.pointer, state: "unavailable" as const, sourceEntryId: null, planId: null },
+      undefined,
+      empty.pointer,
+    ]) {
+      expect(
+        activities(
+          buildThreadFeed([projected(item, 0)], {
+            checklist: {
+              plans:
+                selection === empty.pointer && empty.plan
+                  ? [empty.plan, historical]
+                  : checklist.plans,
+              turnItems: empty.turnItem ? [empty.turnItem, item] : [item],
+              activeProviderThread: {
+                driver: "pi",
+                nativeMetadata: { checklistSelection: selection },
+              },
+            },
+          }),
+        ),
+      ).toEqual([]);
+    }
+  });
+
+  it("does not introduce Pi checklist rows for other providers or duplicate a paged current item", () => {
+    expect(
+      activities(
+        buildThreadFeed([projected(item, 0)], {
+          checklist: {
+            ...checklist,
+            activeProviderThread: { driver: "codex", nativeMetadata: null },
+          },
+        }),
+      ),
+    ).toEqual([]);
+    expect(activities(buildThreadFeed([projected(item, 0)], { checklist }))).toHaveLength(1);
   });
 });

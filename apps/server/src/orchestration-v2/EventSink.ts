@@ -1,6 +1,15 @@
+import * as NodeUtil from "node:util";
 import {
   CommandId,
+  EventId,
+  applyChecklistPointerWrite,
+  mergeChecklistSelectionMetadata,
+  type PiChecklistCapture,
+  type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
+  type PiNativeWorkerCheckpoint,
+  type PiNativeWorkerLaunch,
+  type OrchestrationV2Subagent,
   OrchestrationV2DomainEvent,
   OrchestrationV2StoredEvent,
   ProviderThreadId,
@@ -11,6 +20,7 @@ import {
   type ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import { projectPiChecklist } from "@t3tools/shared/checklist";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -71,18 +81,55 @@ export type EventSinkV2Error = typeof EventSinkV2Error.Type;
  * SERVICE DEFINITION
  */
 export interface EventSinkV2Shape {
+  readonly nativeWorkers: (providerSessionId: PiNativeWorkerLaunch["providerSessionId"]) =>
+    Effect.Effect<ReadonlyArray<OrchestrationV2Subagent>, EventSinkV2Error>;
+  /** Native capture's admission/CAS and derived reads share the append transaction. */
+  readonly writeNativeWorker: (input: {
+    readonly launch: PiNativeWorkerLaunch;
+    readonly ownerGeneration: number;
+    readonly expectedCheckpoint: PiNativeWorkerCheckpoint | undefined;
+    readonly checkpoint: PiNativeWorkerCheckpoint;
+    readonly retire?: boolean;
+    readonly isConnected?: Effect.Effect<boolean>;
+    readonly build: (subagent: OrchestrationV2Subagent, providerThread: OrchestrationV2ProviderThread) =>
+      Effect.Effect<{
+        readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
+        readonly checklistCapture?: { readonly providerThreadId: ProviderThreadId; readonly capture: PiChecklistCapture };
+        readonly sourceProgress: boolean;
+      }, unknown>;
+  }) => Effect.Effect<{
+    readonly committed: boolean;
+    readonly sourceProgress: boolean;
+    readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
+  }, EventSinkV2Error>;
   readonly write: (input: {
+    readonly checklistCapture?: {
+      readonly providerThreadId: ProviderThreadId;
+      readonly capture: PiChecklistCapture;
+    };
+    readonly resetChecklistSession?: ProviderThreadId;
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   readonly writeWithEffects: (input: {
+    readonly checklistCapture?: {
+      readonly providerThreadId: ProviderThreadId;
+      readonly capture: PiChecklistCapture;
+    };
+    readonly resetChecklistSession?: ProviderThreadId;
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   readonly writeIfRunCurrent: (input: {
+    readonly isConnected?: Effect.Effect<boolean>;
+    readonly checklistCapture?: {
+      readonly providerThreadId: ProviderThreadId;
+      readonly capture: PiChecklistCapture;
+    };
+    readonly resetChecklistSession?: ProviderThreadId;
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
     readonly threadId: ThreadId;
@@ -306,7 +353,171 @@ const layerBase: Layer.Layer<
         });
       });
 
-    const normalizeEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
+    const prepareEvents = Effect.fnUntraced(function* (
+      events: ReadonlyArray<OrchestrationV2DomainEvent>,
+      checklistCapture?: Parameters<EventSinkV2Shape["write"]>[0]["checklistCapture"],
+      resetChecklistSession?: ProviderThreadId,
+      nativeCapture = false,
+    ) {
+      const prepared: Array<OrchestrationV2DomainEvent> = [];
+      let checklistAccepted = checklistCapture === undefined;
+      const providerThreads = new Map<ProviderThreadId, OrchestrationV2ProviderThread>();
+      // Full-row snapshots (including run finalization) are not selector authority.
+      // Read the preimage in this transaction, not when a provider event was received.
+      for (const event of events) {
+        if (!nativeCapture && (
+          event.type === "subagent.updated" ||
+          event.type === "turn-item.updated" ||
+          event.type === "message.updated" ||
+          event.type === "thread.model-selection-updated" ||
+          event.type === "plan.updated" ||
+          event.type === "provider-thread.updated"
+        )) {
+          const threadId = event.type === "subagent.updated"
+            ? event.payload.childThreadId : event.threadId;
+          if (threadId != null) {
+            const rows = yield* sql<{ native_child: number }>`
+              SELECT 1 AS native_child FROM orchestration_v2_projection_provider_threads
+              WHERE thread_id = ${threadId}
+                AND json_extract(payload_json, '$.nativeMetadata.nativeWorkerCheckpoint') IS NOT NULL
+              LIMIT 1
+            `;
+            if (rows.length > 0) continue;
+          }
+        }
+        if (event.type !== "provider-thread.updated" || event.payload.driver !== "pi") {
+          prepared.push(event);
+          continue;
+        }
+        const stored =
+          providerThreads.get(event.payload.id) ??
+          (yield* ProjectionStore.readProviderThread(sql, event.threadId, event.payload.id));
+        const payload = {
+          ...event.payload,
+          nativeMetadata: mergeChecklistSelectionMetadata(
+            stored?.nativeMetadata,
+            event.payload.nativeMetadata,
+            { kind: "ordinary" },
+          ),
+        };
+        if (!nativeCapture && stored?.nativeMetadata?.nativeWorkerCheckpoint !== undefined) {
+          continue;
+        }
+        providerThreads.set(payload.id, payload);
+        prepared.push({ ...event, payload });
+      }
+      const providerThreadId = checklistCapture?.providerThreadId ?? resetChecklistSession;
+      if (providerThreadId !== undefined) {
+        const rowEvent = prepared.findLast(
+          (event) =>
+            event.type === "provider-thread.updated" && event.payload.id === providerThreadId,
+        );
+        const base = rowEvent ?? prepared[0];
+        if (base !== undefined) {
+          const stored = yield* ProjectionStore.readProviderThread(
+            sql,
+            base.threadId,
+            providerThreadId,
+          );
+          const effective = providerThreads.get(providerThreadId) ?? stored;
+          if (effective?.driver === "pi" && effective.appThreadId === base.threadId) {
+            const pointer = stored?.nativeMetadata?.checklistSelection;
+            let capture = checklistCapture?.capture;
+            // A guarded fresh-session load without a supplement must retire the old list too.
+            if (
+              capture === undefined &&
+              resetChecklistSession === providerThreadId &&
+              pointer !== undefined &&
+              pointer.list.nativeSessionId !== effective.nativeThreadRef?.nativeId
+            ) {
+              capture = {
+                list: {
+                  ...pointer.list,
+                  nativeSessionId:
+                    effective.nativeThreadRef?.nativeId ?? pointer.list.nativeSessionId,
+                },
+                ownerGeneration: pointer.ownerGeneration + 1,
+                sessionGeneration: pointer.sessionGeneration + 1,
+                captureVersion: 0,
+                expectedPointer: { kind: "current", pointer },
+                authority: "session_reset",
+                source: { state: "unavailable", sourceEntryId: null, tasks: [] },
+              };
+            }
+            if (
+              capture !== undefined &&
+              capture.list.threadId === effective.appThreadId &&
+              capture.list.providerInstanceId === effective.providerInstanceId &&
+              (capture.list.nativeSessionId === effective.nativeThreadRef?.nativeId ||
+                (effective.nativeThreadRef === null &&
+                  resetChecklistSession === providerThreadId &&
+                  capture.source.state === "unavailable"))
+            ) {
+              const authority = {
+                kind:
+                  (resetChecklistSession === providerThreadId || nativeCapture) &&
+                  capture.authority === "session_reset"
+                    ? ("session_reset" as const)
+                    : ("capture" as const),
+                capture,
+              };
+              if (applyChecklistPointerWrite(pointer, authority).accepted) {
+                checklistAccepted = true;
+                const projected = projectPiChecklist({ capture, updatedAt: base.occurredAt });
+                const payload = {
+                  ...effective,
+                  nativeMetadata: mergeChecklistSelectionMetadata(
+                    stored?.nativeMetadata,
+                    effective.nativeMetadata,
+                    authority,
+                  ),
+                };
+                if (rowEvent?.type === "provider-thread.updated") {
+                  prepared[prepared.indexOf(rowEvent)] = { ...rowEvent, payload };
+                } else {
+                  prepared.push({
+                    id: EventId.make(`${base.id}:pi-checklist-thread`),
+                    type: "provider-thread.updated",
+                    threadId: base.threadId,
+                    driver: effective.driver,
+                    providerInstanceId: effective.providerInstanceId,
+                    occurredAt: base.occurredAt,
+                    payload,
+                  });
+                }
+                if (projected.plan !== null && projected.turnItem !== null) {
+                  prepared.push(
+                    {
+                      id: EventId.make(`${base.id}:pi-checklist-plan`),
+                      type: "plan.updated",
+                      threadId: base.threadId,
+                      driver: effective.driver,
+                      providerInstanceId: effective.providerInstanceId,
+                      occurredAt: base.occurredAt,
+                      payload: projected.plan,
+                    },
+                    {
+                      id: EventId.make(`${base.id}:pi-checklist-item`),
+                      type: "turn-item.updated",
+                      threadId: base.threadId,
+                      driver: effective.driver,
+                      providerInstanceId: effective.providerInstanceId,
+                      occurredAt: base.occurredAt,
+                      payload: { ...projected.turnItem, providerThreadId },
+                    },
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+      return { events: prepared, checklistAccepted };
+    });
+
+    const normalizeTurnItems = Effect.fnUntraced(function* (
+      events: ReadonlyArray<OrchestrationV2DomainEvent>,
+    ) {
       const runOrdinals = new Map(
         events.flatMap((event) =>
           event.type === "run.created" || event.type === "run.updated"
@@ -314,7 +525,7 @@ const layerBase: Layer.Layer<
             : [],
         ),
       );
-      return Effect.forEach(
+      return yield* Effect.forEach(
         events,
         (event): Effect.Effect<OrchestrationV2DomainEvent, unknown> =>
           event.type === "turn-item.updated"
@@ -327,7 +538,7 @@ const layerBase: Layer.Layer<
             : Effect.succeed(event),
         { concurrency: 1 },
       );
-    };
+    });
 
     const applyStoredEvents = (storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>) =>
       Effect.gen(function* () {
@@ -370,14 +581,16 @@ const layerBase: Layer.Layer<
 
       return yield* commitThenPublish(
         Effect.gen(function* () {
-          const normalized = yield* normalizeEvents(
+          const prepared = yield* prepareEvents(
             input.guardPendingUserInputCancellations === true
               ? yield* guardUserInputCancellations(input.events)
               : input.events,
+            input.checklistCapture,
+            input.resetChecklistSession,
           );
           const committed = yield* eventStore.append({
             ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-            events: normalized,
+            events: yield* normalizeTurnItems(prepared.events),
           });
           yield* applyStoredEvents(committed);
           yield* effectOutbox.enqueue(input.effects);
@@ -428,14 +641,25 @@ const layerBase: Layer.Layer<
               };
             }
 
-            const normalized = yield* normalizeEvents(
+            const prepared = yield* prepareEvents(
               input.guardPendingUserInputCancellations === true
                 ? yield* guardUserInputCancellations(input.events)
                 : input.events,
+              input.checklistCapture,
+              input.resetChecklistSession,
             );
+            // A stale startup snapshot cannot install a new native session while
+            // retaining the previous session's list. Reject before position writes too.
+            if ((input.resetChecklistSession !== undefined && !prepared.checklistAccepted) ||
+              (input.isConnected !== undefined && !(yield* input.isConnected))) {
+              return {
+                committed: false as const,
+                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+              };
+            }
             const storedEvents = yield* eventStore.append({
               ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-              events: normalized,
+              events: yield* normalizeTurnItems(prepared.events),
             });
             yield* applyStoredEvents(storedEvents);
             yield* effectOutbox.enqueue(input.effects ?? []);
@@ -493,19 +717,79 @@ const layerBase: Layer.Layer<
             };
           }
 
-          const normalized = yield* normalizeEvents(
+          const prepared = yield* prepareEvents(
             input.guardPendingUserInputCancellations === true
               ? yield* guardUserInputCancellations(input.events)
               : input.events,
           );
           const storedEvents = yield* eventStore.append({
             ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-            events: normalized,
+            events: yield* normalizeTurnItems(prepared.events),
           });
           yield* applyStoredEvents(storedEvents);
           return { committed: true as const, storedEvents };
         }),
         (result) => (result.committed ? publishStoredEvents(result.storedEvents) : Effect.void),
+      );
+    });
+
+    const writeNativeWorkerEffect = Effect.fn("EventSink.writeNativeWorker")(function* (
+      input: Parameters<EventSinkV2Shape["writeNativeWorker"]>[0],
+    ) {
+      return yield* commitThenPublish(
+        Effect.gen(function* () {
+          const rejected = {
+            committed: false,
+            sourceProgress: false,
+            storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+          };
+          const members = yield* ProjectionStore.readNativeWorkers(sql, input.launch.providerSessionId);
+          const member = members.find((worker) =>
+            NodeUtil.isDeepStrictEqual(worker.nativeWorker?.launch, input.launch));
+          if (member?.childThreadId == null || member.providerThreadId === null) return rejected;
+          const child = yield* ProjectionStore.readProviderThread(sql, member.childThreadId, member.providerThreadId);
+          const current = child?.nativeMetadata?.nativeWorkerCheckpoint;
+          const runs = yield* sql<{
+            readonly attempt: string | null;
+            readonly providerThreadId: string | null;
+            readonly providerInstanceId: string;
+          }>`
+            SELECT json_extract(payload_json, '$.activeAttemptId') AS attempt,
+              json_extract(payload_json, '$.providerThreadId') AS providerThreadId,
+              json_extract(payload_json, '$.providerInstanceId') AS providerInstanceId
+            FROM orchestration_v2_projection_runs
+            WHERE thread_id = ${input.launch.parentThreadId} AND run_id = ${input.launch.runId}
+          `;
+          if (
+            child === undefined || child.ownerNodeId !== member.id ||
+            child.appThreadId !== member.childThreadId ||
+            member.threadId !== input.launch.parentThreadId ||
+            member.runId !== input.launch.runId ||
+            member.parentNodeId !== input.launch.toolNodeId ||
+            child.providerSessionId !== input.launch.providerSessionId ||
+            child.providerInstanceId !== input.launch.providerInstanceId ||
+            (input.retire !== true && (
+              runs[0]?.providerThreadId !== input.launch.parentProviderThreadId ||
+              runs[0]?.providerInstanceId !== input.launch.providerInstanceId ||
+              runs[0]?.attempt !== input.launch.runAttemptId)) ||
+            !NodeUtil.isDeepStrictEqual(current, input.expectedCheckpoint) ||
+            current?.ownerGeneration !== input.ownerGeneration ||
+            input.checkpoint.ownerGeneration !== input.ownerGeneration + (input.retire === true ? 1 : 0) ||
+            !NodeUtil.isDeepStrictEqual(input.checkpoint.launch, input.launch) ||
+            !NodeUtil.isDeepStrictEqual(current.owner, input.checkpoint.owner)
+          ) return rejected;
+          if (input.isConnected !== undefined && !(yield* input.isConnected)) return rejected;
+          const built = yield* input.build(member, child);
+          if (input.isConnected !== undefined && !(yield* input.isConnected)) return rejected;
+          const prepared = yield* prepareEvents(built.events, built.checklistCapture, undefined, true);
+          if (!prepared.checklistAccepted) {
+            return yield* Effect.die(new Error("Native checklist capture rejected."));
+          }
+          const storedEvents = yield* eventStore.append({ events: yield* normalizeTurnItems(prepared.events) });
+          yield* applyStoredEvents(storedEvents);
+          return { committed: true, sourceProgress: built.sourceProgress, storedEvents };
+        }),
+        (result) => result.committed ? publishStoredEvents(result.storedEvents) : Effect.void,
       );
     });
 
@@ -543,10 +827,10 @@ const layerBase: Layer.Layer<
             return { ...existing, committed: false as const, cancelledEffectIds: [] };
           }
 
-          const normalized = yield* normalizeEvents(input.events);
+          const prepared = yield* prepareEvents(input.events);
           const storedEvents = yield* eventStore.append({
             commandId: input.commandId,
-            events: normalized,
+            events: yield* normalizeTurnItems(prepared.events),
           });
           const sequence = storedEvents.at(-1)?.sequence;
           if (sequence === undefined) {
@@ -760,6 +1044,13 @@ const layerBase: Layer.Layer<
     };
 
     return EventSinkV2.of({
+      nativeWorkers: (providerSessionId) =>
+        ProjectionStore.readNativeWorkers(sql, providerSessionId).pipe(
+          Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 0, cause })),
+        ),
+      writeNativeWorker: (input) => writeNativeWorkerEffect(input).pipe(
+        Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 0, cause })),
+      ),
       write: (input) =>
         writeEffect({ ...input, effects: [] }).pipe(
           Effect.mapError(

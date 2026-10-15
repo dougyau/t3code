@@ -744,6 +744,182 @@ export const OrchestrationV2SubagentWorkflow = Schema.Struct({
 });
 export type OrchestrationV2SubagentWorkflow = typeof OrchestrationV2SubagentWorkflow.Type;
 
+/** Immutable ownership captured at tool start, never inferred from the current turn. */
+export const PiNativeWorkerToolContext = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: ProviderSessionId,
+  parentThreadId: ThreadId,
+  parentProviderThreadId: ProviderThreadId,
+  parentProviderTurnId: ProviderTurnId,
+  runId: RunId,
+  runAttemptId: RunAttemptId,
+  toolNodeId: NodeId,
+  coordinatorSessionId: TrimmedNonEmptyString,
+  toolCallId: TrimmedNonEmptyString,
+});
+export type PiNativeWorkerToolContext = typeof PiNativeWorkerToolContext.Type;
+
+export const PiNativeWorkerLaunch = Schema.Union([
+  Schema.Struct({
+    ...PiNativeWorkerToolContext.fields,
+    source: Schema.Literal("agent_spawn"),
+    instanceId: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({
+    ...PiNativeWorkerToolContext.fields,
+    source: Schema.Literal("team_assign"),
+    instanceId: TrimmedNonEmptyString,
+    assignmentId: TrimmedNonEmptyString,
+    roleId: TrimmedNonEmptyString,
+  }),
+]);
+export type PiNativeWorkerLaunch = typeof PiNativeWorkerLaunch.Type;
+
+export const PiNativeWorkerOwner = Schema.Struct({
+  processId: TrimmedNonEmptyString,
+  coordinatorSessionId: TrimmedNonEmptyString,
+  epoch: TrimmedNonEmptyString,
+});
+export type PiNativeWorkerOwner = typeof PiNativeWorkerOwner.Type;
+export const PiNativeWorkerGap = Schema.Literals([
+  "pending", "not_captured", "not_persisted", "pruned", "evicted",
+  "unsupported_content", "capture_failed", "stale_owner", "resync_required",
+  "invalid_record", "record_oversized", "provenance_mismatch", "unavailable",
+]);
+export const PiNativeWorkerTodoHead = Schema.Union([
+  Schema.Struct({ state: Schema.Literal("ready"), sourceEntryId: Schema.NullOr(Schema.String) }),
+  Schema.Struct({ state: Schema.Literal("unavailable") }),
+]);
+export const PiNativeWorkerSelectedModel = Schema.Struct({
+  model: Schema.String,
+  requestedModel: Schema.optional(Schema.String),
+  reasoning: Schema.optional(Schema.String),
+});
+export const PiNativeWorkerActivatedModel = Schema.Struct({
+  attemptId: Schema.String, model: Schema.String, reasoning: Schema.String,
+});
+export const PiNativeWorkerBinding = Schema.Struct({
+  generation: NonNegativeInt,
+  historyId: TrimmedNonEmptyString,
+  sessionId: TrimmedNonEmptyString,
+  state: Schema.Literals(["active", "historical"]),
+  headEntryId: Schema.NullOr(Schema.String),
+  capture: Schema.Literals(["open", "closed", "incomplete"]),
+  attemptIds: Schema.Array(Schema.String),
+  attempts: Schema.Array(Schema.Struct({
+    attemptId: Schema.String,
+    activated: Schema.optional(Schema.Struct({ model: Schema.String, reasoning: Schema.String })),
+    selected: Schema.optional(PiNativeWorkerSelectedModel),
+  })),
+  gaps: Schema.Array(PiNativeWorkerGap),
+  todoHead: Schema.optional(PiNativeWorkerTodoHead),
+});
+export type PiNativeWorkerBinding = typeof PiNativeWorkerBinding.Type;
+
+export const PiNativeWorkerSummary = Schema.Struct({
+  launch: PiNativeWorkerLaunch,
+  roleId: Schema.optional(Schema.String),
+  acceptedAt: Schema.optional(Schema.Number),
+  brief: Schema.optional(Schema.String),
+  briefComplete: Schema.optional(Schema.Boolean),
+  selected: Schema.optional(PiNativeWorkerSelectedModel),
+  activated: Schema.optional(Schema.NullOr(PiNativeWorkerActivatedModel)),
+  execution: Schema.optional(Schema.Literals(["accepted", "running", "completed", "failed", "cancelled"])),
+  result: Schema.optional(Schema.Literals(["pending", "available", "unavailable"])),
+  capture: Schema.Literals(["opening", "open", "closed", "incomplete"]),
+  availability: Schema.Literals(["ready", "unavailable", "incompatible"]),
+  gaps: Schema.Array(PiNativeWorkerGap),
+});
+export type PiNativeWorkerSummary = typeof PiNativeWorkerSummary.Type;
+
+/** Restart an incomplete record from its first page; never persist fragment bytes. */
+export const PiNativeWorkerFragmentRestart = Schema.Struct({
+  id: Schema.String, binding: NonNegativeInt, revision: PositiveInt,
+  epoch: Schema.String, sequence: Schema.NullOr(NonNegativeInt),
+  totalBytes: PositiveInt, cursor: Schema.NullOr(Schema.String),
+});
+export const PiNativeWorkerCheckpoint = Schema.Struct({
+  launch: PiNativeWorkerLaunch,
+  owner: PiNativeWorkerOwner,
+  ownerGeneration: NonNegativeInt,
+  captureEpoch: Schema.NullOr(Schema.String),
+  bindings: Schema.Array(PiNativeWorkerBinding),
+  bindingGeneration: Schema.NullOr(NonNegativeInt),
+  bindingCursors: Schema.Array(Schema.Struct({
+    generation: NonNegativeInt,
+    cursor: Schema.NullOr(Schema.String),
+    cut: NonNegativeInt,
+    recovery: Schema.Boolean,
+    more: Schema.Boolean,
+    omission: Schema.optional(Schema.Literals(["invalid_record", "record_oversized"])),
+    fragment: Schema.optional(PiNativeWorkerFragmentRestart),
+  })),
+  cursor: Schema.NullOr(Schema.String),
+  cut: NonNegativeInt,
+  recovery: Schema.Boolean,
+  capture: Schema.Literals(["opening", "open", "closed", "incomplete"]),
+  finalSequence: Schema.NullOr(NonNegativeInt),
+  fragment: Schema.optional(PiNativeWorkerFragmentRestart),
+  gaps: Schema.Array(PiNativeWorkerGap),
+});
+export type PiNativeWorkerCheckpoint = typeof PiNativeWorkerCheckpoint.Type;
+
+export const PiNativeWorkerRecordProvenance = Schema.Struct({
+  instanceId: Schema.String,
+  owner: PiNativeWorkerOwner,
+  captureEpoch: Schema.String,
+  id: Schema.String, binding: NonNegativeInt, revision: PositiveInt,
+  sequence: Schema.NullOr(NonNegativeInt),
+  order: NonNegativeInt, nativeOrder: Schema.NullOr(NonNegativeInt),
+  occurredAt: Schema.NullOr(Schema.Number), observedAt: Schema.Number,
+  nativeTime: Schema.NullOr(Schema.String),
+  nativeEntryId: Schema.NullOr(Schema.String), parentEntryId: Schema.NullOr(Schema.String),
+  toolCallId: Schema.NullOr(Schema.String), recovered: Schema.optional(Schema.Literal(true)),
+});
+export type PiNativeWorkerRecordProvenance = typeof PiNativeWorkerRecordProvenance.Type;
+
+export const PiNativeWorkerContent = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("text"), text: Schema.String }),
+  Schema.Struct({
+    type: Schema.Literal("toolCall"), toolCallId: Schema.String, name: Schema.String,
+    arguments: Schema.optional(Schema.Unknown),
+  }),
+  Schema.Struct({ type: Schema.Literal("omitted"), reason: Schema.Literal("unsupported_content") }),
+]);
+export const PiNativeWorkerRecord = Schema.Union([
+  Schema.Struct({
+    provenance: PiNativeWorkerRecordProvenance, kind: Schema.Literal("message"),
+    payload: Schema.Struct({
+      role: Schema.Literals(["user", "assistant"]), blocks: Schema.Array(PiNativeWorkerContent),
+      stopReason: Schema.optional(Schema.Literals(["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"])),
+      errorMessage: Schema.optional(Schema.String),
+    }),
+  }),
+  Schema.Struct({
+    provenance: PiNativeWorkerRecordProvenance, kind: Schema.Literal("tool"),
+    parentToolCallId: Schema.optional(Schema.String),
+    payload: Schema.Struct({
+      status: Schema.Literals(["started", "updated", "completed", "error"]), name: Schema.String,
+      args: Schema.optional(Schema.Unknown), argsState: Schema.Literals(["available", "not_captured"]),
+      result: Schema.NullOr(Schema.Array(PiNativeWorkerContent)), isError: Schema.NullOr(Schema.Boolean),
+      todoSnapshot: Schema.optional(Schema.Struct({
+        format: Schema.Literal("rpiv-todo-v1"),
+        tasks: Schema.Array(Schema.Struct({
+          id: PositiveInt, identityEntryId: TrimmedNonEmptyString, subject: TrimmedNonEmptyString,
+          status: Schema.Literals(["pending", "in_progress", "completed", "deleted"]),
+        })),
+      })),
+    }),
+  }),
+  Schema.Struct({
+    provenance: PiNativeWorkerRecordProvenance, kind: Schema.Literal("branch_changed"),
+    payload: Schema.Struct({
+      headEntryId: Schema.NullOr(Schema.String), previousHeadEntryId: Schema.String,
+    }),
+  }),
+]);
+export type PiNativeWorkerRecord = typeof PiNativeWorkerRecord.Type;
+
 export const OrchestrationV2Subagent = Schema.Struct({
   id: NodeId,
   threadId: ThreadId,
@@ -780,6 +956,7 @@ export const OrchestrationV2Subagent = Schema.Struct({
   progress: Schema.optional(Schema.String),
   /** Present only on a workflow coordinator task; absent on ordinary subagents. */
   workflow: Schema.optional(OrchestrationV2SubagentWorkflow),
+  nativeWorker: Schema.optional(PiNativeWorkerSummary),
   result: Schema.NullOr(Schema.String),
   startedAt: Schema.NullOr(Schema.DateTimeUtc),
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
@@ -914,6 +1091,65 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
 );
 export type OrchestrationV2PendingBackgroundTask = typeof OrchestrationV2PendingBackgroundTask.Type;
 
+/** Conversation + provider instance + effective native session. Not a run or tool id. */
+export const PiChecklistListIdentity = Schema.Struct({
+  threadId: ThreadId,
+  providerInstanceId: ProviderInstanceId,
+  nativeSessionId: TrimmedNonEmptyString,
+});
+export type PiChecklistListIdentity = typeof PiChecklistListIdentity.Type;
+
+export const PiChecklistNativeTask = Schema.Struct({
+  id: Schema.Int.check(
+    Schema.isGreaterThan(0),
+    Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+  ),
+  identityEntryId: TrimmedNonEmptyString,
+  subject: TrimmedNonEmptyString,
+  status: Schema.Literals(["pending", "in_progress", "completed", "deleted"]),
+});
+export type PiChecklistNativeTask = typeof PiChecklistNativeTask.Type;
+
+/**
+ * Current checklist selection. Missing on the row means absent, not empty.
+ * `sourceEntryId: null` is a proven empty branch. `state: "unavailable"` is a
+ * selected result that cannot be projected.
+ */
+export const PiChecklistSelectionPointer = Schema.Struct({
+  state: Schema.Literals(["ready", "unavailable"]),
+  list: PiChecklistListIdentity,
+  ownerGeneration: NonNegativeInt,
+  sessionGeneration: NonNegativeInt,
+  captureVersion: NonNegativeInt,
+  sourceEntryId: Schema.NullOr(TrimmedNonEmptyString),
+  planId: Schema.NullOr(PlanId),
+});
+export type PiChecklistSelectionPointer = typeof PiChecklistSelectionPointer.Type;
+
+/** What the caller observed. `absent` is not the same as a confirmed empty pointer. */
+export const PiChecklistExpectedPointer = Schema.Struct({
+  kind: Schema.Literals(["absent", "current"]),
+  pointer: Schema.optional(PiChecklistSelectionPointer),
+});
+export type PiChecklistExpectedPointer = typeof PiChecklistExpectedPointer.Type;
+
+export const PiChecklistCapture = Schema.Struct({
+  list: PiChecklistListIdentity,
+  ownerGeneration: NonNegativeInt,
+  sessionGeneration: NonNegativeInt,
+  captureVersion: NonNegativeInt,
+  expectedPointer: PiChecklistExpectedPointer,
+  authority: Schema.Literals(["capture", "session_reset"]),
+  source: Schema.Struct({
+    state: Schema.Literals(["ready", "unavailable"]),
+    sourceEntryId: Schema.NullOr(TrimmedNonEmptyString),
+    tasks: Schema.Array(PiChecklistNativeTask),
+  }),
+});
+export type PiChecklistCapture = typeof PiChecklistCapture.Type;
+
+export const PI_CHECKLIST_PROVENANCE = "pi_native" as const;
+
 /** Provider and adapter metadata that should not overwrite the app thread's title. */
 export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   /** Provider-reported selection for display, separate from the app's saved preferences. */
@@ -922,9 +1158,148 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   updatedAt: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   /** Version 2 scopes provider-derived item ids by provider instance. */
   itemIdentityVersion: Schema.optional(Schema.Literal(2)),
+  /**
+   * Optional with no decoding default. A legacy row leaves this absent;
+   * ordinary provider-thread writes must not invent or drop it.
+   */
+  checklistSelection: Schema.optional(PiChecklistSelectionPointer),
+  nativeWorkerCheckpoint: Schema.optional(PiNativeWorkerCheckpoint),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;
+
+export function piChecklistPlanId(list: PiChecklistListIdentity): PlanId {
+  return PlanId.make(
+    `pi-checklist:${list.threadId}:${list.providerInstanceId}:${list.nativeSessionId}`,
+  );
+}
+
+export function piChecklistStepId(
+  list: PiChecklistListIdentity,
+  identityEntryId: string,
+  numericId: number,
+): string {
+  return `${piChecklistPlanId(list)}:${identityEntryId}:${numericId}`;
+}
+
+export function piChecklistTurnItemId(list: PiChecklistListIdentity): TurnItemId {
+  return TurnItemId.make(`pi-checklist-item:${piChecklistPlanId(list)}`);
+}
+
+export function pointerFromCapture(capture: PiChecklistCapture): PiChecklistSelectionPointer {
+  const shared = {
+    list: capture.list,
+    ownerGeneration: capture.ownerGeneration,
+    sessionGeneration: capture.sessionGeneration,
+    captureVersion: capture.captureVersion,
+    sourceEntryId: capture.source.sourceEntryId,
+  };
+  if (capture.source.state === "unavailable") {
+    return { ...shared, state: "unavailable", sourceEntryId: null, planId: null };
+  }
+  return { ...shared, state: "ready", planId: piChecklistPlanId(capture.list) };
+}
+
+export type ChecklistPointerAuthority =
+  | { readonly kind: "ordinary" }
+  | { readonly kind: "capture" | "session_reset"; readonly capture: PiChecklistCapture };
+
+function sameList(left: PiChecklistListIdentity, right: PiChecklistListIdentity): boolean {
+  return (
+    left.threadId === right.threadId &&
+    left.providerInstanceId === right.providerInstanceId &&
+    left.nativeSessionId === right.nativeSessionId
+  );
+}
+
+function samePointer(
+  left: PiChecklistSelectionPointer,
+  right: PiChecklistSelectionPointer,
+): boolean {
+  return (
+    left.state === right.state &&
+    left.ownerGeneration === right.ownerGeneration &&
+    left.sessionGeneration === right.sessionGeneration &&
+    left.captureVersion === right.captureVersion &&
+    left.sourceEntryId === right.sourceEntryId &&
+    left.planId === right.planId &&
+    sameList(left.list, right.list)
+  );
+}
+
+/** Generations fence the owner/session; capture versions order only within that generation. */
+function regresses(
+  stored: PiChecklistSelectionPointer,
+  next: PiChecklistSelectionPointer,
+  kind: "capture" | "session_reset",
+): boolean {
+  if (
+    stored.list.threadId !== next.list.threadId ||
+    stored.list.providerInstanceId !== next.list.providerInstanceId
+  ) {
+    return true;
+  }
+  if (
+    next.ownerGeneration < stored.ownerGeneration ||
+    next.sessionGeneration < stored.sessionGeneration
+  )
+    return true;
+  if (
+    stored.list.nativeSessionId !== next.list.nativeSessionId &&
+    (kind !== "session_reset" || next.sessionGeneration <= stored.sessionGeneration)
+  )
+    return true;
+  if (
+    stored.ownerGeneration !== next.ownerGeneration ||
+    stored.sessionGeneration !== next.sessionGeneration
+  )
+    return false;
+  return (
+    stored.captureVersion > next.captureVersion ||
+    (stored.captureVersion === next.captureVersion && !samePointer(stored, next))
+  );
+}
+
+function expectedMatches(
+  stored: PiChecklistSelectionPointer | undefined,
+  expected: PiChecklistExpectedPointer,
+): boolean {
+  if (expected.kind === "absent") return stored === undefined;
+  return (
+    stored !== undefined && expected.pointer !== undefined && samePointer(stored, expected.pointer)
+  );
+}
+
+export function applyChecklistPointerWrite(
+  stored: PiChecklistSelectionPointer | undefined,
+  authority: ChecklistPointerAuthority,
+): { readonly accepted: boolean; readonly pointer: PiChecklistSelectionPointer | undefined } {
+  if (authority.kind === "ordinary") return { accepted: true, pointer: stored };
+  const next = pointerFromCapture(authority.capture);
+  // Reset retires the previous selection, but is still a compare-and-swap.
+  if (
+    authority.kind !== authority.capture.authority ||
+    !expectedMatches(stored, authority.capture.expectedPointer)
+  ) {
+    return { accepted: false, pointer: stored };
+  }
+  if (stored !== undefined && regresses(stored, next, authority.kind)) {
+    return { accepted: false, pointer: stored };
+  }
+  return { accepted: true, pointer: next };
+}
+
+/** Keep the stored selector unless this write is an accepted capture or session reset. */
+export function mergeChecklistSelectionMetadata(
+  stored: OrchestrationV2ProviderThreadNativeMetadata | null | undefined,
+  incoming: OrchestrationV2ProviderThreadNativeMetadata | null | undefined,
+  authority: ChecklistPointerAuthority,
+): OrchestrationV2ProviderThreadNativeMetadata | null {
+  const decision = applyChecklistPointerWrite(stored?.checklistSelection, authority);
+  const { checklistSelection: _ignored, ...rest } = incoming ?? {};
+  if (decision.pointer === undefined) return Object.keys(rest).length === 0 ? null : rest;
+  return { ...rest, checklistSelection: decision.pointer };
+}
 
 export const OrchestrationV2ProviderGoalStatus = Schema.Literals([
   "active",
@@ -1278,6 +1653,8 @@ export const OrchestrationV2PlanArtifact = Schema.Union([
     kind: Schema.Literal("todo_list"),
     steps: Schema.Array(OrchestrationV2PlanStep),
     explanation: Schema.optional(Schema.String),
+    /** Set by the Pi checklist projector. Absent on every other provider's list. */
+    piChecklistProvenance: Schema.optional(Schema.Literal(PI_CHECKLIST_PROVENANCE)),
   }),
 ]);
 export type OrchestrationV2PlanArtifact = typeof OrchestrationV2PlanArtifact.Type;
@@ -1405,6 +1782,10 @@ export type OrchestrationV2UserMessageInputIntent =
   typeof OrchestrationV2UserMessageInputIntent.Type;
 
 const OrchestrationV2TurnItemBaseFields = {
+  nativeWorkerLaunch: Schema.optional(PiNativeWorkerLaunch),
+  nativeWorkerRecord: Schema.optional(PiNativeWorkerRecordProvenance),
+  /** Record-local revisions for several native records collapsed onto one logical tool. */
+  nativeWorkerRecords: Schema.optional(Schema.Array(PiNativeWorkerRecordProvenance)),
   toolNonExecutionKind: Schema.optional(Schema.String),
   toolSurface: Schema.optional(ToolActivitySurface),
   toolIcon: Schema.optional(ToolActivityIcon),
@@ -1505,6 +1886,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     planId: PlanId,
     steps: Schema.Array(OrchestrationV2PlanStep),
     explanation: Schema.optional(Schema.String),
+    piChecklistProvenance: Schema.optional(Schema.Literal(PI_CHECKLIST_PROVENANCE)),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -2284,6 +2666,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     planId: PlanId,
     steps: Schema.Array(OrchestrationV2PlanStep),
     explanation: Schema.optional(Schema.String),
+    piChecklistProvenance: Schema.optional(Schema.Literal(PI_CHECKLIST_PROVENANCE)),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,

@@ -7,6 +7,7 @@ import {
   shouldDockDraftHeroForSubmission,
   resolveVisibleWorktreeSetup,
   resolveWorktreeSetupProgress,
+  deriveVisibleComposerPlan,
 } from "./ChatView.logic";
 import * as DateTime from "effect/DateTime";
 import { restorePlanFollowUpComposer } from "./ChatView.logic";
@@ -194,7 +195,6 @@ import {
   deriveTimelineEntriesFromVisibleTurnItemsWithState,
   selectHandoffImageResources,
   type TimelineEntriesProjection,
-  deriveActivePlanState,
   deriveActiveWorkStartedAt,
   deriveCanInterruptRunningThread,
   findLatestProposedPlan,
@@ -206,6 +206,7 @@ import {
   CHAT_TIMELINE_ANCHOR_OFFSET,
   timelineContentOverflowsViewport,
   readTimelinePosition,
+  retainTimelinePosition,
   observeTimelineRun,
   type TimelineRunObservation,
   type TimelineScrollMode,
@@ -2163,6 +2164,10 @@ export default function ChatView(props: ChatViewProps) {
     return scopeThreadRef(parentSubagentEnvironmentId, parentSubagentThreadId);
   }, [parentSubagentEnvironmentId, parentSubagentThreadId]);
   const parentSubagentThread = useThreadShell(parentSubagentThreadRef);
+  const parentSubagentProjection = useThreadProjection(parentSubagentThreadRef);
+  const nativeWorker = parentSubagentProjection?.projection.subagents.find(
+    (agent) => agent.childThreadId === activeThread?.id,
+  )?.nativeWorker;
   const parentThreadLink = useMemo(
     () =>
       parentSubagentThreadRef === null
@@ -2449,19 +2454,11 @@ export default function ChatView(props: ChatViewProps) {
   }, [activeTerminalDrawerPresence.present, activeThreadKey, existingOpenTerminalThreadKeys]);
   const latestRunSettled = isLatestRunSettled(activeLatestRun, activeRuntime);
   const activePlan = useMemo(
-    () => deriveActivePlanState(serverProjection, activeActivityRun?.runId),
-    [activeActivityRun?.runId, serverProjection],
+    () => deriveVisibleComposerPlan(serverProjection, activeActivityRun, activeRuntime),
+    [activeActivityRun, activeRuntime, serverProjection],
   );
-  // Tasks progress for the running turn's own plan only — deriveActivePlanState
-  // falls back to older runs' plans, which must not label fresh work.
   const activeComposerTasksProgress = useMemo(() => {
-    if (
-      isLatestRunSettled(activeActivityRun, activeRuntime) ||
-      !activePlan ||
-      activePlan.runId !== (activeActivityRun?.runId ?? null)
-    ) {
-      return null;
-    }
+    if (!activePlan) return null;
     const totalSteps = activePlan.steps.length;
     if (totalSteps === 0) return null;
     const completedSteps = activePlan.steps.filter((step) => step.status === "completed").length;
@@ -2470,7 +2467,7 @@ export default function ChatView(props: ChatViewProps) {
       activePlan.steps.find((candidate) => candidate.status === "pending")?.step ??
       activePlan.steps.at(-1)!.step;
     return { step, completedSteps, totalSteps };
-  }, [activeActivityRun, activePlan, activeRuntime]);
+  }, [activePlan]);
   const activeComposerTaskSteps =
     activeComposerTasksProgress && activePlan ? activePlan.steps : null;
   const activeProjectRef = useMemo(
@@ -7429,12 +7426,13 @@ export default function ChatView(props: ChatViewProps) {
   }, [activeThread, environmentId, interruptThreadTurn, setThreadError]);
   const onOpenRelatedThread = useCallback(
     (threadId: ThreadId) => {
+      retainTimelinePosition(routeThreadKey);
       void navigate({
         to: "/$environmentId/$threadId",
         params: buildThreadRouteParams(scopeThreadRef(environmentId, threadId)),
       });
     },
-    [environmentId, navigate],
+    [environmentId, navigate, routeThreadKey],
   );
   const childThreadInputs = useChildThreadInputs(activeThreadRef);
   const childInputBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
@@ -11690,6 +11688,9 @@ export default function ChatView(props: ChatViewProps) {
                               modelLabel={providerSubagentModelLabel}
                               effortLabel={providerSubagentEffortLabel}
                               status={providerSubagentStatus}
+                              nativeWorker={nativeWorker}
+                              tasksProgress={activeComposerTasksProgress}
+                              taskSteps={activeComposerTaskSteps}
                               onOpenParent={
                                 parentThreadLink
                                   ? () => onOpenRelatedThread(parentThreadLink.threadId)

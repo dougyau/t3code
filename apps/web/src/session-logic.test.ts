@@ -15,8 +15,13 @@ import {
   type OrchestrationV2ProjectedTurnItem,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2RunAttempt,
+  ProviderDriverKind,
+  PiChecklistSelectionPointer,
   type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+
+const decodePiChecklistSelectionPointer = Schema.decodeUnknownSync(PiChecklistSelectionPointer);
 import type { ThreadRuntimeSummary } from "@t3tools/client-runtime/state/shell";
 import { deriveMessagesTimelineRows } from "./components/chat/MessagesTimeline.logic";
 import * as DateTime from "effect/DateTime";
@@ -540,6 +545,131 @@ describe("V2 session presentation", () => {
       { step: "Verify", status: "completed", durationMs: 4_000 },
       { step: "Report", status: "pending" },
     ]);
+  });
+
+  it("selects the Pi checklist from the provider-thread pointer, not the latest run", () => {
+    const projection = makeThreadProjectionFixture();
+    const providerThreadId = ProviderThreadId.make("provider-thread-pi");
+    const currentPlanId = PlanId.make("plan-current");
+    const laterRunId = RunId.make("run-later");
+    const pointer = decodePiChecklistSelectionPointer({
+      state: "ready",
+      list: {
+        threadId: projection.thread.id,
+        providerInstanceId: "pi",
+        nativeSessionId: "session-a",
+      },
+      ownerGeneration: 1,
+      sessionGeneration: 1,
+      captureVersion: 2,
+      sourceEntryId: "entry-1",
+      planId: currentPlanId,
+    });
+    const now = DateTime.makeUnsafe("2026-09-04T00:00:00.000Z");
+    const providerThread = {
+      id: providerThreadId,
+      driver: ProviderDriverKind.make("pi"),
+      providerInstanceId: ProviderInstanceId.make("pi"),
+      providerSessionId: null,
+      appThreadId: projection.thread.id,
+      ownerNodeId: null,
+      nativeThreadRef: null,
+      nativeConversationHeadRef: null,
+      status: "idle" as const,
+      firstRunOrdinal: null,
+      lastRunOrdinal: null,
+      handoffIds: [],
+      forkedFrom: null,
+      nativeMetadata: { checklistSelection: pointer },
+      createdAt: now,
+      updatedAt: now,
+    };
+    const current = {
+      id: currentPlanId,
+      threadId: projection.thread.id,
+      runId: null,
+      nodeId: NodeId.make("node-current"),
+      kind: "todo_list" as const,
+      status: "active" as const,
+      piChecklistProvenance: "pi_native" as const,
+      steps: [{ id: "step-current", text: "From the pointer", status: "pending" as const }],
+    };
+    const later = {
+      id: PlanId.make("plan-later"),
+      threadId: projection.thread.id,
+      runId: laterRunId,
+      nodeId: NodeId.make("node-later"),
+      kind: "todo_list" as const,
+      status: "active" as const,
+      steps: [{ id: "step-later", text: "Later run", status: "running" as const }],
+    };
+
+    expect(
+      deriveActivePlanState(
+        {
+          ...projection,
+          thread: { ...projection.thread, activeProviderThreadId: providerThreadId },
+          providerThreads: [providerThread],
+          plans: [current, later],
+        },
+        laterRunId,
+      ),
+    ).toMatchObject({
+      runId: null,
+      steps: [{ step: "From the pointer", status: "pending" }],
+    });
+    const piProjection = {
+      ...projection,
+      thread: { ...projection.thread, activeProviderThreadId: providerThreadId },
+      providerThreads: [providerThread],
+      plans: [
+        { ...current, steps: current.steps.map((step) => ({ ...step, durationMs: 100 })) },
+        later,
+      ],
+    };
+    expect(deriveActivePlanState(piProjection, laterRunId)?.steps[0]).not.toHaveProperty(
+      "durationMs",
+    );
+    for (const selection of [
+      undefined,
+      { ...pointer, state: "unavailable" as const, planId: null },
+      { ...pointer, sourceEntryId: null },
+    ]) {
+      expect(
+        deriveActivePlanState(
+          {
+            ...piProjection,
+            providerThreads: [
+              { ...providerThread, nativeMetadata: { checklistSelection: selection } },
+            ],
+          },
+          laterRunId,
+        ),
+      ).toBeNull();
+    }
+    expect(
+      deriveActivePlanState(
+        {
+          ...piProjection,
+          plans: [{ ...current, piChecklistProvenance: undefined }, later],
+        },
+        laterRunId,
+      ),
+    ).toBeNull();
+    // Other providers keep their run-bound checklist selection and durations.
+    expect(
+      deriveActivePlanState(
+        {
+          ...piProjection,
+          providerThreads: [{ ...providerThread, driver: ProviderDriverKind.make("codex") }],
+          plans: [current, { ...later, steps: [{ ...later.steps[0]!, durationMs: 100 }] }],
+        },
+        laterRunId,
+      ),
+    ).toMatchObject({
+      runId: laterRunId,
+      steps: [{ step: "Later run", status: "inProgress", durationMs: 100 }],
+    });
   });
 
   it("keeps failed tool items tool-toned so groups still summarize", () => {

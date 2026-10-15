@@ -18,6 +18,10 @@ import {
   MessageId,
   ProjectId,
   ProviderInstanceId,
+  ProviderThreadId,
+  PlanId,
+  NodeId,
+  type PiChecklistSelectionPointer,
   ThreadId,
   RunId,
   TurnItemId,
@@ -36,6 +40,7 @@ import type { Thread, TurnDiffSummary } from "../types";
 import { makeThreadFixture, makeThreadProjectionFixture } from "../test-fixtures";
 import {
   agentControlledBrowserCloseConfirmation,
+  deriveVisibleComposerPlan,
   ENVIRONMENT_RECONNECT_WARNING_GRACE_MS,
   getAntigravitySendBlockReason,
   resolveBackgroundDraftWorkspaceOptions,
@@ -141,6 +146,130 @@ const readySession = {
   lastError: null,
   updatedAt: "2026-03-29T00:00:10.000Z",
 };
+
+describe("deriveVisibleComposerPlan", () => {
+  const projection = makeThreadProjectionFixture();
+  const providerThreadId = ProviderThreadId.make("provider-thread-pi");
+  const planId = PlanId.make("conversation-checklist");
+  const pointer = {
+    state: "ready",
+    list: {
+      threadId: projection.thread.id,
+      providerInstanceId: ProviderInstanceId.make("pi"),
+      nativeSessionId: "session-pi",
+    },
+    ownerGeneration: 1,
+    sessionGeneration: 1,
+    captureVersion: 1,
+    sourceEntryId: "todo-entry",
+    planId,
+  } satisfies PiChecklistSelectionPointer;
+  const plan = {
+    id: planId,
+    threadId: projection.thread.id,
+    runId: null,
+    nodeId: NodeId.make("checklist-node"),
+    kind: "todo_list" as const,
+    status: "completed" as const,
+    piChecklistProvenance: "pi_native" as const,
+    steps: [{ id: "step-1", text: "Finished task", status: "completed" as const }],
+  };
+  const piProjection = {
+    ...projection,
+    thread: { ...projection.thread, activeProviderThreadId: providerThreadId },
+    providerThreads: [
+      {
+        id: providerThreadId,
+        driver: ProviderDriverKind.make("pi"),
+        providerInstanceId: ProviderInstanceId.make("pi"),
+        providerSessionId: null,
+        appThreadId: projection.thread.id,
+        ownerNodeId: null,
+        nativeThreadRef: null,
+        nativeConversationHeadRef: null,
+        status: "idle" as const,
+        firstRunOrdinal: null,
+        lastRunOrdinal: null,
+        handoffIds: [],
+        forkedFrom: null,
+        nativeMetadata: { checklistSelection: pointer },
+        createdAt: projection.updatedAt,
+        updatedAt: projection.updatedAt,
+      },
+    ],
+    plans: [plan],
+  };
+  const runningTurn = {
+    ...completedTurn,
+    runId: RunId.make("new-turn"),
+    status: "running" as const,
+    completedAt: null,
+  };
+
+  it("keeps a selected completed conversation checklist after completion, reopen, and a new turn", () => {
+    for (const run of [completedTurn, null, runningTurn]) {
+      expect(deriveVisibleComposerPlan(piProjection, run, null)).toMatchObject({
+        runId: null,
+        steps: [{ step: "Finished task", status: "completed" }],
+      });
+    }
+  });
+
+  it("hides unavailable, no-todo, and cleared selections instead of showing a retained list", () => {
+    for (const selection of [
+      { ...pointer, state: "unavailable" as const, planId: null },
+      { ...pointer, sourceEntryId: null, planId: null },
+    ]) {
+      expect(
+        deriveVisibleComposerPlan(
+          {
+            ...piProjection,
+            providerThreads: piProjection.providerThreads.map((thread) => ({
+              ...thread,
+              nativeMetadata: { checklistSelection: selection },
+            })),
+          },
+          runningTurn,
+          null,
+        ),
+      ).toBeNull();
+    }
+    expect(
+      deriveVisibleComposerPlan(
+        {
+          ...piProjection,
+          plans: [{ ...plan, steps: [] }],
+        },
+        runningTurn,
+        null,
+      ),
+    ).toBeNull();
+  });
+
+  it("keeps non-Pi plans run-scoped and hides settled runs", () => {
+    const nonPiProjection = {
+      ...projection,
+      plans: [{ ...plan, piChecklistProvenance: undefined, runId: runningTurn.runId }],
+    };
+    expect(deriveVisibleComposerPlan(nonPiProjection, runningTurn, null)?.steps).toEqual([
+      { step: "Finished task", status: "completed" },
+    ]);
+    expect(deriveVisibleComposerPlan(nonPiProjection, completedTurn, null)).toBeNull();
+    expect(
+      deriveVisibleComposerPlan(nonPiProjection, { ...runningTurn, status: "completed" }, null),
+    ).toBeNull();
+    expect(
+      deriveVisibleComposerPlan(
+        {
+          ...nonPiProjection,
+          plans: [{ ...nonPiProjection.plans[0]!, runId: null }],
+        },
+        runningTurn,
+        null,
+      ),
+    ).toBeNull();
+  });
+});
 
 describe("resolveDraftPromotionNavigationTarget", () => {
   const serverThreadRef = { environmentId, threadId };

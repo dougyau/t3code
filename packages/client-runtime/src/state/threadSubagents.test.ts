@@ -3,6 +3,11 @@ import {
   NodeId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
+  ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
+  type PiNativeWorkerSummary,
   RunId,
   ThreadId,
   type OrchestrationV2Subagent,
@@ -46,7 +51,83 @@ const run = (id: string, status: "running" | "completed") =>
 const activeRun = run("run-1", "running");
 const finishedRun = run("run-1", "completed");
 
+function nativeWorker(overrides: Partial<PiNativeWorkerSummary> = {}): PiNativeWorkerSummary {
+  return {
+    launch: {
+      source: "agent_spawn",
+      instanceId: "independent-worker",
+      providerInstanceId: ProviderInstanceId.make("pi"),
+      providerSessionId: ProviderSessionId.make("session"),
+      parentThreadId: ThreadId.make("thread-1"),
+      parentProviderThreadId: ProviderThreadId.make("parent-provider"),
+      parentProviderTurnId: ProviderTurnId.make("parent-turn"),
+      runId: RunId.make("run-0"),
+      runAttemptId: RunAttemptId.make("attempt"),
+      toolNodeId: NodeId.make("launch"),
+      coordinatorSessionId: "coordinator",
+      toolCallId: "spawn",
+    },
+    execution: "completed",
+    capture: "closed",
+    availability: "ready",
+    gaps: [],
+    ...overrides,
+  };
+}
+
 describe("deriveThreadTurnSubagents", () => {
+  it.each([
+    ["running", "closed", true],
+    ["accepted", "incomplete", true],
+    ["completed", "open", true],
+    ["failed", "opening", true],
+    ["completed", "closed", false],
+    ["failed", "incomplete", false],
+    ["cancelled", "closed", false],
+  ] as const)(
+    "retains earlier native %s/%s: %s without pulling in other providers",
+    (execution, capture, included) => {
+      const turn = deriveThreadTurnSubagents({
+        runs: [run("run-0", "completed"), activeRun],
+        subagents: [
+          subagent({ id: "selected" }),
+          subagent({
+            id: "earlier-native",
+            runId: RunId.make("run-0"),
+            status: "completed",
+            nativeWorker: nativeWorker({ execution, capture, availability: "unavailable" }),
+          }),
+          subagent({ id: "earlier-app-owned", runId: RunId.make("run-0") }),
+          subagent({ id: "earlier-claude", runId: RunId.make("run-0"), origin: "provider_native" }),
+        ],
+      });
+      expect(turn?.subagents.map((agent) => agent.id)).toEqual(
+        included ? ["earlier-native", "selected"] : ["selected"],
+      );
+    },
+  );
+
+  it("keeps the entry point visible for a finished result whose capture is still open", () => {
+    const turn = deriveThreadTurnSubagents({
+      runs: [finishedRun],
+      subagents: [
+        subagent({
+          id: "capturing",
+          status: "completed",
+          nativeWorker: nativeWorker({
+            capture: "open",
+            result: "available",
+            availability: "unavailable",
+          }),
+        }),
+      ],
+    });
+    expect(turn?.liveCount).toBe(0);
+    expect(resolveSubagentPillSegment(turn)).toEqual({
+      label: "1 capturing",
+      accessibilityLabel: "1 agent still capturing",
+    });
+  });
   it("returns null when the thread has never spawned an agent", () => {
     expect(deriveThreadTurnSubagents({ runs: [activeRun], subagents: [] })).toBeNull();
   });

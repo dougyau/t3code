@@ -3,10 +3,30 @@ import type {
   OrchestrationV2ThreadShell,
   OrchestrationProjectShell,
   ServerProvider,
+  PiNativeWorkerSummary,
 } from "@t3tools/contracts";
 import { formatModelSlugName, resolveSelectableModel } from "@t3tools/shared/model";
 import { fileBasename } from "@t3tools/shared/path";
 import { isTerminalSubagentStatus } from "./subagentRuntime.ts";
+
+/** Public lifecycle fields are independent: observation failure is not execution failure. */
+export function nativeWorkerPresentation(worker: PiNativeWorkerSummary) {
+  const launch = worker.launch;
+  const role = worker.roleId ?? (launch.source === "team_assign" ? launch.roleId : null);
+  return {
+    role,
+    identity:
+      launch.source === "team_assign" ? `${role} · Assignment ${launch.assignmentId}` : null,
+    model: worker.activated?.model ?? null,
+    task: worker.brief ?? null,
+    status: [
+      `Execution ${worker.execution ?? "unknown"}`,
+      `Capture ${worker.capture}`,
+      `Availability ${worker.availability}`,
+      ...(worker.result ? [`Result ${worker.result}`] : []),
+    ].join(" · "),
+  };
+}
 
 /** Summarizes one adjacent group, without changing its member identities or order. */
 export function subagentGroupSummary(

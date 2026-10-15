@@ -1,6 +1,9 @@
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { resolveProviderInstanceDisplayName } from "@t3tools/client-runtime/state/provider-instance-display";
-import { resolveSubagentMetadata } from "@t3tools/client-runtime/state/subagent-display";
+import {
+  resolveSubagentMetadata,
+  nativeWorkerPresentation,
+} from "@t3tools/client-runtime/state/subagent-display";
 import type { EnvironmentId, OrchestrationV2Subagent } from "@t3tools/contracts";
 import type { ReactNode } from "react";
 import { View } from "react-native";
@@ -26,6 +29,7 @@ type SubagentRowSubagent = Pick<
   | "status"
   | "progress"
   | "result"
+  | "nativeWorker"
 >;
 
 /**
@@ -40,6 +44,9 @@ export function SubagentRow(props: {
 }) {
   const presentation = resolveSubagentRowPresentation(props.subagent);
   const detail = subagentCardDetail(presentation.detail);
+  const native = props.subagent.nativeWorker
+    ? nativeWorkerPresentation(props.subagent.nativeWorker)
+    : null;
   return (
     <View className="flex-row gap-3">
       <View className="h-5 justify-center">
@@ -75,7 +82,19 @@ export function SubagentRow(props: {
             <SymbolView name="chevron.right" size={12} tintColorClassName="accent-icon-subtle" />
           ) : null}
         </View>
-        <SubagentMetadata environmentId={props.environmentId} subagent={props.subagent} />
+        {!native ? (
+          <SubagentMetadata environmentId={props.environmentId} subagent={props.subagent} />
+        ) : null}
+        {native ? (
+          <View className="gap-1">
+            <Text className="text-xs text-foreground-muted">{native.identity ?? native.role}</Text>
+            <Text className="text-xs text-foreground-muted">{native.task}</Text>
+            <Text className="text-xs text-foreground-muted">{native.status}</Text>
+            <Text className="text-xs text-foreground-muted">
+              Effective model: {native.model ?? "Not reported"}
+            </Text>
+          </View>
+        ) : null}
         {detail ? (
           <Text
             numberOfLines={3}

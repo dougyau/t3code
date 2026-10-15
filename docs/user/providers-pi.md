@@ -72,36 +72,6 @@ installs Pi's example `subagent` extension, T3 Code also shows its task progress
 UI. Pi runs those children without a session, so they cannot be opened or resumed as T3 Code
 threads.
 
-## Inspect Pitako workers
-
-Install a compatible Pitako extension in Pi on the server machine. T3 Code does not install
-Pitako or create workers. In Settings, edit the Pi provider instance and enable **Pitako worker
-bridge**. History, routing, and controls have separate opt-ins. All four settings start off and
-apply to the next Pi process. Saving does not restart a running coordinator.
-
-Open the thread's Agents view and choose **Inspect Pitako workers**, even while the coordinator
-is idle. Pitako workers have a separate roster. They are not T3 subagents or durable T3 threads.
-Load the roster, select a worker, then request the brief, activity, result, or history metadata
-you need. Pages are bounded and replace the previous page. Reload deliberately when a cursor
-is stale.
-
-Provider settings set ceilings, not grants. Acknowledge private history and routing separately
-before reading either. To control a worker, inspect and activate its exact current target.
-Submit query or steer input explicitly. Input requires the coordinator's effective **Full access**
-policy. Cancellation is separate and requires confirmation. A cancellation receipt means
-requested, not settled, disposed, or result-ready. Closing inspection does not cancel work.
-
-Inspection depends on the installed extension's capabilities and the resident Pi process.
-Synchronous `agent_run` workers cannot be controlled. An unsupported extension, missing runtime,
-retired owner, or pruned history remains unavailable. A last observation is not a promise of a
-live connection. Requested model and service-tier settings are not proof of the returned tier.
-
-Private access belongs to one authenticated view, not other tabs or devices. Closing the view or
-changing its connection clears private pages and activation. Receipt lookup can recover an
-existing decision in the same valid authenticated session, within bounded retention. It does
-not restore grants or allow a resend. Pending or unknown receipts are not useful answers.
-There is no durable worker recovery after the coordinator process is gone.
-
 ## Troubleshooting
 
 - If Pi is unavailable, confirm that the configured binary runs on the server machine, then refresh

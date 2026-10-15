@@ -30,6 +30,7 @@ import {
   type WorkLogPresentationEntry,
   type WorkLogToolLifecycleStatus,
 } from "@t3tools/client-runtime/work-log/presentation";
+import { selectCurrentChecklistPlan } from "@t3tools/shared/checklist";
 import {
   resolveT3McpToolDefinition,
   resolveT3McpToolPresentation,
@@ -43,6 +44,7 @@ import type {
   OrchestrationV2CreationSource,
   OrchestrationV2ExecutionNode,
   OrchestrationMessageContext,
+  OrchestrationV2PlanArtifact,
   OrchestrationV2ProjectedTurnItem,
   OrchestrationV2RunAttempt,
   OrchestrationV2RunStatus,
@@ -254,6 +256,16 @@ export interface AgentSpawnSummary {
 
 function compactWorkEntryText(value: string): string {
   return value.replace(/\s+/gu, " ").trim();
+}
+
+/** Current Pi checklist from the provider-thread pointer. Not the last todo_list in the feed. */
+export function currentChecklistPlan(
+  plans: ReadonlyArray<OrchestrationV2PlanArtifact>,
+  activeProviderThread: Parameters<
+    typeof selectCurrentChecklistPlan<OrchestrationV2PlanArtifact>
+  >[0]["activeProviderThread"],
+): OrchestrationV2PlanArtifact | null | undefined {
+  return selectCurrentChecklistPlan({ plans, activeProviderThread });
 }
 
 /** Expanded work rows keep their detail while compact rows show a stable one-line label. */
@@ -788,6 +800,17 @@ export function formatItemFullDetail(
   row: OrchestrationV2ProjectedTurnItem,
   item: OrchestrationV2TurnItem,
 ): string {
+  if (item.type === "todo_list" && item.piChecklistProvenance === "pi_native") {
+    return [
+      item.explanation,
+      ...item.steps.map(
+        (step) =>
+          `${step.status === "completed" ? "✓" : step.status === "running" ? "◐" : "○"} ${step.text}`,
+      ),
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
   return JSON.stringify(
     {
       visibility: row.visibility,
@@ -840,7 +863,9 @@ function toFeedActivity(
       !(item.type === "error" && item.status === "failed") &&
       (readPaths
         ? readPaths.length > 0 || turnItemNeedsDetailFetch(item)
-        : turnItemHasDetail(item) || workEntry.questionAnswer !== undefined),
+        : item.type === "todo_list" ||
+          turnItemHasDetail(item) ||
+          workEntry.questionAnswer !== undefined),
     // Read rows show their paths, then the fetched file contents.
     fetchesDetail: turnItemNeedsDetailFetch(item),
     getFullDetail,
@@ -848,7 +873,10 @@ function toFeedActivity(
     icon: workEntry.toolSurface ?? itemIcon(item),
     logo: toolPresentation?.logo ?? null,
     toolLike: itemIsToolLike(item),
-    prominent: itemIsProminent(item) || (item.type === "error" && item.status === "failed"),
+    prominent:
+      item.type === "todo_list" ||
+      itemIsProminent(item) ||
+      (item.type === "error" && item.status === "failed"),
     status:
       item.type === "error" && item.failure.class === "usage_limit"
         ? itemStatus(item)
@@ -1730,6 +1758,11 @@ export function buildThreadFeed(
     readonly anchoredMessages?: ReadonlyArray<LocalThreadMessage>;
     readonly attempts?: ReadonlyArray<OrchestrationV2RunAttempt>;
     readonly nodes?: ReadonlyArray<OrchestrationV2ExecutionNode>;
+    readonly checklist?: {
+      readonly plans: ReadonlyArray<OrchestrationV2PlanArtifact>;
+      readonly turnItems: ReadonlyArray<OrchestrationV2TurnItem>;
+      readonly activeProviderThread: Parameters<typeof currentChecklistPlan>[1];
+    };
   },
 ): ThreadFeedEntry[] {
   const entries: RawThreadFeedEntry[] = [];
@@ -1857,6 +1890,42 @@ export function buildThreadFeed(
     };
     projectedEntriesCache.set(row, { attemptId, entry });
     entries.push(entry);
+  }
+  // Current checklist is conversation state, not the latest historical tool row.
+  // Use its persisted artifact even when that turn item is outside the paged feed.
+  const checklist = options?.checklist;
+  const plan = checklist
+    ? currentChecklistPlan(checklist.plans, checklist.activeProviderThread)
+    : undefined;
+  if (plan?.kind === "todo_list" && plan.steps.length > 0) {
+    const item = checklist?.turnItems.find(
+      (candidate) => candidate.type === "todo_list" && candidate.planId === plan.id,
+    );
+    if (item?.type === "todo_list") {
+      const row: OrchestrationV2ProjectedTurnItem = {
+        position: visibleTurnItems.length,
+        visibility: "local",
+        sourceThreadId: item.threadId,
+        sourceItemId: item.id,
+        item: {
+          ...item,
+          runId: null,
+          startedAt: null,
+          completedAt: null,
+          piChecklistProvenance: plan.piChecklistProvenance,
+          steps: plan.steps.map(({ id, text, status }) => ({ id, text, status })),
+          explanation: plan.explanation,
+        },
+      };
+      const activity = toFeedActivity(row, null);
+      entries.push({
+        type: "activity",
+        id: activity.id,
+        createdAt: activity.createdAt,
+        runId: null,
+        activity,
+      });
+    }
   }
   const retainedMessageIds = new Set([
     ...foldedAnswerMessageIds,

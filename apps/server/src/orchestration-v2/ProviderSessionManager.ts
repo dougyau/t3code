@@ -1,3 +1,4 @@
+import * as NodeUtil from "node:util";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -204,6 +205,11 @@ export class ProviderSessionManagerV2 extends Context.Service<
 >()("t3/orchestration-v2/ProviderSessionManager/ProviderSessionManagerV2") {}
 
 interface LiveSessionEntry {
+  readonly nativeWorkersConnected: { value: boolean };
+  readonly nativeWorkerOwners: Array<{
+    readonly owner: NonNullable<ProviderAdapter.ProviderNativeWorkersPort["owner"]>;
+    readonly generation: number;
+  }>;
   readonly attachedThreadIds: ReadonlySet<ThreadId>;
   readonly loadedProviderThreadKeyByThread: ReadonlyMap<ThreadId, string>;
   /**
@@ -799,6 +805,59 @@ export const layerWithOptions = (
                 input.entry.requestEventPermit.withPermits(1),
               ),
             ),
+            Effect.exit(Effect.gen(function* () {
+              const port = input.entry.runtime.nativeWorkers;
+              if (port === undefined) return;
+              const members = yield* eventSink.nativeWorkers(input.entry.runtime.providerSessionId);
+              for (const member of members) {
+                if (member.childThreadId === null || member.providerThreadId === null ||
+                  member.nativeWorker === undefined) continue;
+                const child = yield* projectionStore.getThreadRecords(member.childThreadId, ["providerThreads"]);
+                const providerThread = child.providerThreads.find((row) => row.id === member.providerThreadId);
+                const checkpoint = providerThread?.nativeMetadata?.nativeWorkerCheckpoint;
+                if (checkpoint === undefined || !input.entry.nativeWorkerOwners.some((snapshot) =>
+                  snapshot.generation === checkpoint.ownerGeneration &&
+                  NodeUtil.isDeepStrictEqual(snapshot.owner, checkpoint.owner))) continue;
+                const closed = checkpoint.capture === "closed";
+                const retired = {
+                  ...checkpoint, ownerGeneration: checkpoint.ownerGeneration + 1,
+                  capture: closed ? "closed" as const : "incomplete" as const,
+                  gaps: closed ? checkpoint.gaps : [...new Set([...checkpoint.gaps, "stale_owner" as const])],
+                };
+                const receipt = yield* eventSink.writeNativeWorker({
+                  launch: checkpoint.launch, ownerGeneration: checkpoint.ownerGeneration,
+                  expectedCheckpoint: checkpoint, checkpoint: retired, retire: true,
+                  build: (committedMember, committedThread) => Effect.gen(function* () {
+                    const eventId = yield* idAllocator.allocate.event({
+                      threadId: member.childThreadId!,
+                      providerSessionId: input.entry.runtime.providerSessionId,
+                    });
+                    return { sourceProgress: false, events: [
+                      {
+                        id: eventId, type: "provider-thread.updated" as const,
+                        threadId: member.childThreadId!, occurredAt: input.releasedAt,
+                        payload: { ...committedThread,
+                          nativeMetadata: { ...committedThread.nativeMetadata, nativeWorkerCheckpoint: retired },
+                          updatedAt: input.releasedAt },
+                      },
+                      {
+                        id: yield* idAllocator.allocate.event({ threadId: member.threadId }),
+                        type: "subagent.updated" as const, threadId: member.threadId,
+                        occurredAt: input.releasedAt,
+                        payload: { ...committedMember,
+                          nativeWorker: { ...member.nativeWorker!, capture: retired.capture, gaps: retired.gaps },
+                          updatedAt: input.releasedAt },
+                      },
+                    ] };
+                  }),
+                });
+                if (!receipt.committed) {
+                  return yield* new EventSink.EventSinkWriteError({
+                    eventCount: 2, cause: "Native retirement checkpoint changed.",
+                  });
+                }
+              }
+            })),
           ],
           { concurrency: 1 },
         ).pipe(Effect.flatMap(Exit.asVoidAll));
@@ -867,6 +926,7 @@ export const layerWithOptions = (
         Effect.gen(function* () {
           const key = sessionKey(input.providerSessionId);
           const candidate = (yield* Ref.get(sessions)).get(key);
+          if (candidate !== undefined) rememberNativeOwner(candidate);
           if (candidate === undefined) {
             return [Option.none<LiveSessionEntry>(), yield* DateTime.now] as const;
           }
@@ -884,6 +944,7 @@ export const layerWithOptions = (
                 return ["kept", current] as const;
               }
               const updated = new Map(current);
+              existing.nativeWorkersConnected.value = false;
               updated.delete(key);
               return ["removed", updated] as const;
             }),
@@ -1068,7 +1129,9 @@ export const layerWithOptions = (
           // can reuse the same providerSessionId while this fiber is parked.
           const probedRuntime = entry.runtime;
           const hasPendingWork =
-            probedRuntime.hasPendingBackgroundWork === undefined
+            probedRuntime.nativeWorkers !== undefined
+              ? yield* nativeWorkersPending(probedRuntime)
+              : probedRuntime.hasPendingBackgroundWork === undefined
               ? false
               : yield* probedRuntime.hasPendingBackgroundWork.pipe(
                   Effect.catchCause(() => Effect.succeed(false)),
@@ -1576,7 +1639,9 @@ export const layerWithOptions = (
               // Unloading stops the native thread's background terminals, so a
               // thread still running background work stays loaded.
               const hasPendingWork =
-                entry.runtime.hasPendingBackgroundWorkForThread === undefined
+                entry.runtime.nativeWorkers !== undefined
+                  ? yield* nativeWorkersPending(entry.runtime, pending.providerThread)
+                  : entry.runtime.hasPendingBackgroundWorkForThread === undefined
                   ? false
                   : yield* entry.runtime
                       .hasPendingBackgroundWorkForThread(pending.providerThread)
@@ -1683,6 +1748,7 @@ export const layerWithOptions = (
         eventSubscribers: Ref.Ref<
           ReadonlyMap<number, Queue.Queue<ProviderSessionEventSignal, Cause.Done>>
         >,
+        nativeLifetime: Pick<LiveSessionEntry, "nativeWorkersConnected" | "nativeWorkerOwners">,
       ): ProviderAdapter.ProviderAdapterV2SessionRuntime => {
         const providerSessionId = runtime.providerSessionId;
         const subscribeEvents = makeEventSubscription(eventSubscribers);
@@ -1700,6 +1766,22 @@ export const layerWithOptions = (
           });
         return {
           ...runtime,
+          ...(runtime.nativeWorkers === undefined ? {} : {
+            nativeWorkers: {
+              get owner() {
+                if (!nativeLifetime.nativeWorkersConnected.value) return undefined;
+                rememberNativeOwner({ runtime, nativeWorkerOwners: nativeLifetime.nativeWorkerOwners });
+                return runtime.nativeWorkers?.owner;
+              },
+              get ownerGeneration() { return runtime.nativeWorkers!.ownerGeneration; },
+              hints: runtime.nativeWorkers.hints,
+              reconcile: runtime.nativeWorkers.reconcile, read: runtime.nativeWorkers.read,
+              hasPendingWork: runtime.nativeWorkers.hasPendingWork,
+            },
+            hasPendingBackgroundWork: nativeWorkersPending(runtime),
+            hasPendingBackgroundWorkForThread: (thread: OrchestrationV2ProviderThread) =>
+              nativeWorkersPending(runtime, thread),
+          }),
           subscribeEvents,
           events: Stream.unwrap(
             subscribeEvents.pipe(Effect.map((subscription) => subscription.events)),
@@ -1892,6 +1974,105 @@ export const layerWithOptions = (
           ),
         );
 
+      const rememberNativeOwner = (entry: Pick<LiveSessionEntry, "runtime" | "nativeWorkerOwners">) => {
+        const port = entry.runtime.nativeWorkers;
+        if (port?.owner === undefined || entry.nativeWorkerOwners.some((snapshot) =>
+          snapshot.generation === port.ownerGeneration && NodeUtil.isDeepStrictEqual(snapshot.owner, port.owner))) return;
+        entry.nativeWorkerOwners.push({ owner: port.owner, generation: port.ownerGeneration });
+      };
+
+      const nativeWorkersPending = (
+        runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        providerThread?: OrchestrationV2ProviderThread,
+      ) => Effect.gen(function* () {
+        const ordinary = providerThread === undefined ? runtime.hasPendingBackgroundWork
+          : runtime.hasPendingBackgroundWorkForThread?.(providerThread);
+        if (ordinary !== undefined && (yield* ordinary)) return true;
+        const port = runtime.nativeWorkers;
+        if (port === undefined) return false;
+        const members = yield* eventSink.nativeWorkers(runtime.providerSessionId);
+        const launches = [];
+        for (const member of members) {
+          if (member.childThreadId === null || member.nativeWorker === undefined ||
+            (providerThread !== undefined && member.nativeWorker.launch.parentProviderThreadId !== providerThread.id)) continue;
+          const child = yield* projectionStore.getThreadRecords(member.childThreadId, ["providerThreads"]);
+          const checkpoint = child.providerThreads.find((row) => row.id === member.providerThreadId)
+            ?.nativeMetadata?.nativeWorkerCheckpoint;
+          if (checkpoint?.ownerGeneration === port.ownerGeneration &&
+            NodeUtil.isDeepStrictEqual(checkpoint.owner, port.owner)) {
+            if (checkpoint.bindingCursors.some((saved) => !saved.omission && (saved.more || saved.fragment))) {
+              return true;
+            }
+            launches.push(member.nativeWorker.launch);
+          }
+        }
+        return launches.length > 0 && (yield* port.hasPendingWork(launches));
+      }).pipe(Effect.catchCause(() => Effect.succeed(false)));
+
+      const startNativeImporter = (entry: LiveSessionEntry) => Effect.gen(function* () {
+        const port = entry.runtime.nativeWorkers;
+        if (port === undefined) return;
+        const afterSequence = yield* eventSink.latestSequence();
+        const importPermit = yield* Semaphore.make(1);
+        const importCommitted = Effect.gen(function* () {
+          const members = yield* eventSink.nativeWorkers(entry.runtime.providerSessionId);
+          rememberNativeOwner(entry);
+          for (const member of members) {
+            if (member.childThreadId === null || member.nativeWorker === undefined) continue;
+            const childThreadId = member.childThreadId;
+            const launch = member.nativeWorker.launch;
+            yield* Effect.gen(function* () {
+              let more = true;
+              while (more) {
+                const current = (yield* Ref.get(sessions)).get(sessionKey(entry.runtime.providerSessionId));
+                if (current?.runtime !== entry.runtime) return;
+                const child = yield* projectionStore.getThreadRecords(childThreadId, ["providerThreads"]);
+                const checkpoint = child.providerThreads.find((row) => row.id === member.providerThreadId)
+                  ?.nativeMetadata?.nativeWorkerCheckpoint;
+                if (checkpoint === undefined || checkpoint.ownerGeneration !== port.ownerGeneration ||
+                  !NodeUtil.isDeepStrictEqual(checkpoint.owner, port.owner)) break;
+                const batch = yield* port.read(launch, checkpoint);
+                const stillConnected = (yield* Ref.get(sessions)).get(sessionKey(entry.runtime.providerSessionId));
+                if (stillConnected?.runtime !== entry.runtime ||
+                  batch.checkpoint.ownerGeneration !== port.ownerGeneration ||
+                  !NodeUtil.isDeepStrictEqual(batch.checkpoint.owner, port.owner)) return;
+                const receipt = yield* providerEventIngestor.ingestNativeWorker(batch,
+                  Ref.get(sessions).pipe(Effect.map((latest) =>
+                    latest.get(sessionKey(entry.runtime.providerSessionId))?.runtime === entry.runtime &&
+                    batch.checkpoint.ownerGeneration === port.ownerGeneration &&
+                    NodeUtil.isDeepStrictEqual(batch.checkpoint.owner, port.owner))),
+                );
+                if (!receipt.committed) break;
+                if (receipt.sourceProgress) {
+                  yield* observeActivity(entry.runtime.providerSessionId,
+                    touchActivity(entry.runtime.providerSessionId, { providerActivity: true }));
+                }
+                more = batch.more;
+              }
+            }).pipe(Effect.catchCause((cause) => Effect.logWarning(
+              "orchestration-v2.native-worker-import-failed",
+              { providerSessionId: entry.runtime.providerSessionId, subagentId: member.id, cause },
+            )));
+          }
+        }).pipe(importPermit.withPermits(1), Effect.catchCause((cause) => Effect.logWarning(
+          "orchestration-v2.native-worker-import-failed",
+          { providerSessionId: entry.runtime.providerSessionId, cause },
+        )));
+        // Capture is driven by committed admission and coalescible source hints,
+        // not by the ordinary provider event pump or a run subscription lifetime.
+        yield* Stream.merge(
+          port.hints,
+          eventSink.stream({ afterSequence, eventType: "thread.created" }).pipe(Stream.map(() => undefined)),
+        ).pipe(
+          Stream.runForEach(() => importCommitted),
+          Effect.forkIn(entry.scope),
+        );
+        yield* importCommitted;
+      }).pipe(Effect.catchCause((cause) => Effect.logWarning(
+        "orchestration-v2.native-worker-import-start-failed",
+        { providerSessionId: entry.runtime.providerSessionId, cause },
+      )));
+
       const startEventPump = (entry: LiveSessionEntry) => {
         let stoppedByProvider = false;
         return entry.runtime.events.pipe(
@@ -1911,7 +2092,9 @@ export const layerWithOptions = (
                     event.providerThreadId,
                     event.runOrdinal,
                   )
-                : touchActivity(entry.runtime.providerSessionId, { providerActivity: true }),
+                : entry.runtime.nativeWorkers !== undefined && event.type === "provider_session.updated"
+                  ? Effect.void
+                  : touchActivity(entry.runtime.providerSessionId, { providerActivity: true }),
             ).pipe(
               Effect.andThen(
                 event.type === "provider_session.updated"
@@ -2163,9 +2346,13 @@ export const layerWithOptions = (
               const eventSubscribers = yield* Ref.make<
                 ReadonlyMap<number, Queue.Queue<ProviderSessionEventSignal, Cause.Done>>
               >(new Map());
-              const exposedRuntime = decorateRuntime(runtime, eventSubscribers);
+              const nativeLifetime: Pick<LiveSessionEntry, "nativeWorkersConnected" | "nativeWorkerOwners"> = {
+                nativeWorkerOwners: [], nativeWorkersConnected: { value: true },
+              };
+              const exposedRuntime = decorateRuntime(runtime, eventSubscribers, nativeLifetime);
               const now = yield* Clock.currentTimeMillis;
               const entry: LiveSessionEntry = {
+                ...nativeLifetime,
                 attachedThreadIds: new Set([input.threadId]),
                 loadedProviderThreadKeyByThread: new Map(),
                 mcpCredentialIdByThread:
@@ -2187,6 +2374,7 @@ export const layerWithOptions = (
                 pinnedSinceMs: null,
                 idleThreadUnloads: new Map(),
               };
+              rememberNativeOwner(entry);
               yield* Ref.update(sessions, (current) => {
                 const updated = new Map(current);
                 updated.set(key, entry);
@@ -2223,6 +2411,7 @@ export const layerWithOptions = (
                 ),
               );
               yield* startEventPump(entry);
+              yield* startNativeImporter(entry);
               yield* scheduleIdleRelease(input.providerSessionId);
               return exposedRuntime;
             }),

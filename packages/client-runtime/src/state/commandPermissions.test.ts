@@ -8,8 +8,6 @@ import { describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import {
   AuthOrchestrationOperateScope,
-  AuthOrchestrationReadScope,
-  AuthDiagnosticsReadScope,
   AuthSettingsWriteScope,
   AuthProvidersManageScope,
   ProviderInstanceId,
@@ -65,7 +63,7 @@ const setup = Effect.gen(function* () {
 
 describe("command permissions", () => {
   it.effect(
-    "separates provider opt-in administration from mixed settings writes at the destination",
+    "separates provider administration from mixed settings writes at the destination",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -76,7 +74,7 @@ describe("command permissions", () => {
             providerInstanceMutation: {
               operation: "upsert" as const,
               instanceId: ProviderInstanceId.make("pi"),
-              instance: { driver: ProviderDriverKind.make("pi"), config: { workerBridge: true } },
+              instance: { driver: ProviderDriverKind.make("pi"), config: { binaryPath: "pi" } },
             },
           };
           const mixed = { ...providerOnly, patch: { defaultRuntimeMode: "full-access" } };
@@ -117,43 +115,6 @@ describe("command permissions", () => {
           ).toBe(AuthProvidersManageScope);
         }),
       ),
-  );
-  it.effect("separates worker history from routing and checks the acknowledged destination", () =>
-    Effect.scoped(Effect.gen(function* () {
-      const registry = yield* setup;
-      const history = createCommandPermissions(runtime, WS_METHODS.workerHistoryRead);
-      const route = createCommandPermissions(runtime, WS_METHODS.workerRouteRead);
-      const acknowledge = createCommandPermissions(runtime, WS_METHODS.workerAcknowledge);
-      const controls = [
-        WS_METHODS.workerControlDetail, WS_METHODS.workerActivate, WS_METHODS.workerAction, WS_METHODS.workerReceipt,
-      ].map((tag) => createCommandPermissions(runtime, tag));
-      registry.set(sessions(env), AsyncResult.success({
-        ...grant(false), scopes: [AuthOrchestrationReadScope], permissions: [AuthOrchestrationReadScope],
-      }));
-      expect(registry.get(history.permissionAtom(env))).toBe(true);
-      expect(registry.get(route.permissionAtom(env))).toBe(false);
-      expect(registry.get(acknowledge.permissionAtom(env, { grant: "history" }))).toBe(true);
-      expect(registry.get(acknowledge.permissionAtom(env, { grant: "route" }))).toBe(false);
-      for (const control of controls) {
-        expect(registry.get(control.permissionAtom(env))).toBe(false);
-        expect((yield* control.authorize(registry, env).pipe(Effect.flip)).requiredPermission).toBe(AuthOrchestrationOperateScope);
-      }
-      yield* acknowledge.authorize(registry, env, { grant: "history" });
-      expect((yield* acknowledge.authorize(registry, env, { grant: "route" }).pipe(Effect.flip)).requiredPermission).toBe(AuthDiagnosticsReadScope);
-      registry.set(sessions(other), AsyncResult.success({
-        ...grant(false), scopes: [AuthDiagnosticsReadScope], permissions: [AuthDiagnosticsReadScope],
-      }));
-      expect(registry.get(history.permissionAtom(other))).toBe(false);
-      yield* acknowledge.authorize(registry, other, { grant: "route" });
-      registry.set(sessions(other), AsyncResult.success(grant(false)));
-      expect((yield* acknowledge.authorize(registry, other, { grant: "route" }).pipe(Effect.flip)).requiredPermission).toBe(AuthDiagnosticsReadScope);
-      registry.set(sessions(env), AsyncResult.success(grant(true)));
-      for (const control of controls) {
-        expect(registry.get(control.permissionAtom(env))).toBe(true);
-        yield* control.authorize(registry, env);
-        expect(registry.get(control.permissionAtom(other))).toBe(false);
-      }
-    })),
   );
   it.effect("requires the destination settings grant to run storage cleanup", () =>
     Effect.scoped(

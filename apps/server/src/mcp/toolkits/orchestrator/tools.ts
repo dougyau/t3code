@@ -30,13 +30,10 @@ import {
   OrchestratorMcpThreadWaitResult,
   ThreadMetadataMcpUpdateInput,
   ThreadMetadataMcpUpdateResult,
-  WorkerMcpReadInput,
-  WorkerMcpReadResult,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
 
-import * as ProviderWorkers from "../../../providerWorkers/ProviderWorkers.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
@@ -276,14 +273,6 @@ const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
   .annotate(Tool.Destructive, true);
 
 export const OrchestratorToolkit = Toolkit.make(
-  Tool.make("t3_workers_read", {
-    description: "Read native Pitako workers in a resident T3 thread without launching a session or consuming results. Read-only roster, detail, requests, activity, result, or scoped history metadata; page on demand. Does not acknowledge private views or grant history, routing, controls, or receipts.",
-    parameters: WorkerMcpReadInput,
-    success: WorkerMcpReadResult,
-    failure: OrchestratorMcpFailure,
-    failureMode: "return",
-    dependencies: [McpInvocationContext.McpInvocationContext, ProviderWorkers.ProviderWorkers],
-  }).annotate(Tool.Readonly, true).annotate(Tool.Destructive, false),
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
   TaskStatusTool,

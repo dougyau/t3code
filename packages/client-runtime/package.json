@@ -3,13 +3,9 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./state/provider-workers": {
-      "types": "./src/state/providerWorkers.ts",
-      "default": "./src/state/providerWorkers.ts"
-    },
-    "./state/worker-inspector": {
-      "types": "./src/state/workerInspector.ts",
-      "default": "./src/state/workerInspector.ts"
+    "./testing/nativeWorker": {
+      "types": "./src/testing/nativeWorker.ts",
+      "default": "./src/testing/nativeWorker.ts"
     },
     "./composerThreadItems": {
       "types": "./src/composerThreadItems.ts",

@@ -1,84 +1,87 @@
 import { describe, expect, it } from "vite-plus/test";
-import * as Schema from "effect/Schema";
-import { WorkerAcknowledgeInput, WorkerHistoryRead, WorkerHistoryReadInput, WorkerMcpReadInput, WorkerRoster, WorkerTextPage, WorkerActivateInput, WorkerActionOutcome, WorkerReceiptInput, WorkerActionId, makeWorkerActionId, parseWorkerActionId } from "./providerWorkers.ts";
 
-const decodeText = Schema.decodeUnknownSync(WorkerTextPage);
-const decodeHistory = Schema.decodeUnknownSync(WorkerHistoryRead);
-const decodeAcknowledge = Schema.decodeUnknownSync(WorkerAcknowledgeInput);
-const decodeHistoryInput = Schema.decodeUnknownSync(WorkerHistoryReadInput);
-const decodeRoster = Schema.decodeUnknownSync(WorkerRoster);
-const decodeMcp = Schema.decodeUnknownSync(WorkerMcpReadInput);
-const decodeActivate = Schema.decodeUnknownSync(WorkerActivateInput);
-const decodeReceipt = Schema.decodeUnknownSync(WorkerReceiptInput);
-const decodeOutcome = Schema.decodeUnknownSync(WorkerActionOutcome);
-const decodeActionId = Schema.decodeUnknownSync(WorkerActionId);
-const actionId = makeWorkerActionId("view", 1, "00000000-0000-0000-0000-000000000001");
+import {
+  AuthOrchestrationOperateScope,
+  AuthProvidersManageScope,
+  AuthSettingsWriteScope,
+  AuthSourceControlWriteScope,
+} from "./auth.ts";
+import { CLIENT_GUARDED_RPC_SCOPES, clientRpcRequiredScopes } from "./clientRpcPermissions.ts";
+import { RpcScopeAuthorization, WS_METHODS, WsRpcGroup } from "./rpc.ts";
 
-describe("browser-safe worker pages", () => {
-  it("offers only ordinary discriminated read requests to MCP", () => {
-    expect(decodeMcp({ request: { operation: "list", threadId: "thread" } })).toEqual({
-      request: { operation: "list", threadId: "thread" },
-    });
-    expect(() => decodeMcp({ request: { operation: "acknowledge", threadId: "thread", viewId: "view", acknowledged: true } })).toThrow();
-    expect(() => decodeMcp({ request: { operation: "historyRead", threadId: "thread", viewId: "view", historyId: "history" } })).toThrow();
-    for (const operation of ["activate", "action", "receipt"])
-      expect(() => decodeMcp({ request: { operation, threadId: "thread", actionId: "action" } })).toThrow();
-  });
-  it("requires exact control identity and receipt authority without conflating transport uncertainty or native states", () => {
-    const target = { environmentId: "env", threadId: "thread", viewId: "view" };
-    expect(() => decodeActivate({ ...target, acknowledged: true, selection: { instanceId: "worker" } })).toThrow();
-    expect(() => decodeReceipt({ ...target, actionId: "action" })).toThrow();
-    const outcome = decodeOutcome;
-    for (const state of ["pending", "outcome_unknown", "not_admitted"])
-      expect(outcome({ actionId, status: { state, sequence: 1 } }).status.state).toBe(state);
-    for (const status of ["queued", "handled", "rejected", "unconfirmed"]) {
-      const page = { actionId, status: { state: "recorded", sequence: 1, receipt: { kind: "input", native: {
-        interactionId: "interaction", historyId: "history", sessionId: "session", intent: "query", status,
-      } } } };
-      expect(outcome(page)).toEqual(page);
+describe("retired worker inspector transport", () => {
+  it("does not register inspector reads, grants, controls or receipt recovery", () => {
+    const operations = [
+      "observe",
+      "list",
+      "detail",
+      "requests",
+      "activity",
+      "result",
+      "historyList",
+      "openView",
+      "closeView",
+      "acknowledge",
+      "historyRead",
+      "routeRead",
+      "controlDetail",
+      "activate",
+      "action",
+      "receipt",
+    ];
+    const methods: readonly string[] = Object.values(WS_METHODS);
+    for (const operation of operations) {
+      const method = `providerWorkers.${operation}`;
+      expect(methods).not.toContain(method);
+      expect(WsRpcGroup.requests.has(method)).toBe(false);
+      expect(Object.hasOwn(CLIENT_GUARDED_RPC_SCOPES, method)).toBe(false);
     }
-    expect(outcome({ actionId, status: { state: "outcome_unknown", reason: "unavailable" } }).status.state).toBe("outcome_unknown");
-    expect(() => outcome({ actionId, status: { state: "pending", sequence: 0 } })).toThrow();
+    expect(
+      [...WsRpcGroup.requests.keys()].filter((tag) => tag.startsWith("providerWorkers.")),
+    ).toEqual([]);
   });
-  it("accepts only bounded canonical view/positive-safe-ordinal/nonce decision IDs", () => {
-    const view = "view:one";
-    const nonce = "00000000-0000-0000-0000-000000000001";
-    const value = makeWorkerActionId(view, Number.MAX_SAFE_INTEGER, nonce);
-    expect(decodeActionId(value)).toBe(value);
-    expect(parseWorkerActionId(value)).toEqual({ viewId: view, ordinal: Number.MAX_SAFE_INTEGER, nonce });
-    for (const invalid of [
-      "arbitrary", value.replace("w1:", "w2:"), value.replace("%3A", "%3a"),
-      `w1:view:0:${nonce}`, `w1:view:01:${nonce}`, `w1:view:1e2:${nonce}`,
-      `w1:view:9007199254740992:${nonce}`, `w1:%zz:1:${nonce}`,
-      `w1:view:1:${nonce}:extra`, `w1:view:1:${nonce.toUpperCase()}X`,
-      `w1:${"a".repeat(513)}:1:${nonce}`,
+
+  it("keeps ordinary provider and orchestration requests scope-authorized", () => {
+    for (const method of [
+      WS_METHODS.providerAuthStart,
+      WS_METHODS.providerAuthComplete,
+      WS_METHODS.providerAuthRespond,
+      WS_METHODS.providerAuthCancel,
+      WS_METHODS.providerAuthLogout,
+      WS_METHODS.providerAuthSubscribe,
+      WS_METHODS.scheduledTasksRunNow,
     ]) {
-      expect(parseWorkerActionId(invalid)).toBeUndefined();
-      expect(() => decodeActionId(invalid)).toThrow();
+      const rpc = WsRpcGroup.requests.get(method);
+      expect(rpc).toBeDefined();
+      expect(rpc?.middlewares.has(RpcScopeAuthorization)).toBe(true);
     }
-    expect(() => makeWorkerActionId(view, Number.MAX_SAFE_INTEGER + 1, nonce)).toThrow(RangeError);
+    expect(clientRpcRequiredScopes(WS_METHODS.scheduledTasksRunNow, undefined)).toEqual([
+      AuthOrchestrationOperateScope,
+    ]);
+    expect(clientRpcRequiredScopes(WS_METHODS.vcsPull, undefined)).toEqual([
+      AuthSourceControlWriteScope,
+    ]);
   });
-  it("bounds rows and UTF-16 text without decoding native history bytes", () => {
-    const text = "😀".repeat(512);
-    expect(decodeText({ text, offset: 0, nextOffset: null }).text).toBe(text);
-    expect(() => decodeText({ text: text + "a", offset: 0, nextOffset: null })).toThrow();
-    const item = { historyId: "history", source: "worker", byteOffset: 0, entryOffset: 0, endsEntry: true, encoding: "base64", data: "/wo=", validation: "corrupt" };
-    const page = { items: [item], diagnostics: [{ code: "corrupt_entry" }], cursor: null };
-    expect(decodeHistory(page)).toEqual(page);
-    expect(() => decodeHistory({ ...page, items: Array.from({ length: 51 }, () => item) })).toThrow();
-    expect(() => decodeHistory({ ...page, items: [{ ...item, source: "coordinator" }] })).toThrow();
-  });
-  it("requires a fresh acknowledgement and never accepts coordinator/path selectors", () => {
-    const target = { environmentId: "env", threadId: "thread", viewId: "view" };
-    const ack = decodeAcknowledge;
-    expect(ack({ ...target, grant: "history", acknowledged: true }).grant).toBe("history");
-    expect(() => ack({ ...target, grant: "history", acknowledged: false })).toThrow();
-    expect(() => ack({ ...target, grant: "control", acknowledged: true })).toThrow();
-    const read = decodeHistoryInput({
-      ...target, historyId: "history", source: "coordinator", path: "/private",
-    });
-    expect(read).not.toHaveProperty("source");
-    expect(read).not.toHaveProperty("path");
-    expect(() => decodeRoster({ owner: {}, items: [], revision: 1, cursor: null })).toThrow();
+
+  it("preserves provider administration independently of ordinary settings writes", () => {
+    const providerInstanceMutation = {
+      operation: "upsert",
+      instanceId: "pi",
+      instance: { driver: "pi", config: {} },
+    };
+    expect(clientRpcRequiredScopes(WS_METHODS.serverUpdateSettings, {
+      patch: {},
+      providerInstanceMutation,
+    })).toEqual([AuthProvidersManageScope]);
+    expect(clientRpcRequiredScopes(WS_METHODS.serverUpdateSettings, {
+      patch: { defaultRuntimeMode: "full-access" },
+    })).toEqual([AuthSettingsWriteScope]);
+    expect(clientRpcRequiredScopes(WS_METHODS.serverUpdateSettings, {
+      patch: { defaultRuntimeMode: "full-access" },
+      providerInstanceMutation,
+    })).toEqual([AuthSettingsWriteScope, AuthProvidersManageScope]);
+    expect(() => clientRpcRequiredScopes(WS_METHODS.serverUpdateSettings, {
+      patch: { defaultRuntimeMode: "invalid" },
+    })).toThrow();
   });
 });

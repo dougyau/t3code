@@ -15,6 +15,15 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderSessionId,
+  type PiNativeWorkerLaunch,
+  type PiNativeWorkerCheckpoint,
+  type PiNativeWorkerSummary,
+  NodeId,
+  MessageId,
+  RunId,
+  RunAttemptId,
+  ProviderTurnId,
+  TurnItemId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -24,6 +33,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Schema from "effect/Schema";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
@@ -80,6 +90,8 @@ const layerFailingReleaseEventSink = Layer.effect(
 interface FlakyReleaseWrites {
   /** Which release writes fail right now. */
   readonly failing: Ref.Ref<"none" | "session" | "session-and-requests">;
+  readonly failNativeRetirement?: Ref.Ref<boolean>;
+  readonly rejectNativeRetirement?: boolean;
   /** Receives one item per failed write. */
   readonly failures: Queue.Queue<void>;
   /** Holds runtime request writes: completes `paused`, then waits for `resume`. */
@@ -119,6 +131,17 @@ const layerFlakyReleaseEventSink = (flaky: FlakyReleaseWrites) =>
             yield* Queue.offer(flaky.failures, undefined);
             return yield* Effect.die(new Error("simulated commit failure"));
           }),
+        writeNativeWorker: (input) => Effect.gen(function* () {
+          if (input.retire === true && flaky.failNativeRetirement !== undefined &&
+            (yield* Ref.get(flaky.failNativeRetirement))) {
+            yield* Queue.offer(flaky.failures, undefined);
+            if (flaky.rejectNativeRetirement) return {
+              committed: false, sourceProgress: false, storedEvents: [],
+            };
+            return yield* Effect.fail(new EventSink.EventSinkWriteError({ eventCount: 0, cause: "retirement-commit" }));
+          }
+          return yield* delegate.writeNativeWorker(input);
+        }),
       });
     }),
   ).pipe(Layer.provide(layerTestEventSink));
@@ -325,6 +348,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly spawnBeforeOpen?: boolean;
     /** Completed when a hanging scope close reaches its wedged finalizer. */
     readonly scopeCloseReached?: Deferred.Deferred<void>;
+    readonly nativeWorkers?: (providerSessionId: ProviderSessionId) => ProviderAdapter.ProviderNativeWorkersPort;
+    readonly onScopeClose?: Effect.Effect<void>;
+    readonly providerEvents?: Queue.Queue<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>;
   } = {},
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
@@ -366,7 +392,8 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           yield* Ref.update(options.mcpConfigs, (configs) => [...configs, mcpConfig]);
         }
         const now = yield* DateTime.now;
-        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+        const events = options.providerEvents ??
+          (yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>());
         const session = makeProviderSession({
           providerSessionId: input.providerSessionId,
           now,
@@ -385,6 +412,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           yield* countClose;
           if (options.hangSessionScopeClose === true) yield* hangClose;
         }
+        if (options.onScopeClose !== undefined) yield* Effect.addFinalizer(() => options.onScopeClose!);
 
         return {
           instanceId: ProviderInstanceId.make("codex"),
@@ -400,6 +428,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
                 }),
               )
             : Stream.fromQueue(events),
+          ...(options.nativeWorkers === undefined ? {} : { nativeWorkers: options.nativeWorkers(input.providerSessionId) }),
           ...(options.hasPendingBackgroundWork === undefined
             ? {}
             : { hasPendingBackgroundWork: options.hasPendingBackgroundWork }),
@@ -470,6 +499,9 @@ function layerTest(input: {
   readonly beforeUnload?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
+  readonly nativeWorkers?: (providerSessionId: ProviderSessionId) => ProviderAdapter.ProviderNativeWorkersPort;
+  readonly onScopeClose?: Effect.Effect<void>;
+  readonly providerEvents?: Queue.Queue<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
 }) {
@@ -502,6 +534,9 @@ function layerTest(input: {
       ...(input.scopeCloseReached === undefined
         ? {}
         : { scopeCloseReached: input.scopeCloseReached }),
+      ...(input.nativeWorkers === undefined ? {} : { nativeWorkers: input.nativeWorkers }),
+      ...(input.onScopeClose === undefined ? {} : { onScopeClose: input.onScopeClose }),
+      ...(input.providerEvents === undefined ? {} : { providerEvents: input.providerEvents }),
     }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
   );
   const layerConfiguredMcpRegistry =
@@ -521,6 +556,7 @@ function layerTest(input: {
   return Layer.mergeAll(
     layerTestStores,
     layerConfiguredEventSink,
+    layerProviderEventIngestorTest,
     IdAllocator.layer,
     layerConfiguredMcpRegistry,
     McpProviderSessions.layer,
@@ -548,6 +584,263 @@ const fakeHttpServer = HttpServer.HttpServer.of({
   address: NetAddress.inetAddressFromIpStringUnsafe("127.0.0.1", 43123),
   serve: (() => Effect.void) as HttpServer.HttpServer["Service"]["serve"],
 });
+
+class NativeSourceUnavailable extends Schema.TaggedError<NativeSourceUnavailable>()("NativeSourceUnavailable", {}) {}
+
+it.effect.each(["silent", "ordinary replay", "result renewal", "retirement retry", "retirement CAS", "closed capture",
+  "timed-out close", "replacement owner", "unavailable peer"] as const)(
+  "imports committed membership: %s", (scenario) =>
+  Effect.gen(function* () {
+    const renew = scenario === "result renewal";
+    const replacementOwner = scenario === "replacement owner";
+    const failRetirement = scenario === "retirement retry" || scenario === "retirement CAS" || replacementOwner;
+    const closeCapture = scenario === "closed capture";
+    const hangClose = scenario === "timed-out close";
+    const state = yield* Ref.make(emptyState);
+    const hints = yield* Queue.unbounded<void>();
+    const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+    const reads = yield* Ref.make(0);
+    const ordinaryPending = yield* Ref.make(false);
+    const owner = { processId: "native-process", coordinatorSessionId: "native-coordinator", epoch: "epoch-1" };
+    let currentOwner = owner;
+    let ready = true;
+    let resultText = "public result only";
+    let failedWorker: string | undefined;
+    const failing = yield* Ref.make<"none" | "session" | "session-and-requests">("none");
+    const failNativeRetirement = yield* Ref.make(failRetirement);
+    const failures = yield* Queue.unbounded<void>();
+    const scopeCloseReached = yield* Deferred.make<void>();
+    const cut = yield* Ref.make(1);
+    const nativeWorkers = (): ProviderAdapter.ProviderNativeWorkersPort => {
+      const sessionOwner = currentOwner;
+      return {
+      get owner() { return ready ? sessionOwner : undefined; }, ownerGeneration: 1, hints: Stream.fromQueue(hints),
+      reconcile: (launch) => Effect.succeed({
+        launch, execution: "accepted", result: "pending", capture: "opening", availability: "ready", gaps: [],
+      }),
+      hasPendingWork: (launches) => Ref.get(cut).pipe(
+        Effect.map((sequence) => launches.length > 0 && !(closeCapture && sequence >= 2))),
+      read: (launch, expected) => Effect.gen(function* () {
+        if (launch.instanceId === failedWorker) return yield* new NativeSourceUnavailable();
+        assert.isDefined(expected);
+        yield* Ref.update(reads, (count) => count + 1);
+        const sequence = yield* Ref.get(cut);
+        const capture = closeCapture && sequence >= 2 ? "closed" as const : "open" as const;
+        const bindings: PiNativeWorkerCheckpoint["bindings"] = [{
+          generation: 1, historyId: "history", sessionId: "worker-session", state: "active",
+          headEntryId: null, capture, attemptIds: [], attempts: [], gaps: [],
+        }];
+        return {
+          launch, expectedCheckpoint: expected,
+          checkpoint: { ...expected!, launch, owner: sessionOwner, ownerGeneration: 1,
+            captureEpoch: "capture-epoch", bindings, bindingGeneration: 1,
+            cursor: `cursor-${sequence}`, cut: sequence, capture,
+            finalSequence: capture === "closed" ? sequence : null },
+          summary: { launch, execution: "completed" as const, result: "available" as const,
+            capture, availability: "ready" as const, gaps: [] },
+          records: [], bindings, more: false,
+          result: { status: "completed", text: resultText, complete: true },
+        };
+      }),
+      };
+    };
+    yield* Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const ids = yield* IdAllocator.IdAllocatorV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("native-manager-parent");
+      const providerSessionId = yield* ids.allocate.providerSession({
+        threadId, providerInstanceId: modelSelection.instanceId,
+      });
+      yield* sink.write({ events: [yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now })] });
+      const runtime = yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+      assert.equal(yield* Ref.get(reads), 0);
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+      const providerThread = makeProviderThread({ idAllocator: ids, threadId, providerSessionId, now });
+      yield* Ref.set(ordinaryPending, true);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(providerThread));
+      yield* Ref.set(ordinaryPending, false);
+      const launch: PiNativeWorkerLaunch = {
+        source: "agent_spawn", instanceId: "worker", providerInstanceId: modelSelection.instanceId,
+        providerSessionId, parentThreadId: threadId, parentProviderThreadId: providerThread.id,
+        parentProviderTurnId: ProviderTurnId.make("native-manager-turn"),
+        runId: RunId.make("native-manager-run"), runAttemptId: RunAttemptId.make("native-manager-attempt"),
+        toolNodeId: NodeId.make("native-manager-tool"), coordinatorSessionId: owner.coordinatorSessionId,
+        toolCallId: "spawn-call",
+      };
+      yield* sink.write({ events: [{
+        id: yield* ids.allocate.event({ threadId }), type: "run.created", threadId, occurredAt: now,
+        payload: { id: launch.runId, threadId, ordinal: 1, providerInstanceId: modelSelection.instanceId,
+          modelSelection, providerThreadId: providerThread.id,
+          userMessageId: MessageId.make("native-manager-message"), rootNodeId: NodeId.make("native-manager-root"),
+          activeAttemptId: launch.runAttemptId, status: "running", requestedAt: now, startedAt: now,
+          completedAt: null, checkpointId: null, contextHandoffId: null },
+      }] });
+      const checkpoint: PiNativeWorkerCheckpoint = {
+        launch, owner, ownerGeneration: 1, captureEpoch: null, bindings: [], bindingGeneration: null,
+        bindingCursors: [], cursor: null, cut: 0, recovery: false, capture: "opening", finalSequence: null, gaps: [],
+      };
+      const summary: PiNativeWorkerSummary = {
+        launch, execution: "accepted", result: "pending", capture: "opening", availability: "ready", gaps: [],
+      };
+      const imported = yield* sink.stream({ eventType: "provider-thread.updated" }).pipe(
+        Stream.filter((stored) => stored.event.type === "provider-thread.updated" &&
+          stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.cut === 1),
+        Stream.take(1), Stream.runDrain, Effect.forkScoped,
+      );
+      yield* ingestor.ingestNormalized({
+        providerSessionId, providerInstanceId: modelSelection.instanceId, threadId,
+        event: { type: "turn_item.updated", driver: ProviderDriverKind.make("pi"), turnItem: {
+          id: TurnItemId.make("native-manager-launch"), threadId, runId: launch.runId, nodeId: launch.toolNodeId,
+          providerThreadId: providerThread.id, providerTurnId: launch.parentProviderTurnId, nativeItemRef: null,
+          parentItemId: null, ordinal: 1, status: "completed", title: null, startedAt: now,
+          completedAt: now, updatedAt: now, type: "dynamic_tool", toolName: "agent_spawn",
+          input: {}, output: {}, nativeWorkerLaunch: launch,
+        } }, nativeWorkerAdmission: { summary, checkpoint },
+      });
+      yield* Fiber.join(imported);
+      let member = (yield* sink.nativeWorkers(providerSessionId))[0]!;
+      const child = yield* projections.getThreadProjection(member.childThreadId!);
+      assert.equal(child.messages.length, 0); // Public result never fabricates transcript text.
+      assert.equal(child.providerThreads[0]?.nativeMetadata?.nativeWorkerCheckpoint?.capture, "open");
+      assert.equal((yield* sink.nativeWorkers(providerSessionId))[0]?.result, "public result only");
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!({
+        ...providerThread, id: ids.derive.providerThread({ driver: CODEX_DRIVER, nativeThreadId: "unrelated" }),
+      }));
+      if (scenario === "unavailable peer") {
+        const peerLaunch = { ...launch, instanceId: "peer-worker", toolNodeId: NodeId.make("peer-tool"),
+          toolCallId: "peer-spawn-call" };
+        yield* ingestor.ingestNormalized({
+          providerSessionId, providerInstanceId: modelSelection.instanceId, threadId,
+          event: { type: "turn_item.updated", driver: ProviderDriverKind.make("pi"), turnItem: {
+            id: TurnItemId.make("peer-launch"), threadId, runId: launch.runId, nodeId: peerLaunch.toolNodeId,
+            providerThreadId: providerThread.id, providerTurnId: launch.parentProviderTurnId,
+            nativeItemRef: null, parentItemId: null, ordinal: 2, status: "completed",
+            title: null, startedAt: now, completedAt: now, updatedAt: now,
+            type: "dynamic_tool", toolName: "agent_spawn", input: {}, output: {},
+            nativeWorkerLaunch: peerLaunch,
+          } }, nativeWorkerAdmission: { summary: { ...summary, launch: peerLaunch },
+            checkpoint: { ...checkpoint, launch: peerLaunch } },
+        });
+        const members = yield* sink.nativeWorkers(providerSessionId);
+        assert.lengthOf(members, 2);
+        // Fail the first read in durable traversal order, not a guessed ID order.
+        failedWorker = members[0]!.nativeWorker!.launch.instanceId;
+        member = members[1]!;
+      }
+      const released = yield* sink.stream({ eventType: "provider-thread.updated" }).pipe(
+        Stream.filter((stored) => stored.event.type === "provider-thread.updated" &&
+          stored.event.threadId === member.childThreadId &&
+          stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.ownerGeneration === 2),
+        Stream.take(1), Stream.runDrain, Effect.forkScoped,
+      );
+      yield* TestClock.adjust("30 minutes"); // Starts the four-hour silent pin budget.
+      const cursorCommitted = yield* sink.stream({ eventType: "provider-thread.updated" }).pipe(
+        Stream.filter((stored) => stored.event.type === "provider-thread.updated" &&
+          stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.cut === 2),
+        Stream.take(1), Stream.runDrain, Effect.forkScoped,
+      );
+      yield* Ref.set(cut, 2);
+      yield* Queue.offer(hints, undefined); // Cursor-only progress must not renew.
+      yield* Fiber.join(cursorCommitted);
+      if (scenario === "ordinary replay") {
+        yield* TestClock.adjust("2 hours");
+        const subscription = yield* runtime.subscribeEvents!;
+        const replayed = yield* subscription.events.pipe(
+          Stream.filter((event) => event.type === "provider_session.updated"),
+          Stream.take(1), Stream.runDrain, Effect.forkScoped,
+        );
+        yield* Queue.offer(providerEvents, {
+          type: "provider_session.updated", driver: CODEX_DRIVER, providerSession: runtime.providerSession,
+        });
+        yield* Fiber.join(replayed);
+      }
+      if (closeCapture) {
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+        yield* TestClock.adjust("30 minutes");
+      } else if (renew) {
+        yield* TestClock.adjust("2 hours");
+        const resultCommitted = yield* sink.stream({ eventType: "subagent.updated" }).pipe(
+          Stream.filter((stored) => stored.event.type === "subagent.updated" &&
+            stored.event.payload.result === "new committed result"),
+          Stream.take(1), Stream.runDrain, Effect.forkScoped,
+        );
+        resultText = "new committed result";
+        yield* Ref.set(cut, 3);
+        yield* Queue.offer(hints, undefined);
+        yield* Fiber.join(resultCommitted);
+        yield* TestClock.adjust("3 hours");
+        assert.equal((yield* manager.getResident(providerSessionId))._tag, "Some");
+        yield* TestClock.adjust("90 minutes");
+      } else {
+        yield* TestClock.adjust(scenario === "ordinary replay" ? "2 hours" : "4 hours");
+      }
+      if (hangClose) {
+        yield* Deferred.await(scopeCloseReached);
+        yield* TestClock.adjust("30 seconds");
+      }
+      if (failRetirement) {
+        yield* Queue.take(failures);
+        yield* Ref.set(failNativeRetirement, false);
+        if (replacementOwner) {
+          currentOwner = { ...owner, epoch: "epoch-replacement" };
+          ready = true;
+          yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+          const newLaunch = { ...launch, instanceId: "new-worker", toolNodeId: NodeId.make("new-tool"),
+            toolCallId: "new-spawn-call" };
+          yield* ingestor.ingestNormalized({
+            providerSessionId, providerInstanceId: modelSelection.instanceId, threadId,
+            event: { type: "turn_item.updated", driver: ProviderDriverKind.make("pi"), turnItem: {
+              id: TurnItemId.make("replacement-launch"), threadId, runId: launch.runId,
+              nodeId: newLaunch.toolNodeId, providerThreadId: providerThread.id,
+              providerTurnId: launch.parentProviderTurnId, nativeItemRef: null, parentItemId: null,
+              ordinal: 2, status: "completed", title: null, startedAt: now, completedAt: now, updatedAt: now,
+              type: "dynamic_tool", toolName: "agent_spawn", input: {}, output: {},
+              nativeWorkerLaunch: newLaunch,
+            } },
+            nativeWorkerAdmission: { summary: { ...summary, launch: newLaunch },
+              checkpoint: { ...checkpoint, launch: newLaunch, owner: currentOwner } },
+          });
+        }
+        yield* TestClock.adjust("1 second");
+      }
+      yield* Fiber.join(released);
+      assert.isUndefined(runtime.nativeWorkers?.owner);
+      assert.equal((yield* manager.getResident(providerSessionId))._tag, replacementOwner ? "Some" : "None");
+      const retired = yield* projections.getThreadProjection(member.childThreadId!);
+      const finalCheckpoint = retired.providerThreads[0]!.nativeMetadata!.nativeWorkerCheckpoint!;
+      assert.equal(finalCheckpoint.ownerGeneration, 2);
+      assert.equal(finalCheckpoint.cut, renew ? 3 : 2); // Release reread the last committed checkpoint.
+      assert.equal(finalCheckpoint.capture, closeCapture ? "closed" : "incomplete");
+      assert.deepEqual(finalCheckpoint.gaps, closeCapture ? [] : ["stale_owner"]);
+      assert.equal((yield* Ref.get(state)).closeCount, hangClose ? 0 : 1);
+      if (replacementOwner) {
+        const newMember = (yield* sink.nativeWorkers(providerSessionId))
+          .find((candidate) => candidate.nativeWorker?.launch.instanceId === "new-worker")!;
+        const newer = yield* projections.getThreadProjection(newMember.childThreadId!);
+        const newerCheckpoint = newer.providerThreads[0]!.nativeMetadata!.nativeWorkerCheckpoint!;
+        assert.equal(newerCheckpoint.owner.epoch, "epoch-replacement");
+        assert.equal(newerCheckpoint.ownerGeneration, 1);
+        assert.notEqual(newerCheckpoint.capture, "incomplete");
+        assert.equal((yield* projections.getThreadProjection(threadId)).providerSessions.at(-1)?.status, "ready");
+      }
+    }).pipe(
+      Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 4 * 60 * 60_000,
+        hasPendingBackgroundWork: Ref.get(ordinaryPending),
+        hasPendingBackgroundWorkForThread: Ref.get(ordinaryPending),
+        nativeWorkers, providerEvents, onScopeClose: Effect.sync(() => { ready = false; }),
+        hangSessionScopeClose: hangClose, scopeCloseReached,
+        ...(failRetirement ? { flakyReleaseWrites: { failing, failures, failNativeRetirement,
+          rejectNativeRetirement: scenario === "retirement CAS" } } : {}) })),
+      Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+    );
+  }),
+);
 
 const fakeEnvironment = ServerEnvironment.ServerEnvironment.of({
   getEnvironmentId: Effect.succeed(EnvironmentId.make("environment-provider-session-manager")),

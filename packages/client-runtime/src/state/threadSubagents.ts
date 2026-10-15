@@ -2,10 +2,8 @@
  * The subagent roster for one turn, and the compact label the mobile composer
  * pill renders for it.
  *
- * Scoped to a run rather than the whole thread: a thread accumulates every
- * subagent it ever spawned, while the pill and its sheet answer "what is this
- * turn doing right now". Statuses come from the v2 projection directly, so
- * this stays a pure fold over `runs` and `subagents`.
+ * The selected run plus earlier native workers still executing or capturing.
+ * Closed copies remain in Lineage, not in the current-turn roster.
  */
 import * as DateTime from "effect/DateTime";
 import type { OrchestrationV2Subagent, OrchestrationV2ThreadProjection } from "@t3tools/contracts";
@@ -52,7 +50,9 @@ export function deriveThreadTurnSubagents(
   );
   const runId = activeRun?.id ?? latestUpdated.runId;
   const subagents = copySorted(
-    projection.subagents.filter((subagent) => subagent.runId === runId),
+    projection.subagents.filter(
+      (subagent) => subagent.runId === runId || isOpenNativeWorker(subagent),
+    ),
     (left, right) => orderKey(left) - orderKey(right) || left.id.localeCompare(right.id),
   );
   if (subagents.length === 0) return null;
@@ -66,6 +66,17 @@ export function deriveThreadTurnSubagents(
   return { runId, turnActive: activeRun !== null, subagents, liveCount, settledCount };
 }
 
+export function isOpenNativeWorker(subagent: Pick<Subagent, "nativeWorker">): boolean {
+  const worker = subagent.nativeWorker;
+  return (
+    worker !== undefined &&
+    (worker.execution === "accepted" ||
+      worker.execution === "running" ||
+      worker.capture === "opening" ||
+      worker.capture === "open")
+  );
+}
+
 /**
  * What the pill's agents segment says, or null while it should stay hidden.
  * The segment is for work in flight: once the turn settles it goes away
@@ -75,12 +86,21 @@ export function resolveSubagentPillSegment(
   turn: ThreadTurnSubagents | null,
 ): SubagentPillSegment | null {
   if (turn === null) return null;
-  if (!turn.turnActive && turn.liveCount === 0) return null;
+  const capturing = turn.subagents.filter(
+    (agent) => !isActiveSubagentStatus(agent.status) && isOpenNativeWorker(agent),
+  ).length;
+  if (!turn.turnActive && turn.liveCount === 0 && capturing === 0) return null;
   const total = turn.subagents.length;
   if (turn.liveCount > 0) {
     return {
       label: `${turn.liveCount}/${total}`,
       accessibilityLabel: `${turn.liveCount} of ${total} agents working`,
+    };
+  }
+  if (capturing > 0) {
+    return {
+      label: `${capturing} capturing`,
+      accessibilityLabel: `${capturing} ${capturing === 1 ? "agent" : "agents"} still capturing`,
     };
   }
   return {
