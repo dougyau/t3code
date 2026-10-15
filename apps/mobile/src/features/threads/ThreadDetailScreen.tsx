@@ -425,10 +425,8 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const composerEditorRef = useRef<ComposerEditorHandle>(null);
   // A provider-native subagent shows status instead of a composer.
   const isProviderSubagent = isProviderNativeSubagentThread(props.selectedThread.source);
-  const parentThread = useEnvironmentThread(
-    props.environmentId,
-    props.selectedThread.lineage.parentThreadId,
-  );
+  const parentThreadId = props.selectedThread.lineage.parentThreadId;
+  const parentThread = useEnvironmentThread(props.environmentId, parentThreadId);
   const nativeWorker = Option.getOrNull(parentThread.data)?.subagents.find(
     (agent) => agent.childThreadId === props.selectedThread.id,
   )?.nativeWorker;
@@ -1422,6 +1420,16 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                         )}
                         status={props.providerSubagentStatus ?? null}
                         nativeWorker={nativeWorker}
+                        onOpenAssignment={
+                          nativeWorker && parentThreadId !== null
+                            ? () =>
+                                navigation.navigate("ThreadNativeWorkerDetails", {
+                                  environmentId: props.environmentId,
+                                  parentThreadId,
+                                  childThreadId: props.selectedThread.id,
+                                })
+                            : undefined
+                        }
                         onOpenParent={
                           props.selectedThread.lineage.parentThreadId === null
                             ? null

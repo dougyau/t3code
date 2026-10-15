@@ -2,10 +2,12 @@ import { ProjectId, ProviderDriverKind } from "@t3tools/contracts";
 import type { OrchestrationV2TurnItemStatus } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import {
+  nativeWorkerBriefPresentation,
   subagentGroupSummary,
   resolveSubagentMetadata,
   subagentDetailPreview,
 } from "./subagentDisplay.js";
+import { nativeWorkerFixture } from "../testing/nativeWorker.ts";
 
 describe("subagentGroupSummary", () => {
   it.each(["pending", "running", "waiting"] as const)(
@@ -162,5 +164,24 @@ describe("subagentDetailPreview", () => {
       subagentDetailPreview({ status: "failed", progress: "Last progress", result: " " }),
     ).toBe("Last progress");
     expect(subagentDetailPreview({ status: "pending" })).toBeNull();
+  });
+});
+
+describe("nativeWorkerBriefPresentation", () => {
+  it("distinguishes missing text from exact empty, whitespace and multiline originals", () => {
+    expect(
+      nativeWorkerBriefPresentation(nativeWorkerFixture({ brief: undefined, briefComplete: true })),
+    ).toEqual({ state: "missing" });
+    for (const text of ["", " \n\t ", "Original brief\n  Keep indentation\n"]) {
+      for (const [briefComplete, completeness] of [
+        [true, "complete"],
+        [false, "partial"],
+        [undefined, "unknown"],
+      ] as const) {
+        expect(
+          nativeWorkerBriefPresentation(nativeWorkerFixture({ brief: text, briefComplete })),
+        ).toEqual({ state: "available", text, completeness });
+      }
+    }
   });
 });

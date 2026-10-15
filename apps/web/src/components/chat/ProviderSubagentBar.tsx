@@ -2,15 +2,15 @@ import {
   formatProviderSubagentStatus,
   type ProviderSubagentStatus,
 } from "@t3tools/client-runtime/state/thread-execution";
-import { isOrchestrationV2WorkActive } from "@t3tools/contracts";
-import type { PiNativeWorkerSummary } from "@t3tools/contracts";
-import { nativeWorkerPresentation } from "@t3tools/client-runtime/state/subagent-display";
+import { isOrchestrationV2WorkActive, type PiNativeWorkerSummary } from "@t3tools/contracts";
 import { ArrowUpLeftIcon } from "lucide-react";
 import { useLayoutEffect, useRef, useState } from "react";
 
 import type { ProviderInstanceEntry } from "../../providerInstances";
 import { Button } from "../ui/button";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
+import { ComposerBanner } from "./ComposerBanner";
+import { NativeWorkerDetailsDialog } from "./NativeWorkerDetailsDialog";
 import {
   ComposerTasksContent,
   type ComposerTasksProgress,
@@ -38,16 +38,20 @@ export function ProviderSubagentBar(props: {
   readonly taskSteps?: readonly ComposerTaskStep[] | null | undefined;
 }) {
   const [tasksExpanded, setTasksExpanded] = useState(false);
-  const native = props.nativeWorker ? nativeWorkerPresentation(props.nativeWorker) : null;
+  const native = props.nativeWorker;
+  const identity =
+    native?.roleId ??
+    (native?.launch.source === "team_assign" ? native.launch.roleId : native?.launch.source);
+  const execution = native ? `Execution ${native.execution ?? "unknown"}` : null;
   const statusRef = useRef<HTMLSpanElement>(null);
   const { status } = props;
   const live = !native && status !== null && isOrchestrationV2WorkActive(status.status);
-  const modelLabel = native ? (native.model ?? "Not reported") : props.modelLabel;
+  const modelLabel = native ? (native.activated?.model ?? "Not reported") : props.modelLabel;
   const effortLabel = native ? null : props.effortLabel;
   const modelDescription = effortLabel === null ? modelLabel : `${modelLabel}, ${effortLabel}`;
   // Announced once per transition; the ticking label below is not.
   const announcement =
-    native?.status ??
+    execution ??
     formatProviderSubagentStatus(status === null ? null : { ...status, startedAt: null }, 0);
 
   // The label is written from an effect, and live bars tick through DOM
@@ -56,35 +60,30 @@ export function ProviderSubagentBar(props: {
     const update = () => {
       if (statusRef.current) {
         statusRef.current.textContent =
-          native?.status ?? formatProviderSubagentStatus(status, Date.now());
+          execution ?? formatProviderSubagentStatus(status, Date.now());
       }
     };
     update();
     if (!live) return;
     const id = setInterval(update, 1_000);
     return () => clearInterval(id);
-  }, [live, status, native?.status]);
+  }, [live, status, execution]);
 
   return (
     <div>
       {props.tasksProgress && props.taskSteps ? (
-        <ComposerTasksContent
-          progress={props.tasksProgress}
-          steps={props.taskSteps}
-          expanded={tasksExpanded}
-          onToggle={() => setTasksExpanded((expanded) => !expanded)}
-        />
-      ) : null}
-      {native ? (
-        <div className="grid gap-1 px-5 pt-2 text-xs text-muted-foreground">
-          <span>{native.identity ?? native.role}</span>
-          <span>{native.task}</span>
-          <span>{native.status}</span>
-          <span>Effective model: {native.model ?? "Not reported"}</span>
-        </div>
+        <ComposerBanner.Root density="comfortable" variant="default" placement="floating">
+          <ComposerTasksContent
+            progress={props.tasksProgress}
+            steps={props.taskSteps}
+            expanded={tasksExpanded}
+            onToggle={() => setTasksExpanded((expanded) => !expanded)}
+          />
+        </ComposerBanner.Root>
       ) : null}
       <div className="flex min-h-12 items-center gap-3 rounded-3xl py-2 ps-5 pe-2 text-sm">
         <span className="flex min-w-0 items-center gap-2">
+          {identity ? <span className="truncate font-medium">{identity}</span> : null}
           {props.provider ? (
             <ProviderInstanceIcon
               driverKind={props.provider.driverKind}
@@ -109,11 +108,12 @@ export function ProviderSubagentBar(props: {
           className="min-w-0 truncate text-muted-foreground tabular-nums"
         />
         <span role="status" className="sr-only">
-          {`${modelDescription} subagent: ${announcement}`}
+          {`${identity ? `${identity}, ` : ""}${modelDescription} subagent: ${announcement}`}
         </span>
         <span className="ms-auto shrink-0 text-muted-foreground max-sm:hidden">
           Runs on its own
         </span>
+        <NativeWorkerDetailsDialog worker={native} />
         {props.onOpenParent ? (
           <Button size="sm" variant="ghost" onClick={props.onOpenParent}>
             <ArrowUpLeftIcon />
