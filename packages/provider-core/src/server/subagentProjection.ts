@@ -272,7 +272,8 @@ function writtenIds(
 /**
  * Ends a provider-native subagent, its node and its turn item once the provider
  * process that ran it is gone, since no terminal event will come from it. Each
- * record is skipped if already settled or already ended by `emitted`.
+ * record is skipped if already settled or already ended by `emitted`. Pi native
+ * worker snapshots belong to native capture, not this provider-process lifecycle.
  */
 export const endOrphanedNativeSubagent = <E>(input: {
   readonly projection: Pick<OrchestrationV2ThreadProjection, "nodes" | "subagents" | "turnItems">;
@@ -285,7 +286,7 @@ export const endOrphanedNativeSubagent = <E>(input: {
   Effect.gen(function* () {
     const { now, status, subagentId } = input;
     const subagent = input.projection.subagents.find((entry) => entry.id === subagentId);
-    if (subagent?.origin !== "provider_native") return [];
+    if (subagent?.origin !== "provider_native" || subagent.nativeWorker !== undefined) return [];
     const node = input.projection.nodes.find((entry) => entry.id === subagentId);
     const item = input.projection.turnItems.find(
       (entry) => entry.type === "subagent" && entry.subagentId === subagentId,
