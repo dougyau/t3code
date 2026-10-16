@@ -45,9 +45,11 @@ import { toolOutputImages } from "@t3tools/shared/toolOutput";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
+import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
@@ -390,6 +392,46 @@ const seedNativeWorker = Effect.fnUntraced(function* (admit = true) {
 });
 
 layer("native worker persisted import", (it) => {
+  it.effect.each(["startup", "shutdown"] as const)(
+    "preserves captured native workers during %s recovery",
+    (trigger) =>
+      Effect.gen(function* () {
+        const f = yield* seedNativeWorker();
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const events = yield* EventStore.EventStoreV2;
+        yield* f.sink.write({
+          events: [
+            {
+              id: yield* f.ids.allocate.event({ threadId: f.parent.threadId }),
+              threadId: f.parent.threadId,
+              type: "run.updated",
+              occurredAt: f.now,
+              payload: { ...f.run, status: "completed", completedAt: f.now },
+            },
+          ],
+        });
+        const before = yield* projections.getThreadProjection(f.parent.threadId);
+        const sequence = yield* events.latestSequence({ threadId: f.parent.threadId });
+        const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+          Effect.provide(Layer.mergeAll(ServerSettings.layerTest(), EffectOutbox.layer)),
+        );
+
+        const summary = yield* recovery.reconcile(trigger);
+
+        assert.equal(summary.terminalizedRuns, 0);
+        assert.deepEqual(
+          (yield* projections.getThreadProjection(f.parent.threadId)).subagents,
+          before.subagents,
+        );
+        assert.equal(yield* events.latestSequence({ threadId: f.parent.threadId }), sequence);
+        assert.deepEqual(
+          (yield* projections.getThreadProjection(f.member.childThreadId!)).providerThreads[0]
+            ?.nativeMetadata?.nativeWorkerCheckpoint,
+          f.checkpoint,
+        );
+      }),
+  );
+
   it.effect(
     "persists native message diagnostics and presents tool-only turns without empty rows",
     () =>
