@@ -4933,6 +4933,9 @@ describe("PiRpc early process exit", () => {
       assert.isFalse(winner.allRequests().some((record) => record.type === "prompt" || record.type === "new_session"));
       assert.isDefined(runtime.nativeWorkers);
       assert.isFalse(yield* runtime.nativeWorkers!.hasPendingWork([]));
+      assert.deepEqual(yield* runtime.nativeWorkers!.readBackgroundPending(), {
+        state: "unavailable", reason: "stale_owner",
+      });
       assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );

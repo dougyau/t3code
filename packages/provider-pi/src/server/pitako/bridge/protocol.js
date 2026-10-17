@@ -4,7 +4,7 @@ export const replyBytes = 48 * 1024;
 export const outstandingRequests = 8;
 export const queueBytes = 256 * 1024;
 export const capabilities = Object.freeze(["workers.list", "workers.detail", "workers.requests", "workers.activity", "workers.result", "subscribe", "unsubscribe",
-  "history.list", "history.read", "route.read", "workers.detail.public-v1", "workers.activity.public-v1", "workers.result.public-v1"]);
+  "history.list", "history.read", "route.read", "workers.detail.public-v1", "workers.activity.public-v1", "workers.result.public-v1", "architecture.list", "architecture.read", "architecture.public-v1", "background.pending"]);
 export const object = value => !!value && typeof value === "object" && !Array.isArray(value);
 const keys = (value, allowed) => Object.keys(value).every(key => allowed.includes(key));
 export const string = (value, max = 1024) =>
@@ -13,7 +13,8 @@ export const isOwner = value => object(value) && keys(value, ["processId", "coor
   string(value.processId) && string(value.coordinatorSessionId) && string(value.epoch);
 export const sameOwner = (a, b) => a.processId === b.processId &&
   a.coordinatorSessionId === b.coordinatorSessionId && a.epoch === b.epoch;
-const isCapabilities = value => Array.isArray(value) && value.length === capabilities.length &&
+// Only the three published snapshots, not arbitrary subsets or future extensions.
+const isCapabilities = value => Array.isArray(value) && [13, 16, 17].includes(value.length) &&
   value.every((item, index) => item === capabilities[index]);
 const integer = value => Number.isSafeInteger(value) && value >= 0;
 const token = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
@@ -53,6 +54,9 @@ export function isRequest(value) {
     case "connect": return keys(value.params, ["token", "expectedSessionId", "resumeToken"]) &&
       token(value.params.token) && string(value.params.expectedSessionId) &&
       (value.params.resumeToken === undefined || token(value.params.resumeToken));
+    case "background.pending": return keys(value.params, []);
+    case "architecture.list": return keys(value.params, ["cursor"]) && optional(value.params, "cursor", architectureCursor);
+    case "architecture.read": return keys(value.params, ["ref", "cursor"]) && isArchitectureRef(value.params.ref) && optional(value.params, "cursor", architectureCursor);
     case "workers.list": return keys(value.params, ["after", "revision"]) &&
       (value.params.after === undefined || string(value.params.after) && integer(value.params.revision)) &&
       (value.params.revision === undefined || integer(value.params.revision));
@@ -109,10 +113,10 @@ export const success = (request, result) => ({ version, id: request.id, clientId
 const text = value => typeof value === "string" && Buffer.byteLength(value) <= replyBytes;
 const optional = (value, key, validate) => value[key] === undefined || validate(value[key]);
 function isSdkRequest(value) {
-  return object(value) && keys(value, ["attemptId", "historyId", "sessionId", "sdkOptions", "model", "provider",
+  return object(value) && keys(value, ["turnId", "attemptId", "historyId", "sessionId", "sdkOptions", "model", "provider",
     "requestId", "inputTokens", "outputTokens", "reasoning", "fast_requested", "requested_service_tier",
     "returned_service_tier", "time_to_first_model_output_ms", "time_to_first_model_output_unavailable_reason"]) &&
-    ["attemptId", "historyId", "sessionId", "provider", "requestId", "reasoning"].every(key => optional(value, key, text)) &&
+    ["turnId", "attemptId", "historyId", "sessionId", "provider", "requestId", "reasoning"].every(key => optional(value, key, text)) &&
     text(value.model) && typeof value.fast_requested === "boolean" &&
     optional(value, "sdkOptions", options => object(options) &&
       keys(options, ["reasoning", "temperature", "maxTokens", "serviceTier"]) &&
@@ -129,13 +133,13 @@ function isList(value, owner) {
     sameOwner(value.owner, owner) && Array.isArray(value.items) && value.items.length <= 50 &&
     (value.cursor === null || string(value.cursor)) &&
     value.items.every(row => object(row) &&
-      keys(row, ["id", "roleId", "status", "source", "assignmentId", "task", "selectedModel", "requestedModel",
+      keys(row, ["id", "roleId", "status", "source", "teamId", "memberId", "turnId", "assignmentId", "task", "selectedModel", "requestedModel",
         "requestedReasoning", "activated", "sdkRequest", "acceptedAt", "terminalAt", "activity", "phase", "profile",
         "resultTaken", "handoff"]) &&
       string(row.id) && string(row.roleId) &&
       ["created", "running", "completed", "failed", "cancelled"].includes(row.status) &&
       optional(row, "source", source => ["agent_run", "agent_spawn", "team_assign"].includes(source)) &&
-      ["assignmentId", "requestedModel", "requestedReasoning", "profile"].every(key => optional(row, key, text)) &&
+      ["teamId", "memberId", "turnId", "assignmentId", "requestedModel", "requestedReasoning", "profile"].every(key => optional(row, key, text)) &&
       text(row.task) && text(row.selectedModel) && optional(row, "terminalAt", Number.isFinite) &&
       optional(row, "activated", item => object(item) && keys(item, ["attemptId", "model", "reasoning"]) &&
         text(item.attemptId) && text(item.model) && text(item.reasoning)) &&
@@ -229,7 +233,8 @@ function publicDetail(value, owner) {
   return keys(value, ["format", "ref", "worker", "lifecycle", "bindings", "workbrief", "nextBrief", "selected", "activated",
       "captureEpoch", "conversationSequence", "captureGaps", "nextBindings"]) &&
     value.format === "public-v1" && publicBoundRef(value.ref, owner) && ["agent_spawn", "team_assign"].includes(value.ref.source) &&
-    object(worker) && keys(worker, ["source", "instanceId", "roleId", "coordinatorSessionId", "toolCallId", "assignmentId", "acceptedAt", "linkage"]) &&
+    object(worker) && keys(worker, ["source", "instanceId", "roleId", "teamId", "memberId", "turnId", "coordinatorSessionId", "toolCallId", "assignmentId", "acceptedAt", "linkage"]) &&
+    ["teamId", "memberId", "turnId"].every(key => optional(worker, key, string)) &&
     worker.source === value.ref.source && worker.instanceId === value.ref.instanceId && string(worker.roleId) &&
     worker.coordinatorSessionId === owner.coordinatorSessionId &&
     (worker.toolCallId === null || string(worker.toolCallId)) &&
@@ -358,6 +363,11 @@ export function isReply(value, method, format) {
     object(value.error) && keys(value.error, ["code", "message"]) &&
     Object.hasOwn(errors, value.error.code) && value.error.message === errors[value.error.code];
   if (value.ok !== true || !keys(value, ["version", "id", "clientId", "owner", "ok", "result"])) return false;
+  if (method === "background.pending") return object(value.result) &&
+    (["pending", "none"].includes(value.result.state) ? keys(value.result, ["state"])
+      : value.result.state === "unavailable" && keys(value.result, ["state", "reason"]) &&
+        ["unsupported", "stale_owner", "source_unavailable"].includes(value.result.reason));
+  if (method === "architecture.list" || method === "architecture.read") return architectureReply(value.result, method, value.owner);
   if (method === "connect") return object(value.result) && keys(value.result, ["capabilities", "lease"]) &&
     isCapabilities(value.result.capabilities) &&
     object(value.result.lease) && keys(value.result.lease, ["clientId", "resumeToken"]) &&
@@ -387,4 +397,115 @@ export function isNotification(value) {
   return object(value) && keys(value, ["version", "method", "clientId", "owner", "subscriptionId", "revision", "refreshRequired"]) &&
     value.version === version && value.method === "changed" && string(value.clientId, 128) && isOwner(value.owner) &&
     string(value.subscriptionId, 128) && integer(value.revision) && value.refreshRequired === true;
+}
+
+const architectureCursor = value => string(value, 16 * 1024);
+const unboundedText = value => typeof value === "string";
+const nonempty = value => typeof value === "string" && value.length > 0;
+const array = (value, validate) => Array.isArray(value) && value.every(validate);
+const fields = (value, names) => object(value) && keys(value, names);
+const strings = value => array(value, nonempty);
+const doubt = value => fields(value, ["question", "purpose"]) && nonempty(value.question) && nonempty(value.purpose);
+const resolution = (value, statuses, extra) => fields(value, ["doubtId", "status", "answer", ...extra]) &&
+  nonempty(value.doubtId) && statuses.includes(value.status) && nonempty(value.answer);
+export function isPublicArchitectureBody(body) {
+  if (!object(body)) return false;
+  switch (body.kind) {
+    case "composition": return keys(body, ["kind", "snapshotId", "specialists"]) && nonempty(body.snapshotId) &&
+      Array.isArray(body.specialists) && body.specialists.length >= 1 && body.specialists.length <= 5 && body.specialists.every(item =>
+        fields(item, ["candidateRef", "mandate", "reason"]) && [item.candidateRef, item.mandate, item.reason].every(nonempty));
+    case "preparation": return keys(body, ["kind", "analysis", "doubts"]) && nonempty(body.analysis) && array(body.doubts, doubt);
+    case "contribution": return keys(body, ["kind", "proposal", "arguments", "objections", "doubts"]) && nonempty(body.proposal) && strings(body.arguments) &&
+      array(body.objections, item => fields(item, ["memberId", "messageId", "argument"]) && [item.memberId, item.messageId, item.argument].every(nonempty)) && array(body.doubts, doubt);
+    case "decision": return keys(body, ["kind", "action", "reason"]) && ["continue", "consult", "synthesize", "recompose"].includes(body.action) && nonempty(body.reason);
+    case "answer":
+    case "consultation-response": return keys(body, ["kind", "answer", "evidence", "limits", "doubts", ...(body.kind === "answer" ? [] : ["doubtIds"])]) &&
+      nonempty(body.answer) && strings(body.evidence) && strings(body.limits) && array(body.doubts, doubt) && (body.kind === "answer" || strings(body.doubtIds));
+    case "consultation-plan": return keys(body, ["kind", "resolutions", "support"]) &&
+      array(body.resolutions, item => resolution(item, ["answered", "rejected"], [])) && array(body.support, item =>
+        fields(item, ["role", "brief", "doubtIds", "prerequisites"]) && ["scout", "researcher", "oracle"].includes(item.role) && nonempty(item.brief) &&
+        strings(item.doubtIds) && array(item.prerequisites, integer));
+    case "knowledge": return keys(body, ["kind", "resolutions"]) && array(body.resolutions, item =>
+      resolution(item, ["answered", "partial", "rejected", "failed"], ["supportIds"]) && strings(item.supportIds));
+    case "synthesis": return keys(body, ["kind", "status", "recommendation", "alternatives", "evidence", "assumptions", "disagreements", "pending"]) &&
+      ["complete", "partial", "failed"].includes(body.status) && nonempty(body.recommendation) && ["alternatives", "evidence", "assumptions", "disagreements", "pending"].every(key => strings(body[key]));
+    default: return false;
+  }
+}
+const architectureStages = ["composition", "preparation", "contribution", "decision", "answer", "consultation-plan", "consultation-response", "knowledge", "synthesis"];
+const architectureStage = value => value === null || [...architectureStages, "waiting", "closing"].includes(value);
+export const isArchitectureRef = value => fields(value, ["kind", "processId", "coordinatorSessionId", "epoch", "roomId"]) && value.kind === "architecture" &&
+  isOwner({ processId: value.processId, coordinatorSessionId: value.coordinatorSessionId, epoch: value.epoch }) && string(value.roomId);
+function architectureLifecycle(value) {
+  return fields(value, ["stage", "round", "protocolState", "outcome", "closure"]) && architectureStage(value.stage) && integer(value.round) &&
+    ["starting", "running", "waiting", "finished", "failed", "cancelled", "closure-unknown"].includes(value.protocolState) && ["pending", "available", "unavailable"].includes(value.outcome) &&
+    fields(value.closure, ["state", "members", "director"]) && ["pending", "released", "unknown"].includes(value.closure.state) &&
+    ["members", "director"].every(key => ["not-created", "pending", "released", "unknown"].includes(value.closure[key]));
+}
+const architectureIdentity = value => fields(value, ["memberId", "assignmentId", "instanceId"]) && [value.memberId, value.assignmentId, value.instanceId].every(item => string(item));
+function architectureMessage(value) {
+  return fields(value, ["id", "ordinal", "roomId", "assignmentId", "memberId", "author", "stage", "snapshotId", "round", "turnId", "attemptId", "body", "native", "doubts"]) &&
+    ["id", "roomId", "assignmentId", "memberId", "author", "snapshotId", "turnId", "attemptId"].every(key => string(value[key])) && integer(value.ordinal) &&
+    optional(value, "round", integer) && architectureStages.includes(value.stage) && isPublicArchitectureBody(value.body) && value.body.kind === value.stage &&
+    fields(value.native, ["historyId", "sessionId", "toolCallId", "persistence"]) && optional(value.native, "historyId", string) && string(value.native.sessionId) &&
+    string(value.native.toolCallId) && value.native.persistence === "unconfirmed" && array(value.doubts, item => fields(item, ["id", "question", "purpose"]) &&
+      string(item.id) && nonempty(item.question) && nonempty(item.purpose));
+}
+export function isArchitectureRecord(value) {
+  if (!object(value) || !string(value.id)) return false;
+  switch (value.kind) {
+    case "room": return keys(value, ["kind", "id", "mode", "origin", "goalSource", "lifecycle", "pendingDoubtIds"]) && ["table", "consultation"].includes(value.mode) &&
+      fields(value.origin, ["coordinatorSessionId", "tool", "toolCallId", "memberId", "assignmentId", "instanceId"]) && value.origin.tool === "architecture_start" &&
+      ["coordinatorSessionId", "toolCallId", "memberId", "assignmentId", "instanceId"].every(key => string(value.origin[key])) &&
+      fields(value.goalSource, ["kind", "instanceId"]) && value.goalSource.kind === "worker-workbrief" && string(value.goalSource.instanceId) &&
+      architectureLifecycle(value.lifecycle) && strings(value.pendingDoubtIds);
+    case "member": return keys(value, ["kind", "id", "assignmentId", "instanceId", "roleId", "function", "ordinal", "admittedAt", "mandate", "execution", "workerRef", "conversationRefs", "compositionMessageId", "supersededByCompositionId"]) &&
+      ["assignmentId", "instanceId", "roleId"].every(key => string(value[key])) && ["director", "specialist", "support"].includes(value.function) && integer(value.ordinal) && Number.isFinite(value.admittedAt) &&
+      object(value.mandate) && (value.mandate.source === "root-workbrief" ? keys(value.mandate, ["source", "instanceId"]) && string(value.mandate.instanceId) :
+        value.mandate.source === "TeamAssignment.task" && keys(value.mandate, ["source", "text"]) && unboundedText(value.mandate.text)) &&
+      ["accepted", "running", "completed", "failed", "cancelled"].includes(value.execution) && optional(value, "workerRef", item => readReference(item, true)) &&
+      array(value.conversationRefs, item => readReference(item, true)) && ["compositionMessageId", "supersededByCompositionId"].every(key => optional(value, key, string));
+    case "publication": return keys(value, ["kind", "id", "message"]) && architectureMessage(value.message) && value.id === value.message.id;
+    case "knowledge-boundary": return keys(value, ["kind", "id", "ordinal", "roomId", "cycleId", "planMessageId", "knowledgeMessageId", "resolutions"]) &&
+      integer(value.ordinal) && ["roomId", "cycleId", "planMessageId"].every(key => string(value[key])) &&
+      (value.knowledgeMessageId === null || string(value.knowledgeMessageId)) && array(value.resolutions, item =>
+        resolution(item, ["answered", "partial", "rejected", "failed"], ["supportIds", "provenance"]) && strings(item.supportIds) && object(item.provenance) &&
+        (item.provenance.kind === "direct" ? fields(item.provenance, ["kind", "planMessageId"]) && string(item.provenance.planMessageId) && item.supportIds.length === 0 :
+          item.provenance.kind === "delegated" && fields(item.provenance, ["kind", "knowledgeMessageId", "consultationId", "responses"]) &&
+          string(item.provenance.knowledgeMessageId) && string(item.provenance.consultationId) && array(item.provenance.responses, response =>
+            fields(response, ["consultationId", "assignmentId", "messageId", "status"]) && string(response.consultationId) &&
+            optional(response, "assignmentId", string) && optional(response, "messageId", string) && ["completed", "failed"].includes(response.status))));
+    case "control": return keys(value, ["kind", "id", "order", "action", "text", "author", "application"]) && integer(value.order) &&
+      ["context", "priorities", "finish", "stop"].includes(value.action) && optional(value, "text", unboundedText) &&
+      fields(value.author, ["coordinatorSessionId", "toolCallId"]) && string(value.author.coordinatorSessionId) && string(value.author.toolCallId) && object(value.application) &&
+      (value.application.state === "pending" ? keys(value.application, ["state"]) : value.application.state === "applied" && keys(value.application, ["state", "stage", "round"]) && architectureStage(value.application.stage) && integer(value.application.round));
+    case "failure": return keys(value, ["kind", "id", "phase", "error", "memberId", "assignmentId", "stage", "round"]) &&
+      ["preparation", "admission", "turn", "disband", "director-close"].includes(value.phase) && unboundedText(value.error) &&
+      ["memberId", "assignmentId"].every(key => optional(value, key, string)) && optional(value, "stage", item => architectureStages.includes(item)) && optional(value, "round", integer);
+    case "outcome": return keys(value, ["kind", "id", "source", "status", "content"]) && value.id === "final" && value.source === "background-settlement" &&
+      ["completed", "failed", "cancelled"].includes(value.status) && object(value.content) && (value.content.kind === "text" ? keys(value.content, ["kind", "text"]) && unboundedText(value.content.text) :
+        value.content.kind === "synthesis" && keys(value.content, ["kind", "body"]) && value.content.body?.kind === "synthesis" && isPublicArchitectureBody(value.content.body));
+    default: return false;
+  }
+}
+function architectureFragment(value) {
+  return fields(value, ["kind", "recordId", "encoding", "byteOffset", "totalBytes", "data"]) && value.kind === "fragment" && string(value.recordId) &&
+    value.encoding === "base64-json" && integer(value.byteOffset) && integer(value.totalBytes) && value.byteOffset < value.totalBytes &&
+    typeof value.data === "string" && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value.data) &&
+    Buffer.from(value.data, "base64").length > 0 && Buffer.from(value.data, "base64").length <= 12 * 1024 && value.byteOffset + Buffer.from(value.data, "base64").length <= value.totalBytes;
+}
+function architectureReply(value, method, owner) {
+  if (!object(value)) return false;
+  if (value.state !== "ready") return value.state === "unavailable" ? keys(value, ["state", "reason"]) &&
+    ["not_captured", "snapshot_oversized", ...(method === "architecture.read" ? ["unknown_room"] : [])].includes(value.reason) :
+    keys(value, ["state"]) && ["stale_owner", "stale_cursor", "invalid_cursor"].includes(value.state);
+  if (Buffer.byteLength(JSON.stringify(value)) > 40 * 1024 || value.format !== "architecture-public-v1" || !string(value.snapshotId) || !integer(value.cut) ||
+      !(value.next === null || architectureCursor(value.next))) return false;
+  if (method === "architecture.list") return keys(value, ["format", "state", "owner", "snapshotId", "cut", "items", "next"]) && isOwner(value.owner) && sameOwner(value.owner, owner) &&
+    array(value.items, item => fields(item, ["ref", "mode", "director", "lifecycle"]) && isArchitectureRef(item.ref) && sameOwner(item.ref, owner) &&
+      ["table", "consultation"].includes(item.mode) && architectureIdentity(item.director) && architectureLifecycle(item.lifecycle));
+  return keys(value, ["format", "state", "ref", "snapshotId", "cut", "capture", "records", "next"]) && isArchitectureRef(value.ref) && sameOwner(value.ref, owner) &&
+    fields(value.capture, ["state", "finalCut", "gaps"]) && ["open", "closed", "incomplete"].includes(value.capture.state) &&
+    (value.capture.finalCut === null || integer(value.capture.finalCut) && value.capture.finalCut <= value.cut) && array(value.capture.gaps, item => ["not_captured", "capture_failed"].includes(item)) &&
+    array(value.records, item => isArchitectureRecord(item) || architectureFragment(item));
 }

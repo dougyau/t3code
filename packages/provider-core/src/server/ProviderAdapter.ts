@@ -559,6 +559,15 @@ export interface ProviderAdapterV2McpApps {
   }) => Effect.Effect<{ readonly contents: ReadonlyArray<unknown> }, ProviderAdapterV2Error>;
 }
 
+/** Owner-global passive residency observation, independent of launch admission. */
+export type ProviderBackgroundPending =
+  | { readonly state: "pending" }
+  | { readonly state: "none" }
+  | {
+      readonly state: "unavailable";
+      readonly reason: "unsupported" | "stale_owner" | "source_unavailable";
+    };
+
 /** Internal passive source. Only the ordered run subscriber admits launch membership. */
 export interface ProviderNativeWorkersPort {
   readonly ownerGeneration: number;
@@ -573,6 +582,8 @@ export interface ProviderNativeWorkersPort {
   ) => Effect.Effect<ProviderNativeWorkerBatch, Error>;
   /** Call only with launches already admitted by the ordered subscriber. */
   readonly hasPendingWork: (admitted: ReadonlyArray<PiNativeWorkerLaunch>) => Effect.Effect<boolean>;
+  /** Owner-global residency only; never root-stream liveness or launch admission. */
+  readonly readBackgroundPending: () => Effect.Effect<ProviderBackgroundPending>;
 }
 
 export interface ProviderNativeWorkerBatch {

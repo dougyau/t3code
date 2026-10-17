@@ -237,7 +237,7 @@ interface LiveSessionEntry {
   readonly busyTurns: ReadonlySet<string>;
   readonly lastActivityAtMs: number;
   readonly idleFiber: Fiber.Fiber<void, never> | null;
-  /** Set when idle release is deferred for pending background work; bounds total deferral. */
+  /** Native: first unknown-only idle observation. Legacy: first pending-work defer. */
   readonly pinnedSinceMs: number | null;
   /**
    * Shared runtimes only: the provider thread each attached app thread last
@@ -922,10 +922,14 @@ export const layerWithOptions = (
       const removeLiveEntry = (input: {
         readonly providerSessionId: ProviderSessionId;
         readonly onlyIfIdleGeneration?: number;
+        readonly idleFence?: (entry: LiveSessionEntry) => boolean;
       }): Effect.Effect<readonly [Option.Option<LiveSessionEntry>, DateTime.Utc]> =>
         Effect.gen(function* () {
           const key = sessionKey(input.providerSessionId);
           const candidate = (yield* Ref.get(sessions)).get(key);
+          if (candidate !== undefined && input.idleFence !== undefined && !input.idleFence(candidate)) {
+            return [Option.none<LiveSessionEntry>(), yield* DateTime.now] as const;
+          }
           if (candidate !== undefined) rememberNativeOwner(candidate);
           if (candidate === undefined) {
             return [Option.none<LiveSessionEntry>(), yield* DateTime.now] as const;
@@ -937,9 +941,10 @@ export const layerWithOptions = (
                 return [existing === undefined ? "gone" : "changed", current] as const;
               }
               if (
-                input.onlyIfIdleGeneration !== undefined &&
-                (existing.busyTurns.size > 0 ||
-                  existing.idleGeneration !== input.onlyIfIdleGeneration)
+                (input.onlyIfIdleGeneration !== undefined &&
+                  (existing.busyTurns.size > 0 ||
+                    existing.idleGeneration !== input.onlyIfIdleGeneration)) ||
+                (input.idleFence !== undefined && !input.idleFence(existing))
               ) {
                 return ["kept", current] as const;
               }
@@ -951,7 +956,8 @@ export const layerWithOptions = (
             DateTime.now,
           ).pipe(candidate.requestEventPermit.withPermits(1));
           const [outcome, releasedAt] = removed;
-          // Another entry took this id while the permit was held; release it instead.
+          // Explicit closes may follow a changed entry; an idle retry keeps its
+          // original fence and must never adopt a replacement.
           if (outcome === "changed") return yield* removeLiveEntry(input);
           return [
             outcome === "removed" ? Option.some(candidate) : Option.none<LiveSessionEntry>(),
@@ -1004,6 +1010,7 @@ export const layerWithOptions = (
         readonly detail?: string;
         readonly cancelIdleFiber?: boolean;
         readonly onlyIfIdleGeneration?: number;
+        readonly idleFence?: (entry: LiveSessionEntry) => boolean;
         readonly gracefulSubscribers?: boolean;
       }) =>
         Effect.acquireUseRelease(
@@ -1125,13 +1132,31 @@ export const layerWithOptions = (
           ) {
             return;
           }
-          // Capture runtime identity before yielding: a replacement session
-          // can reuse the same providerSessionId while this fiber is parked.
           const probedRuntime = entry.runtime;
+          if (probedRuntime.nativeWorkers !== undefined) {
+            const targetValid = (latest: LiveSessionEntry) =>
+              latest.runtime === probedRuntime && latest.busyTurns.size === 0 &&
+              latest.idleGeneration === input.generation;
+            const decision = yield* nativeIdleDecision(entry, targetValid);
+            if (decision.kind === "stale") return;
+            if (decision.kind === "retry") return yield* releaseIfStillIdle(input);
+            if (decision.kind === "defer") {
+              yield* Effect.sleep(Duration.millis(decision.delayMs));
+              return yield* releaseIfStillIdle(input);
+            }
+            yield* releaseEntry({
+              providerSessionId: input.providerSessionId, reason: "idle_timeout",
+              cancelIdleFiber: false, onlyIfIdleGeneration: input.generation,
+              idleFence: decision.fence,
+            }).pipe(logReleaseFailure(input.providerSessionId));
+            // A permit wait may invalidate the observation without replacing the
+            // idle cycle. That cycle still owns its next evaluation.
+            const latest = (yield* Ref.get(sessions)).get(key);
+            if (latest !== undefined && targetValid(latest)) return yield* releaseIfStillIdle(input);
+            return;
+          }
           const hasPendingWork =
-            probedRuntime.nativeWorkers !== undefined
-              ? yield* nativeWorkersPending(probedRuntime)
-              : probedRuntime.hasPendingBackgroundWork === undefined
+            probedRuntime.hasPendingBackgroundWork === undefined
               ? false
               : yield* probedRuntime.hasPendingBackgroundWork.pipe(
                   Effect.catchCause(() => Effect.succeed(false)),
@@ -1183,6 +1208,7 @@ export const layerWithOptions = (
             reason: "idle_timeout",
             cancelIdleFiber: false,
             onlyIfIdleGeneration: input.generation,
+            idleFence: (latest) => latest.runtime === probedRuntime,
           }).pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("orchestration-v2.driver-session.idle-release-failed", {
@@ -1208,9 +1234,8 @@ export const layerWithOptions = (
           ),
         );
 
-      // Provider activity restarts the pin budget, so background work that keeps
-      // reporting progress (a long Claude workflow) is never cut off; only work
-      // that went silent for maxIdlePinMs is released.
+      // Provider progress restarts legacy pending-work caps and native unknown
+      // episodes. Confirmed native work itself has no deadline.
       const scheduleIdleReleaseInternal = (
         providerSessionId: ProviderSessionId,
         options?: { readonly providerActivity?: boolean },
@@ -1267,6 +1292,11 @@ export const layerWithOptions = (
               updated.set(sessionKey(providerSessionId), {
                 ...entry,
                 lastActivityAtMs,
+                // Native unloads share this pin even while a sibling is busy,
+                // when scheduleIdleReleaseInternal has no timer to restart.
+                ...(options?.providerActivity === true && entry.runtime.nativeWorkers !== undefined
+                  ? { pinnedSinceMs: null }
+                  : {}),
               });
               return updated;
             });
@@ -1634,24 +1664,31 @@ export const layerWithOptions = (
                 !entry.attachedThreadIds.has(input.threadId) ||
                 hasBusyTurn(entry, pending.providerThread.id)
               ) {
-                return "skipped" as const;
+                return { kind: "skipped" } as const;
               }
-              // Unloading stops the native thread's background terminals, so a
-              // thread still running background work stays loaded.
-              const hasPendingWork =
-                entry.runtime.nativeWorkers !== undefined
-                  ? yield* nativeWorkersPending(entry.runtime, pending.providerThread)
-                  : entry.runtime.hasPendingBackgroundWorkForThread === undefined
+              const targetValid = (latest: LiveSessionEntry) =>
+                latest.runtime === entry.runtime &&
+                latest.attachedThreadIds.has(input.threadId) &&
+                latest.idleThreadUnloads.get(input.threadId) === pending &&
+                !hasBusyTurn(latest, pending.providerThread.id);
+              let fence = targetValid;
+              if (entry.runtime.nativeWorkers !== undefined) {
+                const decision = yield* nativeIdleDecision(entry, targetValid);
+                if (decision.kind === "stale") return { kind: "skipped" } as const;
+                if (decision.kind === "retry") return { kind: "retry" } as const;
+                if (decision.kind === "defer") return decision;
+                fence = decision.fence;
+              } else {
+                const hasPendingWork = entry.runtime.hasPendingBackgroundWorkForThread === undefined
                   ? false
-                  : yield* entry.runtime
-                      .hasPendingBackgroundWorkForThread(pending.providerThread)
+                  : yield* entry.runtime.hasPendingBackgroundWorkForThread(pending.providerThread)
                       .pipe(Effect.catchCause(() => Effect.succeed(false)));
-              if (hasPendingWork) return "deferred" as const;
+                if (hasPendingWork) return { kind: "defer", delayMs: idleTimeoutMs } as const;
+              }
               const unloading = yield* Ref.modify(sessions, (current) => {
                 const latest = current.get(key);
                 if (
-                  latest?.runtime !== entry.runtime ||
-                  latest.idleThreadUnloads.get(input.threadId)?.generation !== input.generation
+                  latest === undefined || !fence(latest)
                 ) {
                   return [false, current] as const;
                 }
@@ -1669,7 +1706,7 @@ export const layerWithOptions = (
                 });
                 return [true, updated] as const;
               });
-              if (!unloading) return "skipped" as const;
+              if (!unloading) return { kind: "retry" } as const;
               yield* unloadThread({ providerThread: pending.providerThread }).pipe(
                 Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
                 Effect.catchCause((cause) =>
@@ -1681,13 +1718,15 @@ export const layerWithOptions = (
                   }),
                 ),
               );
-              return "unloaded" as const;
+              return { kind: "unloaded" } as const;
             }),
           );
           // Re-check on this fiber after another idle window, outside the
           // lock so the thread's next attach is not held up meanwhile.
-          if (outcome === "deferred") {
-            yield* Effect.sleep(Duration.millis(idleTimeoutMs));
+          if (outcome.kind === "defer") {
+            yield* Effect.sleep(Duration.millis(outcome.delayMs));
+          }
+          if (outcome.kind === "defer" || outcome.kind === "retry") {
             return yield* unloadIdleThread(input);
           }
         });
@@ -1777,6 +1816,7 @@ export const layerWithOptions = (
               hints: runtime.nativeWorkers.hints,
               reconcile: runtime.nativeWorkers.reconcile, read: runtime.nativeWorkers.read,
               hasPendingWork: runtime.nativeWorkers.hasPendingWork,
+              readBackgroundPending: runtime.nativeWorkers.readBackgroundPending,
             },
             hasPendingBackgroundWork: nativeWorkersPending(runtime),
             hasPendingBackgroundWorkForThread: (thread: OrchestrationV2ProviderThread) =>
@@ -1980,6 +2020,100 @@ export const layerWithOptions = (
           snapshot.generation === port.ownerGeneration && NodeUtil.isDeepStrictEqual(snapshot.owner, port.owner))) return;
         entry.nativeWorkerOwners.push({ owner: port.owner, generation: port.ownerGeneration });
       };
+
+      // These reads are residency-only: the boolean ingestion/stream helper
+      // below deliberately keeps its admitted-member semantics.
+      const residencySource = <E>(effect: Effect.Effect<ProviderAdapter.ProviderBackgroundPending, E>) =>
+        effect.pipe(Effect.catchCause((cause) => Cause.hasInterrupts(cause)
+          ? Effect.interrupt
+          : Effect.succeed<ProviderAdapter.ProviderBackgroundPending>({
+              state: "unavailable", reason: "source_unavailable",
+            })));
+
+      const readNativeResidency = Effect.fnUntraced(function* (
+        runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        port: ProviderAdapter.ProviderNativeWorkersPort,
+        owner: ProviderAdapter.ProviderNativeWorkersPort["owner"],
+        ownerGeneration: number,
+      ) {
+        const ordinary = () => residencySource((runtime.hasPendingBackgroundWork ?? Effect.succeed(false))
+          .pipe(Effect.map((pending): ProviderAdapter.ProviderBackgroundPending => ({ state: pending ? "pending" : "none" }))));
+        const local = () => residencySource(Effect.gen(function* () {
+          const members = yield* eventSink.nativeWorkers(runtime.providerSessionId);
+          let unknown = false;
+          for (const member of members) {
+            if (member.nativeWorker === undefined) continue;
+            const childThreadId = member.childThreadId;
+            if (childThreadId === null) {
+              unknown = true;
+              continue;
+            }
+            const state = yield* residencySource(Effect.gen(function* () {
+              const child = yield* projectionStore.getThreadRecords(childThreadId, ["providerThreads"]);
+              const checkpoint = child.providerThreads.find((row) => row.id === member.providerThreadId)
+                ?.nativeMetadata?.nativeWorkerCheckpoint;
+              if (checkpoint === undefined) return { state: "unavailable", reason: "source_unavailable" } as const;
+              if (checkpoint.ownerGeneration !== ownerGeneration ||
+                !NodeUtil.isDeepStrictEqual(checkpoint.owner, owner)) return { state: "none" } as const;
+              const pending = checkpoint.capture === "opening" || checkpoint.capture === "open" ||
+                checkpoint.bindingCursors.some((saved) => !saved.omission && (saved.more || saved.fragment)) ||
+                checkpoint.bindings.some((binding) => !checkpoint.bindingCursors.some((saved) =>
+                  saved.generation === binding.generation));
+              return { state: pending ? "pending" : "none" } as const;
+            }));
+            if (state.state === "pending") return state;
+            if (state.state === "unavailable") unknown = true;
+          }
+          return unknown ? { state: "unavailable", reason: "source_unavailable" } as const : { state: "none" } as const;
+        }));
+        const beforeOrdinary = yield* ordinary();
+        const beforeLocal = yield* local();
+        const native = yield* residencySource(port.readBackgroundPending());
+        // Work can commit while the native RPC is outstanding.
+        const afterOrdinary = yield* ordinary();
+        const afterLocal = yield* local();
+        const states = [beforeOrdinary, beforeLocal, native, afterOrdinary, afterLocal];
+        return states.find((state) => state.state === "pending") ??
+          states.find((state) => state.state === "unavailable") ?? { state: "none" } as const;
+      });
+
+      const nativeIdleDecision = Effect.fnUntraced(function* (
+        entry: LiveSessionEntry,
+        targetValid: (latest: LiveSessionEntry) => boolean,
+      ) {
+        const port = entry.runtime.nativeWorkers!;
+        const currentOwner = port.owner;
+        const owner = currentOwner === undefined ? undefined : { ...currentOwner };
+        const ownerGeneration = port.ownerGeneration;
+        const observation = yield* readNativeResidency(entry.runtime, port, owner, ownerGeneration);
+        const now = yield* Clock.currentTimeMillis;
+        const sameObservation = (latest: LiveSessionEntry, pin: number | null) =>
+          targetValid(latest) && latest.runtime.nativeWorkers === port &&
+          port.ownerGeneration === ownerGeneration && NodeUtil.isDeepStrictEqual(port.owner, owner) &&
+          latest.idleGeneration === entry.idleGeneration && latest.busyTurns === entry.busyTurns &&
+          latest.lastActivityAtMs === entry.lastActivityAtMs && latest.pinnedSinceMs === pin;
+        return yield* Ref.modify(sessions, (current): readonly [
+          { readonly kind: "stale" } | { readonly kind: "retry" } |
+          { readonly kind: "defer"; readonly delayMs: number } |
+          { readonly kind: "act"; readonly fence: (live: LiveSessionEntry) => boolean },
+          Map<string, LiveSessionEntry>
+        ] => {
+          const key = sessionKey(entry.runtime.providerSessionId);
+          const latest = current.get(key);
+          if (latest === undefined || !targetValid(latest)) return [{ kind: "stale" } as const, current];
+          if (!sameObservation(latest, entry.pinnedSinceMs)) return [{ kind: "retry" } as const, current];
+          const pinnedSinceMs = observation.state === "unavailable" ? latest.pinnedSinceMs ?? now : null;
+          const updated = new Map(current);
+          updated.set(key, { ...latest, pinnedSinceMs });
+          const remaining = pinnedSinceMs === null ? 0 : maxIdlePinMs - (now - pinnedSinceMs);
+          if (observation.state === "pending" || (observation.state === "unavailable" && remaining > 0)) {
+            return [{ kind: "defer", delayMs: observation.state === "pending" ? idleTimeoutMs : Math.min(idleTimeoutMs, remaining) } as const, updated];
+          }
+          // Keep an expired episode for sibling unloads. Only certainty or real
+          // activity may clear it; a thread removal is neither.
+          return [{ kind: "act", fence: (live: LiveSessionEntry) => sameObservation(live, pinnedSinceMs) } as const, updated];
+        });
+      });
 
       const nativeWorkersPending = (
         runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,

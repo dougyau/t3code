@@ -15,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 import type {
   ProviderNativeWorkersPort,
+  ProviderBackgroundPending,
   ProviderNativeWorkerBatch,
 } from "@t3tools/provider-core/server/ProviderAdapter";
 import {
@@ -790,6 +791,23 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
           };
         }),
       catch: errorOf,
+    });
+
+  readonly readBackgroundPending = (): Effect.Effect<ProviderBackgroundPending> =>
+    Effect.promise(async () => {
+      const generation = this.generation;
+      try {
+        return await this.withClient((client) => client.backgroundPending());
+      } catch (cause) {
+        return {
+          state: "unavailable",
+          reason:
+            generation !== this.generation || this.closed || this.state === "stale_owner" ||
+            (cause instanceof BridgeError && cause.code === "stale_owner")
+              ? "stale_owner"
+              : "source_unavailable",
+        };
+      }
     });
 
   /** No roster admission: the server supplies its committed launch set. */
