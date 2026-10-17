@@ -1,11 +1,15 @@
+import type { BackgroundPending } from "./protocol.js";
+export type { BackgroundPending } from "./protocol.js";
+import type { ArchitectureRef, ArchitectureRead, ArchitectureCatalog } from "./protocol.js";
 import type { Owner, WorkerList, Capability, Notification, WorkerReadReference, WorkerReadCursor, WorkerDetail, WorkerRequests, WorkerActivity, WorkerResult } from "./protocol.js";
 import type { HistoryListOptions, HistoryReadOptions, HistoryPage, HistoryMetadata, RoutePage, PublicWorkerDetail } from "./protocol.js";
 import type { ClientLease, ResumeLease } from "./protocol.js";
 import type { PublicConversationPage, PublicWorkerResult, Availability } from "./protocol.js";
 export type { PublicConversationPage, PublicWorkerResult, PublicRecord, PublicFragment, PublicBinding, PublicGap, PublicContent } from "./protocol.js";
-export type { ClientLease, ResumeLease, PublicLaunch, PublicWorkerDetail } from "./protocol.js";
+export type { TeamMetadata, ClientLease, ResumeLease, PublicLaunch, PublicWorkerDetail } from "./protocol.js";
 export type { WorkerReadReference, WorkerReadCursor, WorkerDetail, WorkerRequests, WorkerActivity, WorkerResult } from "./protocol.js";
 export type { HistoryListOptions, HistoryReadOptions, HistoryPage, HistoryMetadata, HistoryFragment, RoutePage } from "./protocol.js";
+export type { ArchitectureRef, ArchitectureRead, ArchitectureCatalog, ArchitectureRecord, ArchitecturePage, ArchitectureFragment, ArchitectureLifecycle, PublicArchitectureBody, PublicArchitectureMessage, PublicKnowledgeBoundary, PublicSynthesisBody } from "./protocol.js";
 export class BridgeError extends Error { readonly code: string; constructor(code: string, message: string); }
 /** Every hint requires refresh. Gaps are not replayed; refresh again on reconnect. */
 export type ChangeHint = Readonly<Notification & { gap: boolean }>;
@@ -22,7 +26,12 @@ export interface BridgeClient {
   readonly capabilities: readonly Capability[];
   /** Private reconnect credential. Never put in model context. */
   readonly lease: Readonly<ClientLease>;
-  /** Carry the first page revision on continuation; stale_cursor requires a fresh first page. */
+  /** Passive instant snapshot; unavailable is never absence. */
+  backgroundPending(): Promise<BackgroundPending>;
+  /** Opaque cursors continue a frozen cut; omit the cursor to refresh. */
+  listArchitectures(cursor?: string): Promise<ArchitectureCatalog>;
+  readArchitecture(ref: ArchitectureRef, cursor?: string): Promise<ArchitectureRead>;
+  /** Carry the first page revision on worker-list continuation. */
   list(after?: string, revision?: number): Promise<WorkerList>;
   subscribe(listener: (hint: ChangeHint) => void): Promise<BridgeSubscription>;
   detail(id: string, cursor?: WorkerReadCursor): Promise<WorkerDetail>;

@@ -1,13 +1,16 @@
 export interface Owner { processId: string; coordinatorSessionId: string; epoch: string }
 export type Capability = "workers.list" | "workers.detail" | "workers.requests" | "workers.activity" | "workers.result" | "subscribe" | "unsubscribe" |
-  "history.list" | "history.read" | "route.read" | "workers.detail.public-v1" | "workers.activity.public-v1" | "workers.result.public-v1";
+  "history.list" | "history.read" | "route.read" | "workers.detail.public-v1" | "workers.activity.public-v1" | "workers.result.public-v1" | "architecture.list" | "architecture.read" | "architecture.public-v1" | "background.pending";
+export type BackgroundPending = { state: "pending" } | { state: "none" } |
+  { state: "unavailable"; reason: "unsupported" | "stale_owner" | "source_unavailable" };
 export interface ClientLease { clientId: string; resumeToken: string }
 export type ResumeLease = Pick<ClientLease, "clientId" | "resumeToken">;
 export interface Descriptor {
   version: 2; transport: "unix"; socket: string; token: string; owner: Owner;
   capabilities: readonly Capability[];
 }
-export interface PublicLaunch {
+export interface TeamMetadata { teamId?: string; memberId?: string; turnId?: string }
+export interface PublicLaunch extends TeamMetadata {
   source: "agent_spawn" | "team_assign"; instanceId: string; roleId: string;
   coordinatorSessionId: string | null; toolCallId: string | null; assignmentId?: string;
   acceptedAt: number; linkage: "tool" | "unlinked";
@@ -77,6 +80,7 @@ export interface PublicWorkerDetail {
 }
 /** Wire metadata only; no Pi or controller dependency in native consumer types. */
 export interface SdkRequest {
+  turnId?: string;
   attemptId?: string; historyId?: string; sessionId?: string;
   sdkOptions?: { reasoning?: string; temperature?: number; maxTokens?: number; serviceTier?: string };
   model: string; provider?: string; requestId?: string; inputTokens?: number | null; outputTokens?: number | null;
@@ -84,7 +88,7 @@ export interface SdkRequest {
   returned_service_tier: "unavailable"; time_to_first_model_output_ms: number | "unavailable";
   time_to_first_model_output_unavailable_reason?: "cancelled" | "failed";
 }
-export interface WorkerListItem {
+export interface WorkerListItem extends TeamMetadata {
   id: string; roleId: string; status: "created" | "running" | "completed" | "failed" | "cancelled";
   source?: "agent_run" | "agent_spawn" | "team_assign"; assignmentId?: string;
   task: string; selectedModel: string; requestedModel?: string; requestedReasoning?: string;
@@ -150,7 +154,7 @@ export type HistoryReadOptions = HistoryListOptions & { historyId: string; group
 /** Metadata is provenance, not a filesystem capability. Extra catalog fields remain opaque. */
 export type HistoryMetadata = {
   kind: "member"; groupId: string; historyId: string; roleId: string; coordinatorSessionId: string;
-  instanceId?: string; assignmentId?: string; attemptId?: string;
+  instanceId?: string; assignmentId?: string; attemptId?: string; teamId?: string; memberId?: string; turnId?: string;
   native: { state: "not-created" | "pruned" } |
     { state: "allocated"; sessionId: string; disposition: { state: "pending" } |
       { state: "disposed"; at: string } | { state: "unknown"; reason: string } };
@@ -165,6 +169,9 @@ export type HistoryPage<T = HistoryFragment> = {
 };
 export type RoutePage = { state: "captured" | "not-routed" | "unavailable"; page: TextPage };
 export type Request = { version: 2; id: string; clientId: string; owner: Owner } & (
+  { method: "background.pending"; params: Record<string, never> } |
+  { method: "architecture.list"; params: { cursor?: string } } |
+  { method: "architecture.read"; params: { ref: ArchitectureRef; cursor?: string } } |
   { method: "connect"; params: { token: string; expectedSessionId: string; resumeToken?: string } } |
   { method: "workers.list"; params: { after?: string; revision?: number } } |
   { method: "subscribe"; params: Record<string, never> } |
@@ -185,7 +192,7 @@ export const errors: Readonly<Record<"invalid_request" | "unsupported_method" | 
   "invalid_cursor" | "stale_cursor" | "stale_reference" | "unknown_target" | "busy" | "oversized" | "lease_expired", string>>;
 export type ErrorCode = keyof typeof errors;
 export type Reply = { version: 2; id: string; clientId: string; owner: Owner } & (
-  { ok: true; result: WorkerList | WorkerDetail | WorkerRequests | WorkerActivity | WorkerResult | Subscription |
+  { ok: true; result: BackgroundPending | ArchitectureCatalog | ArchitectureRead | WorkerList | WorkerDetail | WorkerRequests | WorkerActivity | WorkerResult | Subscription |
     HistoryPage | HistoryPage<HistoryMetadata> | RoutePage | PublicWorkerDetail | PublicConversationPage | PublicWorkerResult |
     { subscriptionId: string } | { capabilities: readonly Capability[]; lease: ClientLease } } |
   { ok: false; error: { code: ErrorCode; message: string } });
@@ -202,3 +209,56 @@ export function isReply(value: unknown, method: Request["method"], format?: "pub
 export function isNotification(value: unknown): value is Notification;
 export function failure(request: Envelope, code: ErrorCode): Reply;
 export function success(request: Request, result: unknown): { version: 2; id: string; clientId: string; owner: Owner; ok: true; result: unknown };
+
+/** Passive Architecture export. These declarations load no runtime dependencies. */
+export interface ArchitectureRef extends Owner { kind: "architecture"; roomId: string }
+export type PublicArchitectureBody =
+  | { kind: "composition"; snapshotId: string; specialists: { candidateRef: string; mandate: string; reason: string }[] }
+  | { kind: "preparation"; analysis: string; doubts: { question: string; purpose: string }[] }
+  | { kind: "contribution"; proposal: string; arguments: string[]; objections: { memberId: string; messageId: string; argument: string }[]; doubts: { question: string; purpose: string }[] }
+  | { kind: "decision"; action: "continue" | "consult" | "synthesize" | "recompose"; reason: string }
+  | { kind: "answer"; answer: string; evidence: string[]; limits: string[]; doubts: { question: string; purpose: string }[] }
+  | { kind: "consultation-plan"; resolutions: { doubtId: string; status: "answered" | "rejected"; answer: string }[]; support: { role: "scout" | "researcher" | "oracle"; brief: string; doubtIds: string[]; prerequisites: number[] }[] }
+  | { kind: "consultation-response"; doubtIds: string[]; answer: string; evidence: string[]; limits: string[]; doubts: { question: string; purpose: string }[] }
+  | { kind: "knowledge"; resolutions: { doubtId: string; status: "answered" | "partial" | "rejected" | "failed"; answer: string; supportIds: string[] }[] }
+  | { kind: "synthesis"; status: "complete" | "partial" | "failed"; recommendation: string; alternatives: string[]; evidence: string[]; assumptions: string[]; disagreements: string[]; pending: string[] };
+export type PublicArchitectureStage = PublicArchitectureBody["kind"];
+export type PublicSynthesisBody = Extract<PublicArchitectureBody, { kind: "synthesis" }>;
+export interface PublicArchitectureMessage {
+  id: string; ordinal: number; roomId: string; assignmentId: string; memberId: string; author: string;
+  stage: PublicArchitectureStage; snapshotId: string; round?: number; turnId: string; attemptId: string;
+  body: PublicArchitectureBody; native: { historyId?: string; sessionId: string; toolCallId: string; persistence: "unconfirmed" };
+  doubts: { id: string; question: string; purpose: string }[];
+}
+export interface ArchitectureLifecycle {
+  stage: PublicArchitectureStage | "waiting" | "closing" | null; round: number;
+  protocolState: "starting" | "running" | "waiting" | "finished" | "failed" | "cancelled" | "closure-unknown";
+  outcome: "pending" | "available" | "unavailable";
+  closure: { state: "pending" | "released" | "unknown"; members: "not-created" | "pending" | "released" | "unknown"; director: "not-created" | "pending" | "released" | "unknown" };
+}
+export interface PublicKnowledgeBoundary {
+  kind: "knowledge-boundary"; id: string; ordinal: number; roomId: string; cycleId: string;
+  planMessageId: string; knowledgeMessageId: string | null;
+  resolutions: (Extract<PublicArchitectureBody, { kind: "knowledge" }>["resolutions"][number] & {
+    provenance: { kind: "direct"; planMessageId: string } | { kind: "delegated"; knowledgeMessageId: string; consultationId: string;
+      responses: { consultationId: string; assignmentId?: string; messageId?: string; status: "completed" | "failed" }[] };
+  })[];
+}
+export type ArchitectureRecord =
+  | PublicKnowledgeBoundary
+  | { kind: "room"; id: string; mode: "table" | "consultation"; origin: { coordinatorSessionId: string; tool: "architecture_start"; toolCallId: string; memberId: string; assignmentId: string; instanceId: string }; goalSource: { kind: "worker-workbrief"; instanceId: string }; lifecycle: ArchitectureLifecycle; pendingDoubtIds: string[] }
+  | { kind: "member"; id: string; assignmentId: string; instanceId: string; roleId: string; function: "director" | "specialist" | "support"; ordinal: number; admittedAt: number; mandate: { source: "root-workbrief"; instanceId: string } | { source: "TeamAssignment.task"; text: string }; execution: "accepted" | "running" | "completed" | "failed" | "cancelled"; workerRef?: WorkerReadReference; conversationRefs: WorkerReadReference[]; compositionMessageId?: string; supersededByCompositionId?: string }
+  | { kind: "publication"; id: string; message: PublicArchitectureMessage }
+  | { kind: "control"; id: string; order: number; action: "context" | "priorities" | "finish" | "stop"; text?: string; author: { coordinatorSessionId: string; toolCallId: string }; application: { state: "pending" } | { state: "applied"; stage: ArchitectureLifecycle["stage"]; round: number } }
+  | { kind: "failure"; id: string; phase: "preparation" | "admission" | "turn" | "disband" | "director-close"; error: string; memberId?: string; assignmentId?: string; stage?: PublicArchitectureStage; round?: number }
+  | { kind: "outcome"; id: "final"; source: "background-settlement"; status: "completed" | "failed" | "cancelled"; content: { kind: "synthesis"; body: PublicSynthesisBody } | { kind: "text"; text: string } };
+export interface ArchitectureFragment { kind: "fragment"; recordId: string; encoding: "base64-json"; byteOffset: number; totalBytes: number; data: string }
+export type ArchitectureAvailability = { state: "unavailable"; reason: "unknown_room" | "not_captured" | "snapshot_oversized" } | { state: "stale_owner" | "stale_cursor" | "invalid_cursor" };
+export interface ArchitectureCatalogItem { ref: ArchitectureRef; mode: "table" | "consultation"; director: { memberId: string; assignmentId: string; instanceId: string }; lifecycle: ArchitectureLifecycle }
+export interface ArchitectureCatalogPage { format: "architecture-public-v1"; state: "ready"; owner: Owner; snapshotId: string; cut: number; items: ArchitectureCatalogItem[]; next: string | null }
+export type ArchitectureCatalog = ArchitectureCatalogPage | { state: "unavailable"; reason: "not_captured" | "snapshot_oversized" } | { state: "stale_owner" | "stale_cursor" | "invalid_cursor" };
+export interface ArchitecturePage { format: "architecture-public-v1"; state: "ready"; ref: ArchitectureRef; snapshotId: string; cut: number; capture: { state: "open" | "closed" | "incomplete"; finalCut: number | null; gaps: ("not_captured" | "capture_failed")[] }; records: (ArchitectureRecord | ArchitectureFragment)[]; next: string | null }
+export type ArchitectureRead = ArchitecturePage | ArchitectureAvailability;
+export function isArchitectureRef(value: unknown): value is ArchitectureRef;
+export function isArchitectureRecord(value: unknown): value is ArchitectureRecord;
+export function isPublicArchitectureBody(value: unknown): value is PublicArchitectureBody;

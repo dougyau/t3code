@@ -5,11 +5,11 @@ import * as NodePath from "node:path";
 import * as NodeNet from "node:net";
 import * as Effect from "effect/Effect";
 import { connect, type BridgeClient } from "./pitako/bridge/client.js";
-import { capabilities, failure, isRequest, success, type ErrorCode, type ResumeLease, type Request } from "./pitako/bridge/protocol.js";
+import { capabilities, failure, isRequest, success, type Capability, type ErrorCode, type ResumeLease, type Request } from "./pitako/bridge/protocol.js";
 import { frame, frames } from "./pitako/framing.js";
 
 /** Authenticated wire fixture, not a broker/controller or provider runtime. Every socket is joined on release. */
-export const workerWireFixture = (owner: BridgeClient["owner"], ownedDirectory?: string) => Effect.acquireRelease(
+export const workerWireFixture = (owner: BridgeClient["owner"], ownedDirectory?: string, advertised: readonly Capability[] = capabilities) => Effect.acquireRelease(
   Effect.promise(async () => {
     const directory = ownedDirectory ?? NodeFS.mkdtempSync(NodePath.join(NodeFS.realpathSync(NodeOS.tmpdir()), "pw-wire-"));
     const socketPath = NodePath.join(directory, "b.sock");
@@ -22,6 +22,7 @@ export const workerWireFixture = (owner: BridgeClient["owner"], ownedDirectory?:
     const policy = {
       resumeError: undefined as ErrorCode | undefined, malformed: false,
       subscribeError: false,
+      pendingError: undefined as ErrorCode | undefined,
       reply: undefined as ((request: Request) => unknown) | undefined,
       roster: { owner, revision: 1, cursor: null, items: [] } as unknown,
       pageError: undefined as ErrorCode | undefined,
@@ -39,7 +40,7 @@ export const workerWireFixture = (owner: BridgeClient["owner"], ownedDirectory?:
             throw new Error("Unauthenticated fixture client");
           socket.write(frame(value.params.resumeToken && policy.resumeError
             ? failure(value, policy.resumeError)
-            : success(value, { capabilities, lease: {
+            : success(value, { capabilities: advertised, lease: {
                 clientId: value.clientId, resumeToken: "b".repeat(64),
               } })));
         } else if (policy.malformed) {
@@ -53,8 +54,12 @@ export const workerWireFixture = (owner: BridgeClient["owner"], ownedDirectory?:
           }));
         } else if (value.method === "unsubscribe") {
           socket.write(frame(success(value, { subscriptionId: value.params.subscriptionId })));
+        } else if (value.method === "background.pending" && policy.pendingError) {
+          socket.write(frame(failure(value, policy.pendingError)));
         } else if (policy.reply) {
-          socket.write(frame(success(value, policy.reply(value))));
+          void Promise.resolve(policy.reply(value)).then((result) => {
+            if (!socket.destroyed) socket.write(frame(success(value, result)));
+          });
         } else if (value.method === "workers.list") {
           socket.write(frame(policy.pageError ? failure(value, policy.pageError) : success(value, policy.roster)));
         } else throw new Error(`Unexpected fixture method: ${value.method}`);
@@ -69,7 +74,7 @@ export const workerWireFixture = (owner: BridgeClient["owner"], ownedDirectory?:
     NodeFS.chmodSync(socketPath, 0o600);
     // @effect-diagnostics-next-line preferSchemaOverJson:off -- Native descriptor fixture, consumed by the passive client's own boundary validation.
     NodeFS.writeFileSync(descriptor, JSON.stringify({
-      version: 2, transport: "unix", socket: socketPath, token, owner, capabilities,
+      version: 2, transport: "unix", socket: socketPath, token, owner, capabilities: advertised,
     }), { mode: 0o600 });
     const clients = new Set<BridgeClient>();
     const open = async (resume?: ResumeLease) => {

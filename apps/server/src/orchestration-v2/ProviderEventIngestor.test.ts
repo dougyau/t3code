@@ -1034,6 +1034,7 @@ layer("native worker persisted import", (it) => {
                 }),
               read: () => Effect.die("Importer only"),
               hasPendingWork: () => Effect.succeed(false),
+              readBackgroundPending: () => Effect.succeed({ state: "none" }),
             },
             events: Stream.fromIterable([
               {

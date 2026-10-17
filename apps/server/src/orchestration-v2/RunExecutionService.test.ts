@@ -2018,6 +2018,15 @@ it.effect(
             events: Stream.empty,
             // Session-wide stays true forever; the root must consult the
             // thread-scoped probe instead of being pinned by siblings.
+            nativeWorkers: {
+              owner: { processId: "root-process", coordinatorSessionId: "root-owner", epoch: "root-epoch" },
+              ownerGeneration: 1,
+              hints: Stream.never,
+              readBackgroundPending: () => Effect.succeed({ state: "pending" }),
+              hasPendingWork: () => Effect.die("Root stream must not read global native residency"),
+              reconcile: () => Effect.die("Root stream does not reconcile native workers"),
+              read: () => Effect.die("Root stream does not import native workers"),
+            } satisfies ProviderAdapter.ProviderNativeWorkersPort,
             hasPendingBackgroundWork: Effect.succeed(true),
             hasPendingBackgroundWorkForThread: (providerThread: OrchestrationV2ProviderThread) =>
               Effect.gen(function* () {

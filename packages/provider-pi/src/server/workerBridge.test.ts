@@ -2,6 +2,9 @@
 import * as NodeFS from "node:fs";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Cause from "effect/Cause";
+import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 import {
   PiWorkerBridge,
@@ -12,6 +15,7 @@ import {
 import { BridgeError } from "./pitako/bridge/client.js";
 import {
   errors,
+  capabilities,
   type PublicWorkerDetail,
   type PublicRecord,
   type PublicConversationPage,
@@ -1031,5 +1035,199 @@ describe("Pi native source ownership", () => {
           ),
         );
       }).pipe(Effect.scoped),
+  );
+});
+
+describe("owner-global background pending", () => {
+  it.effect.each([13, 16, 17])(
+    "negotiates canonical %s capabilities without probing old producers",
+    (count) =>
+      Effect.gen(function* () {
+        const bridge = new PiWorkerBridge("linux");
+        yield* Effect.addFinalizer(() => Effect.sync(() => bridge.cleanupDirectory(true)));
+        const wire = yield* workerWireFixture(
+          owner,
+          bridge.directory,
+          capabilities.slice(0, count),
+        );
+        yield* Effect.addFinalizer(() => bridge.close);
+        yield* bridge.bind("session");
+        for (const reply of [
+          { state: "pending" },
+          { state: "none" },
+          ...["unsupported", "stale_owner", "source_unavailable"].map((reason) => ({
+            state: "unavailable",
+            reason,
+          })),
+        ]) {
+          wire.policy.reply = () => reply;
+          assert.deepEqual(
+            yield* bridge.readBackgroundPending(),
+            count === 17
+              ? reply
+              : {
+                  state: "unavailable",
+                  reason: "unsupported",
+                },
+          );
+        }
+        assert.equal(
+          wire.calls.filter((method) => method === "background.pending").length,
+          count === 17 ? 5 : 0,
+        );
+        assert.deepEqual(bridge.owner, owner);
+        assert.isFalse(yield* bridge.hasPendingWork([]));
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("does not mistake incompatible descriptors or acquisition failure for absence", () =>
+    Effect.gen(function* () {
+      for (const advertised of [
+        capabilities.slice(0, 14),
+        [...capabilities, "future"],
+        capabilities.toReversed(),
+      ]) {
+        yield* Effect.gen(function* () {
+          const bridge = new PiWorkerBridge("linux");
+          yield* Effect.addFinalizer(() => Effect.sync(() => bridge.cleanupDirectory(true)));
+          const wire = yield* workerWireFixture(owner, bridge.directory);
+          yield* Effect.addFinalizer(() => bridge.close);
+          const descriptor = JSON.parse(NodeFS.readFileSync(wire.descriptor, "utf8"));
+          NodeFS.writeFileSync(
+            wire.descriptor,
+            JSON.stringify({ ...descriptor, capabilities: advertised }),
+          );
+          yield* bridge.bind("session");
+          assert.deepEqual(yield* bridge.readBackgroundPending(), {
+            state: "unavailable",
+            reason: "source_unavailable",
+          });
+          assert.deepEqual(wire.calls, ["connect"]);
+        }).pipe(Effect.scoped);
+      }
+      const absent = new PiWorkerBridge("win32");
+      assert.deepEqual(yield* absent.readBackgroundPending(), {
+        state: "unavailable",
+        reason: "source_unavailable",
+      });
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("rejects invalid replies without claiming none", () =>
+    Effect.gen(function* () {
+      for (const reply of [
+        { state: "unknown" },
+        { state: "none", extra: true },
+        { state: "unavailable", reason: "unknown" },
+        null,
+        false,
+      ]) {
+        yield* Effect.gen(function* () {
+          const bridge = new PiWorkerBridge("linux");
+          yield* Effect.addFinalizer(() => Effect.sync(() => bridge.cleanupDirectory(true)));
+          const wire = yield* workerWireFixture(owner, bridge.directory);
+          yield* Effect.addFinalizer(() => bridge.close);
+          yield* bridge.bind("session");
+          wire.policy.reply = () => reply;
+          assert.deepEqual(yield* bridge.readBackgroundPending(), {
+            state: "unavailable",
+            reason: "source_unavailable",
+          });
+        }).pipe(Effect.scoped);
+      }
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "preserves a healthy connection after operation rejection but not transport failure",
+    () =>
+      Effect.gen(function* () {
+        const bridge = new PiWorkerBridge("linux");
+        yield* Effect.addFinalizer(() => Effect.sync(() => bridge.cleanupDirectory(true)));
+        const wire = yield* workerWireFixture(owner, bridge.directory);
+        yield* Effect.addFinalizer(() => bridge.close);
+        yield* bridge.bind("session");
+        const generation = bridge.ownerGeneration;
+        wire.policy.pendingError = "busy";
+        assert.deepEqual(yield* bridge.readBackgroundPending(), {
+          state: "unavailable",
+          reason: "source_unavailable",
+        });
+        wire.policy.pendingError = undefined;
+        wire.policy.reply = () => ({ state: "pending" });
+        assert.deepEqual(yield* bridge.readBackgroundPending(), { state: "pending" });
+        assert.equal(bridge.ownerGeneration, generation);
+        assert.equal(wire.calls.filter((method) => method === "connect").length, 2);
+        wire.policy.malformed = true;
+        assert.deepEqual(yield* bridge.readBackgroundPending(), {
+          state: "unavailable",
+          reason: "source_unavailable",
+        });
+        wire.policy.malformed = false;
+        assert.deepEqual(yield* bridge.readBackgroundPending(), {
+          state: "unavailable",
+          reason: "source_unavailable",
+        });
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("fences a held response during retirement and permits an independent replacement", () =>
+    Effect.gen(function* () {
+      const bridge = new PiWorkerBridge("linux");
+      yield* Effect.addFinalizer(() => Effect.sync(() => bridge.cleanupDirectory(true)));
+      const wire = yield* workerWireFixture(owner, bridge.directory);
+      yield* Effect.addFinalizer(() => bridge.close);
+      yield* bridge.bind("session");
+      const entered = Promise.withResolvers<void>();
+      const reply = Promise.withResolvers<unknown>();
+      wire.policy.reply = () => {
+        entered.resolve();
+        return reply.promise;
+      };
+      const reading = yield* bridge.readBackgroundPending().pipe(Effect.forkChild);
+      yield* Effect.promise(() => entered.promise);
+      const generation = bridge.ownerGeneration;
+      yield* bridge.invalidate;
+      reply.resolve({ state: "none" });
+      assert.deepEqual(yield* Fiber.join(reading), { state: "unavailable", reason: "stale_owner" });
+      assert.equal(bridge.ownerGeneration, generation + 1);
+      assert.deepEqual(yield* bridge.readBackgroundPending(), {
+        state: "unavailable",
+        reason: "stale_owner",
+      });
+      wire.policy.reply = () => ({ state: "pending" });
+      yield* bridge.bind("session");
+      assert.deepEqual(yield* bridge.readBackgroundPending(), { state: "pending" });
+      assert.deepEqual(bridge.owner, owner);
+      yield* bridge.close;
+      assert.deepEqual(yield* bridge.readBackgroundPending(), {
+        state: "unavailable",
+        reason: "stale_owner",
+      });
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps Effect interruption as cancellation, joining tracked work on close", () =>
+    Effect.gen(function* () {
+      const bridge = new PiWorkerBridge("linux");
+      yield* Effect.addFinalizer(() => Effect.sync(() => bridge.cleanupDirectory(true)));
+      const wire = yield* workerWireFixture(owner, bridge.directory);
+      yield* Effect.addFinalizer(() => bridge.close);
+      yield* bridge.bind("session");
+      const entered = Promise.withResolvers<void>();
+      const reply = Promise.withResolvers<unknown>();
+      wire.policy.reply = () => {
+        entered.resolve();
+        return reply.promise;
+      };
+      const reading = yield* bridge.readBackgroundPending().pipe(Effect.exit, Effect.forkChild);
+      yield* Effect.promise(() => entered.promise);
+      yield* Fiber.interrupt(reading);
+      const exit = yield* Fiber.await(reading);
+      assert.isTrue(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause));
+      reply.resolve({ state: "none" });
+      yield* bridge.close;
+      assert.isUndefined(bridge.owner);
+    }).pipe(Effect.scoped),
   );
 });
