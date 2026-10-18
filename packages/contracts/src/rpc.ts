@@ -25,7 +25,7 @@ import * as Schema from "effect/Schema";
 import * as Rpc from "effect/rpc/Rpc";
 import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
-import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   CodexAuthCallbackInput,
   CodexAuthCallbackState,
@@ -326,6 +326,7 @@ import {
 import { UsagePricing, UsageReadError, UsageSummary, UsageSummaryInput } from "./usage.ts";
 import {
   StorageCleanupReport,
+  StorageCleanupReportEntry,
   ServerSettings,
   ServerSettingsError,
   ServerSettingsPatch,
@@ -482,6 +483,8 @@ export const WS_METHODS = {
   serverUpsertKeybinding: "server.upsertKeybinding",
   serverRemoveKeybinding: "server.removeKeybinding",
   serverRunStorageCleanup: "server.runStorageCleanup",
+  serverGetThreadWorktreeCleanupEligibility: "server.getThreadWorktreeCleanupEligibility",
+  serverRemoveDeletedThreadWorktree: "server.removeDeletedThreadWorktree",
   serverGetStorageCleanupReport: "server.getStorageCleanupReport",
   serverGetSettings: "server.getSettings",
   serverUpdateSettings: "server.updateSettings",
@@ -754,6 +757,30 @@ const WsServerRunStorageCleanupRpc = Rpc.make(WS_METHODS.serverRunStorageCleanup
   success: StorageCleanupReport,
   error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
 });
+
+/** Advisory only: deletion always rereads the deleted owner and every safety guard. */
+export const ThreadWorktreeCleanupEligibility = Schema.Union([
+  Schema.Struct({ eligible: Schema.Literal(true), worktreePath: Schema.String }),
+  Schema.Struct({ eligible: Schema.Literal(false), reason: Schema.String }),
+]);
+export type ThreadWorktreeCleanupEligibility = typeof ThreadWorktreeCleanupEligibility.Type;
+
+const WsServerGetThreadWorktreeCleanupEligibilityRpc = Rpc.make(
+  WS_METHODS.serverGetThreadWorktreeCleanupEligibility,
+  {
+    payload: Schema.Struct({ threadId: ThreadId }),
+    success: ThreadWorktreeCleanupEligibility,
+    error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
+  },
+);
+const WsServerRemoveDeletedThreadWorktreeRpc = Rpc.make(
+  WS_METHODS.serverRemoveDeletedThreadWorktree,
+  {
+    payload: Schema.Struct({ threadId: ThreadId, expectedWorktreePath: Schema.String }),
+    success: StorageCleanupReportEntry,
+    error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
+  },
+);
 const WsServerGetStorageCleanupReportRpc = Rpc.make(WS_METHODS.serverGetStorageCleanupReport, {
   payload: Schema.Struct({}),
   success: Schema.NullOr(StorageCleanupReport),
@@ -1901,6 +1928,8 @@ export const WsCoreRpcGroup = RpcGroup.make(
   WsServerUpsertKeybindingRpc,
   WsServerRemoveKeybindingRpc,
   WsServerRunStorageCleanupRpc,
+  WsServerGetThreadWorktreeCleanupEligibilityRpc,
+  WsServerRemoveDeletedThreadWorktreeRpc,
   WsServerGetStorageCleanupReportRpc,
   WsServerGetSettingsRpc,
   WsServerUpdateSettingsRpc,

@@ -13,6 +13,7 @@ import {
   ProviderInstanceId,
   ProviderDriverKind,
   AuthSourceControlWriteScope,
+  AuthOrchestrationReadScope,
   ThreadId,
   EnvironmentId,
   ScheduledTaskId,
@@ -62,6 +63,55 @@ const setup = Effect.gen(function* () {
 });
 
 describe("command permissions", () => {
+  it.effect(
+    "separates advisory read from directed deletion and rechecks destination revocation",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const registry = yield* setup;
+          const advisory = createCommandPermissions(
+            runtime,
+            WS_METHODS.serverGetThreadWorktreeCleanupEligibility,
+          );
+          const remove = createCommandPermissions(
+            runtime,
+            WS_METHODS.serverRemoveDeletedThreadWorktree,
+          );
+          registry.set(
+            sessions(env),
+            AsyncResult.success({
+              ...grant(false),
+              scopes: [AuthOrchestrationReadScope],
+              permissions: [AuthOrchestrationReadScope],
+            }),
+          );
+          yield* advisory.authorize(registry, env);
+          expect(registry.get(remove.permissionAtom(env))).toBe(false);
+          expect(
+            (yield* remove.authorize(registry, env).pipe(Effect.flip)).requiredPermission,
+          ).toBe(AuthSourceControlWriteScope);
+          registry.set(
+            sessions(other),
+            AsyncResult.success({
+              ...grant(false),
+              scopes: [AuthSourceControlWriteScope],
+              permissions: [AuthSourceControlWriteScope],
+            }),
+          );
+          expect(registry.get(remove.permissionAtom(other))).toBe(true);
+          yield* remove.authorize(registry, other);
+          // A grant on another environment never authorizes this destination.
+          expect((yield* remove.authorize(registry, env).pipe(Effect.flip))._tag).toBe(
+            "EnvironmentAuthorizationError",
+          );
+          registry.set(sessions(other), AsyncResult.success(grant(false)));
+          expect(registry.get(remove.permissionAtom(other))).toBe(false);
+          expect((yield* remove.authorize(registry, other).pipe(Effect.flip))._tag).toBe(
+            "EnvironmentAuthorizationError",
+          );
+        }),
+      ),
+  );
   it.effect(
     "separates provider administration from mixed settings writes at the destination",
     () =>

@@ -5,8 +5,89 @@ import {
   navigateAfterThreadDeletion,
   requestThreadUnpinConfirmation,
   ThreadArchiveBlockedError,
+  requestThreadWorktreeCleanup,
+  reportThreadWorktreeCleanup,
 } from "./useThreadActions";
 import { toastManager } from "../components/ui/toast";
+
+describe("manual checkout cleanup", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("offers the server-selected checkout and respects declining", async () => {
+    let prompt = "";
+    const eligibility = { eligible: true as const, worktreePath: "/checkout/feature" };
+    expect(
+      await requestThreadWorktreeCleanup({
+        eligibility,
+        canRemove: true,
+        confirm: async (message) => {
+          prompt = message;
+          return false;
+        },
+      }),
+    ).toBeNull();
+    expect(prompt).toContain("\nfeature\n");
+    expect(prompt).toContain("Safety checks may keep it");
+    expect(
+      await requestThreadWorktreeCleanup({
+        eligibility,
+        canRemove: true,
+        confirm: async () => true,
+      }),
+    ).toBe("/checkout/feature");
+  });
+
+  it.each([
+    { eligible: false as const, reason: "Automatic worktree cleanup is enabled" },
+    { eligible: false as const, reason: "Checkout has another owning thread" },
+  ])("does not offer an ineligible checkout: $reason", async (eligibility) => {
+    const confirm = vi.fn(async () => true);
+    expect(
+      await requestThreadWorktreeCleanup({
+        eligibility,
+        canRemove: true,
+        confirm,
+      }),
+    ).toBeNull();
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("does not offer deletion without the destination permission", async () => {
+    const confirm = vi.fn(async () => true);
+    expect(
+      await requestThreadWorktreeCleanup({
+        eligibility: { eligible: true, worktreePath: "/checkout/feature" },
+        canRemove: false,
+        confirm,
+      }),
+    ).toBeNull();
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it.each(["kept", "failed"] as const)(
+    "reports a %s checkout separately from successful thread deletion",
+    (outcome) => {
+      const addToast = vi.spyOn(toastManager, "add").mockReturnValue("cleanup-result");
+      reportThreadWorktreeCleanup({
+        kind: "worktree",
+        outcome,
+        reason: "Another owner exists",
+        path: "/checkout/feature",
+        threadId: ThreadId.make("deleted"),
+        threadTitle: "Deleted",
+        bytes: null,
+        files: null,
+      });
+      expect(addToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title:
+            outcome === "kept" ? "Worktree kept" : "Thread deleted, but worktree cleanup failed",
+          description: "Another owner exists",
+        }),
+      );
+    },
+  );
+});
 
 describe("navigateAfterThreadDeletion", () => {
   afterEach(() => vi.restoreAllMocks());

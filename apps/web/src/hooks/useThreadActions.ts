@@ -9,14 +9,13 @@ import { canSnooze, threadWokeAt } from "@t3tools/client-runtime/state/thread-se
 import { threadRuntimeCanArchive } from "@t3tools/client-runtime/state/models";
 import {
   AuthOrchestrationOperateScope,
-  AuthSourceControlWriteScope,
   EnvironmentAuthorizationError,
   EnvironmentId,
   type ScopedThreadRef,
   ThreadId,
-  sessionGrantsScope,
+  type StorageCleanupReportEntry,
+  type ThreadWorktreeCleanupEligibility,
 } from "@t3tools/contracts";
-import { resolveWorktreeCleanup } from "@t3tools/shared/projectSettings";
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/reactivity";
@@ -28,10 +27,8 @@ import { useComposerDraftStore } from "../composerDraftStore";
 import { environmentSession, readEnvironmentScope } from "../state/session";
 import { terminalEnvironment } from "../state/terminal";
 import { appAtomRegistry } from "../rpc/atomRegistry";
-import { environmentServerConfigsAtom } from "../state/server";
-import { isScratchProject } from "@t3tools/client-runtime/state/projects";
+import { serverEnvironment } from "../state/server";
 import { threadEnvironment } from "../state/threads";
-import { vcsEnvironment } from "../state/vcs";
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { refreshArchivedThreadsForEnvironment } from "../lib/archivedThreadsState";
 import { releaseComposerDraftUploads } from "../lib/composerDraftUploads";
@@ -45,7 +42,6 @@ import {
   readEnvironmentSupportsSnooze,
   readEnvironmentSupportsVisitedTracking,
   readEnvironmentThreadRefs,
-  readProject,
   readThreadShell,
   readThreadShells,
 } from "../state/entities";
@@ -53,7 +49,7 @@ import { useUiStateStore } from "../uiStateStore";
 import { clearThreadPreviewState } from "../previewStateStore";
 import { useTerminalUiStateStore } from "../terminalUiStateStore";
 import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
-import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "../worktreeCleanup";
+import { formatWorktreePathForDisplay } from "../worktreeCleanup";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { useClientSettings } from "./useSettings";
 import * as ThreadUndo from "./threadUndo";
@@ -205,6 +201,39 @@ export async function navigateAfterThreadDeletion(navigate: () => Promise<void>)
   }
 }
 
+export async function requestThreadWorktreeCleanup(input: {
+  eligibility: ThreadWorktreeCleanupEligibility;
+  canRemove: boolean;
+  confirm: (message: string) => Promise<boolean>;
+}) {
+  if (!input.canRemove || !input.eligibility.eligible) return null;
+  const worktreePath = input.eligibility.worktreePath;
+  return (await input.confirm(
+    [
+      "This thread is the only owner of this worktree:",
+      formatWorktreePathForDisplay(worktreePath),
+      "",
+      "Delete the worktree too? Safety checks may keep it.",
+    ].join("\n"),
+  ))
+    ? worktreePath
+    : null;
+}
+
+export function reportThreadWorktreeCleanup(entry: StorageCleanupReportEntry) {
+  if (entry.outcome === "removed") return;
+  toastManager.add(
+    stackedThreadToast({
+      type: entry.outcome === "failed" ? "error" : "warning",
+      title:
+        entry.outcome === "failed"
+          ? "Thread deleted, but worktree cleanup failed"
+          : "Worktree kept",
+      description: entry.reason,
+    }),
+  );
+}
+
 /**
  * Marks a thread unread. Servers with visited tracking own the unread marker
  * (thread.mark-unread rewinds the server-side visited watermark, syncing the
@@ -307,13 +336,14 @@ export function useThreadActions() {
   });
   const markThreadUnread = useMarkThreadUnread();
   const stopThreadSession = useOrchestrationCommand(threadEnvironment.stopSession);
-  const removeWorktree = useAtomCommand(vcsEnvironment.removeWorktree, {
+  const removeWorktree = useAtomCommand(serverEnvironment.removeDeletedThreadWorktree, {
     reportFailure: false,
   });
+  const loadWorktreeEligibility = useAtomCommand(
+    serverEnvironment.threadWorktreeCleanupEligibility,
+    { reportFailure: false, reportDefect: false },
+  );
   const loadSessionState = useAtomQueryRunner(environmentSession.sessionStateAtom, {
-    reportFailure: false,
-  });
-  const refreshVcsStatus = useAtomCommand(vcsEnvironment.refreshStatus, {
     reportFailure: false,
   });
   const sidebarThreadSortOrder = useClientSettings((settings) => settings.sidebarThreadSortOrder);
@@ -441,6 +471,52 @@ export function useThreadActions() {
     async (target: ScopedThreadRef, opts: { deletedThreadKeys?: ReadonlySet<string> } = {}) => {
       const permissionFailure = threadOperationFailure(target);
       if (permissionFailure) return permissionFailure;
+      const localApi = readLocalApi();
+      let worktreeToRemove: string | null = null;
+      if (localApi) {
+        await loadSessionState(target.environmentId);
+        const canRemove = appAtomRegistry.get(
+          serverEnvironment.removeDeletedThreadWorktree.permissionAtom(target.environmentId),
+        );
+        if (canRemove) {
+          const eligibility = await loadWorktreeEligibility({
+            environmentId: target.environmentId,
+            input: { threadId: target.threadId },
+          });
+          // Older servers have no protected cleanup API. Delete the thread
+          // normally, never fall back to forced VCS removal.
+          if (eligibility._tag === "Success") {
+            const confirmation = await settlePromise(() =>
+              requestThreadWorktreeCleanup({
+                eligibility: eligibility.value,
+                canRemove,
+                confirm: (message) => localApi.dialogs.confirm(message, { variant: "destructive" }),
+              }),
+            );
+            if (confirmation._tag === "Failure") return confirmation;
+            worktreeToRemove = confirmation.value;
+          }
+        }
+      }
+      const cleanupAfterDeletion = async () => {
+        if (worktreeToRemove === null) return;
+        const result = await removeWorktree({
+          environmentId: target.environmentId,
+          input: { threadId: target.threadId, expectedWorktreePath: worktreeToRemove },
+        });
+        if (result._tag === "Success") {
+          reportThreadWorktreeCleanup(result.value);
+        } else {
+          const error = squashAtomCommandFailure(result);
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Thread deleted, but worktree cleanup failed",
+              description: error instanceof Error ? error.message : "Worktree was not removed.",
+            }),
+          );
+        }
+      };
       const resolved = resolveThreadTarget(target);
       if (!resolved) {
         // Thread not in main store (e.g. archived thread) — dispatch delete directly.
@@ -451,6 +527,7 @@ export function useThreadActions() {
         if (result._tag === "Success") {
           refreshArchivedThreadsForEnvironment(target.environmentId);
           clearThreadPreviewState(target);
+          await cleanupAfterDeletion();
         }
         return result;
       }
@@ -458,10 +535,6 @@ export function useThreadActions() {
       const threads = readEnvironmentThreadRefs(threadRef.environmentId).flatMap((ref) => {
         const shell = readThreadShell(ref);
         return shell === null ? [] : [shell];
-      });
-      const threadProject = readProject({
-        environmentId: threadRef.environmentId,
-        projectId: thread.projectId,
       });
       const deletedIds =
         opts.deletedThreadKeys && opts.deletedThreadKeys.size > 0
@@ -472,57 +545,6 @@ export function useThreadActions() {
               }),
             )
           : undefined;
-      const survivingThreads =
-        deletedIds && deletedIds.size > 0
-          ? threads.filter((entry) => entry.id === threadRef.threadId || !deletedIds.has(entry.id))
-          : threads;
-      const orphanedWorktreePath = getOrphanedWorktreePathForThread(
-        survivingThreads,
-        threadRef.threadId,
-      );
-      const displayWorktreePath = orphanedWorktreePath
-        ? formatWorktreePathForDisplay(orphanedWorktreePath)
-        : null;
-      const environmentConfig = appAtomRegistry
-        .get(environmentServerConfigsAtom)
-        .get(threadRef.environmentId);
-      const localApi = readLocalApi();
-      let canDeleteWorktree = false;
-      if (
-        orphanedWorktreePath !== null &&
-        threadProject !== null &&
-        !isScratchProject(threadProject, environmentConfig?.scratchWorkspaceRoot) &&
-        localApi
-      ) {
-        const sessionResult = await loadSessionState(threadRef.environmentId);
-        const permissionFailure = threadOperationFailure(threadRef);
-        if (permissionFailure) return permissionFailure;
-        canDeleteWorktree =
-          sessionResult._tag === "Success" &&
-          sessionGrantsScope(sessionResult.value, AuthSourceControlWriteScope);
-      }
-      let shouldDeleteWorktree = false;
-      const environmentSettings = environmentConfig?.settings;
-      const automaticWorktreeCleanup = environmentSettings
-        ? resolveWorktreeCleanup(environmentSettings, thread.projectId).worktreeOnDelete
-        : false;
-      if (canDeleteWorktree && localApi && !automaticWorktreeCleanup) {
-        const confirmationResult = await settlePromise(() =>
-          localApi.dialogs.confirm(
-            [
-              "This thread is the only one linked to this worktree:",
-              displayWorktreePath ?? orphanedWorktreePath,
-              "",
-              "Delete the worktree too?",
-            ].join("\n"),
-            { variant: "destructive" },
-          ),
-        );
-        if (confirmationResult._tag === "Failure") {
-          return confirmationResult;
-        }
-        shouldDeleteWorktree = confirmationResult.value;
-      }
 
       if (thread.runtime !== null) {
         await stopThreadSession({
@@ -576,67 +598,7 @@ export function useThreadActions() {
         );
       }
 
-      if (!shouldDeleteWorktree || !orphanedWorktreePath || !threadProject) {
-        return deleteResult;
-      }
-
-      const removeResult = readEnvironmentScope(
-        threadRef.environmentId,
-        AuthSourceControlWriteScope,
-      )
-        ? await removeWorktree({
-            environmentId: threadRef.environmentId,
-            input: {
-              cwd: threadProject.workspaceRoot,
-              path: orphanedWorktreePath,
-              force: true,
-            },
-          })
-        : AsyncResult.failure(
-            Cause.fail(
-              new EnvironmentAuthorizationError({
-                message: "This connection can no longer remove worktrees.",
-                requiredScope: AuthSourceControlWriteScope,
-              }),
-            ),
-          );
-      const refreshResult =
-        removeResult._tag === "Success"
-          ? await refreshVcsStatus({
-              environmentId: threadRef.environmentId,
-              input: { cwd: threadProject.workspaceRoot },
-            })
-          : null;
-      const cleanupFailure =
-        removeResult._tag === "Failure"
-          ? removeResult
-          : refreshResult?._tag === "Failure"
-            ? refreshResult
-            : null;
-      if (cleanupFailure) {
-        const removalFailed = removeResult._tag === "Failure";
-        const error = squashAtomCommandFailure(cleanupFailure);
-        const message = error instanceof Error ? error.message : "An error occurred.";
-        console.error("Worktree cleanup failed after thread deletion", {
-          threadId: threadRef.threadId,
-          projectCwd: threadProject.workspaceRoot,
-          worktreePath: orphanedWorktreePath,
-          error,
-        });
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: removalFailed
-              ? "Failed to delete worktree"
-              : "Worktree deleted, but Git status refresh failed",
-            description: removalFailed
-              ? `Could not remove ${displayWorktreePath ?? orphanedWorktreePath}. ${message}`
-              : message,
-          }),
-        );
-        // The thread was deleted. Cleanup has its own toast; returning its
-        // failure would make callers incorrectly report a thread deletion error.
-      }
+      await cleanupAfterDeletion();
       return deleteResult;
     },
     [
@@ -646,7 +608,7 @@ export function useThreadActions() {
       deleteThreadMutation,
       getCurrentRouteThreadRef,
       loadSessionState,
-      refreshVcsStatus,
+      loadWorktreeEligibility,
       removeWorktree,
       router,
       resolveThreadTarget,
