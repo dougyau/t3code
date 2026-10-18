@@ -2398,6 +2398,10 @@ const layerWsRpc = (
             return { keybindings: keybindingsConfig, issues: [] };
           }),
         [WS_METHODS.serverRunStorageCleanup]: () => storageCleanup.runNow,
+        [WS_METHODS.serverGetThreadWorktreeCleanupEligibility]: (input) =>
+          storageCleanup.getThreadWorktreeCleanupEligibility(input),
+        [WS_METHODS.serverRemoveDeletedThreadWorktree]: (input) =>
+          storageCleanup.removeDeletedThreadWorktree(input),
         [WS_METHODS.serverGetStorageCleanupReport]: () => storageCleanup.reports,
         [WS_METHODS.serverGetSettings]: (_input) =>
           serverSettings.getSettings.pipe(Effect.map(ServerSettings.redactServerSettingsForClient)),

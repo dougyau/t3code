@@ -2,6 +2,7 @@ import {
   GitCommandError,
   OrchestrationV2AppThreadJson,
   OrchestrationV2ProviderSessionJson,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -14,6 +15,7 @@ import type {
   WorktreeCleanupRules,
   StorageCleanupReport,
   StorageCleanupReportEntry,
+  ThreadWorktreeCleanupEligibility,
 } from "@t3tools/contracts";
 import { resolveWorktreeCleanup } from "@t3tools/shared/projectSettings";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
@@ -36,6 +38,7 @@ import * as ServerConfig from "./config.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
+import * as EffectWorker from "./orchestration-v2/EffectWorker.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import { threadHasQueuedTurnStart } from "./orchestration-v2/ThreadSettlementService.ts";
 import { forkParked } from "./serverActivation.ts";
@@ -45,6 +48,10 @@ import { isFilesystemRoot, managedWorktreesDirectories } from "./worktreesDirect
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import { withWorkspaceLease } from "./workspace/workspaceLease.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as NodeUtil from "node:util";
+import { readNativeCleanupReferences } from "./workspace/nativeCleanupReferences.ts";
+
+const encodeCleanupThreadIds = Schema.encodeEffect(Schema.fromJsonString(Schema.Array(ThreadId)));
 
 const decodeCleanupThread = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2AppThreadJson),
@@ -161,6 +168,13 @@ export class StorageCleanup extends Context.Service<
     readonly latestReport: Effect.Effect<StorageCleanupReport | null>;
     readonly reports: Stream.Stream<StorageCleanupReport | null>;
     readonly drain: Effect.Effect<void>;
+    readonly getThreadWorktreeCleanupEligibility: (input: {
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<ThreadWorktreeCleanupEligibility, ServerSettingsError>;
+    readonly removeDeletedThreadWorktree: (input: {
+      readonly threadId: ThreadId;
+      readonly expectedWorktreePath: string;
+    }) => Effect.Effect<StorageCleanupReportEntry, ServerSettingsError>;
   }
 >()("t3/storageCleanup") {}
 
@@ -169,6 +183,7 @@ const make = Effect.gen(function* () {
   const settingsService = yield* Settings.ServerSettingsService;
   const projectStore = yield* ProjectStore.ProjectStoreV2;
   const engine = yield* Orchestrator.OrchestratorV2;
+  const effectWorker = yield* EffectWorker.OrchestrationEffectWorkerV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const sql = yield* SqlClient.SqlClient;
   const git = yield* GitVcsDriver.GitVcsDriver;
@@ -252,8 +267,63 @@ const make = Effect.gen(function* () {
     const active = yield* projections.getShellSnapshot();
     const archived = yield* projections.getShellSnapshot({ location: "archive" });
     const projects = yield* projectStore.listShells();
-    return { projects, threads: [...active.threads, ...archived.threads] };
+    const deletedRows = yield* sql<{ payload_json: string; workspaceRoot: string }>`
+      SELECT t.payload_json, p.workspace_root AS "workspaceRoot"
+      FROM orchestration_v2_projection_threads t
+      JOIN projection_projects p ON p.project_id = t.project_id
+      WHERE t.deleted_at IS NOT NULL
+    `;
+    const deletedThreads = yield* Effect.forEach(deletedRows, (row) =>
+      decodeCleanupThread(row.payload_json).pipe(
+        Effect.map((thread) => ({ ...thread, workspaceRoot: row.workspaceRoot })),
+      ),
+    );
+    const threads = [...active.threads, ...archived.threads];
+    const references = [...threads, ...deletedThreads];
+    const classify = yield* readNativeCleanupReferences(sql, references);
+    return { projects, threads, deletedThreads, references, classify };
   });
+
+  const getThreadWorktreeCleanupEligibility = Effect.fn(
+    "StorageCleanup.getThreadWorktreeCleanupEligibility",
+  )(
+    function* (input: { readonly threadId: ThreadId }) {
+      const unavailable = (reason: string): ThreadWorktreeCleanupEligibility => ({
+        eligible: false,
+        reason,
+      });
+      const snapshot = yield* readThreads();
+      const thread = snapshot.threads.find((row) => row.id === input.threadId);
+      if (thread?.worktreePath == null || thread.branch === null)
+        return unavailable("Thread has no worktree");
+      if (snapshot.classify(thread.id).observation)
+        return unavailable("Native observations do not own the checkout");
+      const project = snapshot.projects.find((row) => row.id === thread.projectId);
+      if (project === undefined) return unavailable("Project is unavailable");
+      // Scratch folders are not disposable Git worktrees.
+      if (path.resolve(project.workspaceRoot) === path.resolve(config.baseDir, "scratch"))
+        return unavailable("Scratch project");
+      const settings = yield* settingsService.getSettings;
+      if (resolveWorktreeCleanup(settings, thread.projectId).worktreeOnDelete)
+        return unavailable("Automatic worktree cleanup is enabled");
+      const worktreePath = path.resolve(thread.worktreePath);
+      const references = snapshot.references.filter(
+        (row) => row.worktreePath !== null && path.resolve(row.worktreePath) === worktreePath,
+      );
+      for (const row of references) {
+        const classification = snapshot.classify(row.id);
+        if (classification.reason !== null) return unavailable(classification.reason);
+        if (row.id !== thread.id && row.deletedAt === null && !classification.observation)
+          return unavailable("Checkout has another owning thread");
+      }
+      if (!(yield* fs.exists(worktreePath))) return unavailable("Worktree is already absent");
+      return { eligible: true, worktreePath } satisfies ThreadWorktreeCleanupEligibility;
+    },
+    Effect.orElseSucceed((): ThreadWorktreeCleanupEligibility => ({
+      eligible: false,
+      reason: "Unable to inspect worktree safely",
+    })),
+  );
 
   // Local threads under another project need not have a worktreePath of their own.
   const containsProjectRoot = Effect.fn("StorageCleanup.containsProjectRoot")(function* (
@@ -395,6 +465,7 @@ const make = Effect.gen(function* () {
     serverSettings: ServerSettings,
     now: number,
     entries: StorageCleanupReportEntry[],
+    directed?: { readonly threadId: ThreadId; readonly expectedWorktreePath: string },
   ) {
     const roots: Array<string> = [];
     for (const directory of managedWorktreesDirectories(
@@ -410,31 +481,54 @@ const make = Effect.gen(function* () {
       );
       if (root !== null && !isFilesystemRoot(root, path)) roots.push(root);
     }
-    const deletedRows = yield* sql<{ payload_json: string; workspaceRoot: string }>`
-          SELECT t.payload_json, p.workspace_root AS "workspaceRoot"
-          FROM orchestration_v2_projection_threads t
-          JOIN projection_projects p ON p.project_id = t.project_id
-          WHERE t.deleted_at IS NOT NULL
-        `;
-    const deletedThreads = (yield* Effect.forEach(deletedRows, (row) =>
-      decodeCleanupThread(row.payload_json).pipe(
-        Effect.map((thread) => ({ ...thread, workspaceRoot: row.workspaceRoot })),
-      ),
-    )).filter((thread) => thread.worktreePath !== null && thread.branch !== null);
     const snapshot = yield* readThreads();
     const refreshedDefaultRefs = new Map<string, Set<string>>();
     const groups = Map.groupBy(
-      snapshot.threads.filter((thread) => thread.worktreePath !== null),
+      snapshot.references.filter((thread) => thread.worktreePath !== null),
       (thread) => path.resolve(thread.worktreePath!),
     );
-    const candidates = [
-      ...[...groups.values()].map((group) => group[0]!),
-      ...deletedThreads.filter((thread) => !groups.has(path.resolve(thread.worktreePath!))),
-    ];
-    for (const thread of candidates) {
+    for (const [worktreePath, group] of groups) {
+      if (directed !== undefined && worktreePath !== path.resolve(directed.expectedWorktreePath))
+        continue;
+      const live = group.filter(
+        (row) => row.deletedAt === null && !snapshot.classify(row.id).observation,
+      );
+      const deletedOwners = snapshot.deletedThreads.filter(
+        (row) =>
+          row.worktreePath !== null &&
+          path.resolve(row.worktreePath) === worktreePath &&
+          !snapshot.classify(row.id).observation,
+      );
+      const eligibleDeletedOwners = deletedOwners.filter(
+        (row) => resolveWorktreeCleanup(serverSettings, row.projectId).worktreeOnDelete,
+      );
+      // Stable identity selection: historical observations never stand in for
+      // a missing owner, nor suppress an actual deleted-parent candidate.
+      const thread =
+        directed === undefined
+          ? [
+              ...(live.length > 0
+                ? live
+                : eligibleDeletedOwners.length > 0
+                  ? eligibleDeletedOwners
+                  : deletedOwners),
+            ].sort((a, b) => a.id.localeCompare(b.id))[0]
+          : deletedOwners.find((row) => row.id === directed.threadId);
+      if (thread === undefined) {
+        entries.push({
+          kind: "worktree",
+          outcome: "kept",
+          reason: "No matching owning thread or deleted parent",
+          path: worktreePath,
+          threadId: directed?.threadId ?? null,
+          threadTitle: null,
+          bytes: null,
+          files: null,
+        });
+        continue;
+      }
       const settings = resolveWorktreeCleanup(serverSettings, thread.projectId);
-      if (!worktreeCleanupEnabled(settings)) continue;
-      const worktreePath = path.resolve(thread.worktreePath!);
+      if (directed === undefined && !worktreeCleanupEnabled(settings)) continue;
       const deleted = "workspaceRoot" in thread;
       const project = deleted
         ? { workspaceRoot: thread.workspaceRoot }
@@ -451,10 +545,20 @@ const make = Effect.gen(function* () {
       };
       const keep = (reason: string) => entries.push({ ...entry, reason: sentence(reason) });
       yield* Effect.gen(function* () {
-        if (!(yield* fs.exists(worktreePath))) return;
-        if (deleted && !settings.worktreeOnDelete) return keep("no rules apply");
-        const shared = groups.get(worktreePath)?.length ?? 0;
-        if (shared > 1) return keep(`shared by ${shared} threads`);
+        if (!(yield* fs.exists(worktreePath))) {
+          if (directed !== undefined) keep("worktree is already absent");
+          return;
+        }
+        if (deleted && directed === undefined && !settings.worktreeOnDelete)
+          return keep("no rules apply");
+        const classifications = group.map((row) => [row.id, snapshot.classify(row.id)] as const);
+        const nativeBlock = classifications.find(([, result]) => result.reason !== null)?.[1]
+          .reason;
+        if (nativeBlock != null) return keep(nativeBlock);
+        if (live.length > (deleted ? 0 : 1)) return keep(`shared by ${live.length} threads`);
+        if (group.some((row) => row.branch !== thread.branch))
+          return keep("worktree references disagree on branch");
+        if (thread.branch === null) return keep("thread has no worktree branch");
         if (project === undefined) return keep("project is unavailable");
         if (!deleted && !storageCleanupThreadIdle(thread, now))
           return keep("thread is running or has pending work");
@@ -548,27 +652,56 @@ const make = Effect.gen(function* () {
               entry.worktreePath !== null && path.resolve(entry.worktreePath) === worktreePath,
           );
           if (hasTerminal(worktreePath)) return "open terminal";
+          const latestReferences = latestSnapshot.references.filter(
+            (row) => row.worktreePath !== null && path.resolve(row.worktreePath) === worktreePath,
+          );
+          const latestClassifications = latestReferences.map(
+            (row) => [row.id, latestSnapshot.classify(row.id)] as const,
+          );
+          const fingerprint = (rows: typeof classifications) =>
+            [...rows].sort(([a], [b]) => a.localeCompare(b));
+          if (
+            !NodeUtil.isDeepStrictEqual(
+              fingerprint(classifications),
+              fingerprint(latestClassifications),
+            )
+          )
+            return "native observation identity, generation or descendants changed since check";
+          const latestOwners = latest.filter((row) => !latestSnapshot.classify(row.id).observation);
           if (deleted) {
             if (
-              latest.length > 0 ||
-              !resolveWorktreeCleanup(yield* settingsService.getSettings, thread.projectId)
-                .worktreeOnDelete
+              latestOwners.length > 0 ||
+              !latestSnapshot.deletedThreads.some(
+                (row) =>
+                  row.id === thread.id &&
+                  row.worktreePath !== null &&
+                  path.resolve(row.worktreePath) === worktreePath &&
+                  row.branch === thread.branch,
+              ) ||
+              (directed === undefined &&
+                !resolveWorktreeCleanup(yield* settingsService.getSettings, thread.projectId)
+                  .worktreeOnDelete)
             )
               return "thread or cleanup settings changed since check";
-            // V2 deletion queues durable cleanup. Do not remove its checkout until
-            // every effect has finished successfully or was explicitly cancelled.
-            const pendingCleanup = yield* sql`
-              SELECT 1 FROM orchestration_v2_effect_outbox
-              WHERE thread_id = ${thread.id} AND status NOT IN ('succeeded', 'cancelled') LIMIT 1
-            `;
-            if (pendingCleanup.length > 0) return "thread deletion is still pending";
           } else if (
-            latest.length !== 1 ||
-            latest[0]!.id !== thread.id ||
-            !storageCleanupThreadIdle(latest[0]!, now) ||
-            storageCleanupActivityAt(latest[0]!) !== storageCleanupActivityAt(thread)
+            latestOwners.length !== 1 ||
+            latestOwners[0]!.id !== thread.id ||
+            latestOwners[0]!.branch !== thread.branch ||
+            !storageCleanupThreadIdle(latestOwners[0]!, now) ||
+            storageCleanupActivityAt(latestOwners[0]!) !== storageCleanupActivityAt(thread)
           )
             return "thread activity or shared worktree changed since check";
+          // Include historical references and native descendants: deletion of
+          // the parent must not bypass cleanup still queued for a child.
+          const referenceIds = [
+            ...new Set(latestClassifications.flatMap(([, result]) => result.threadIds)),
+          ];
+          const pendingCleanup = yield* sql`
+            SELECT 1 FROM orchestration_v2_effect_outbox
+            WHERE thread_id IN (SELECT value FROM json_each(${yield* encodeCleanupThreadIds(referenceIds)}))
+              AND status NOT IN ('succeeded', 'cancelled') LIMIT 1
+          `;
+          if (pendingCleanup.length > 0) return "thread deletion or cleanup is still pending";
           // Sessions can outlive their run and can be shared across app threads.
           const sessionRows = yield* sql<{ payload_json: string }>`
             SELECT payload_json FROM orchestration_v2_projection_provider_sessions
@@ -613,6 +746,8 @@ const make = Effect.gen(function* () {
           )
         )
           return keep("settings changed since check");
+        const finalBlock = yield* blockedSinceCheck();
+        if (finalBlock !== null) return keep(finalBlock);
         // Clean only untracked files; Git must still refuse removal if a tracked
         // edit arrives after our last status check.
         if (settings.worktreeKeepWhen === "tracked-changes")
@@ -645,6 +780,50 @@ const make = Effect.gen(function* () {
       );
     }
   });
+
+  const removeDeletedThreadWorktree = Effect.fn("StorageCleanup.removeDeletedThreadWorktree")(
+    function* (input: { readonly threadId: ThreadId; readonly expectedWorktreePath: string }) {
+      const entries: StorageCleanupReportEntry[] = [];
+      yield* Effect.gen(function* () {
+        // Drain queued teardown before inspecting the deleted owner. Work
+        // already claimed elsewhere remains protected by the persisted guards.
+        yield* effectWorker.drain().pipe(Effect.timeout("10 seconds"));
+        yield* cleanWorktrees(
+          yield* settingsService.getSettings,
+          yield* Clock.currentTimeMillis,
+          entries,
+          input,
+        );
+      }).pipe(
+        Effect.catch((error) =>
+          Effect.sync(() => {
+            entries.push({
+              kind: "worktree",
+              outcome: "failed",
+              reason: cleanupFailureReason(error),
+              path: input.expectedWorktreePath,
+              threadId: input.threadId,
+              threadTitle: null,
+              bytes: null,
+              files: null,
+            });
+          }),
+        ),
+      );
+      return (
+        entries[0] ?? {
+          kind: "worktree" as const,
+          outcome: "kept" as const,
+          reason: "No matching owning thread or deleted parent",
+          path: input.expectedWorktreePath,
+          threadId: input.threadId,
+          threadTitle: null,
+          bytes: null,
+          files: null,
+        }
+      );
+    },
+  );
 
   const cleanFiles = Effect.fn("StorageCleanup.cleanFiles")(function* (
     root: string,
@@ -856,6 +1035,8 @@ const make = Effect.gen(function* () {
     latestReport: SubscriptionRef.get(reportRef),
     reports: SubscriptionRef.changes(reportRef),
     drain: worker.drain,
+    getThreadWorktreeCleanupEligibility,
+    removeDeletedThreadWorktree,
   });
 });
 

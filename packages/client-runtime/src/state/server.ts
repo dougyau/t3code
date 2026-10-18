@@ -983,6 +983,18 @@ export function createServerEnvironmentAtoms<R, E>(
 
   return {
     configValueAtom,
+    threadWorktreeCleanupEligibility: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:thread-worktree-cleanup-eligibility",
+      tag: WS_METHODS.serverGetThreadWorktreeCleanupEligibility,
+    }),
+    removeDeletedThreadWorktree: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:remove-deleted-thread-worktree",
+      tag: WS_METHODS.serverRemoveDeletedThreadWorktree,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => JSON.stringify([environmentId, input]),
+      },
+    }),
     runStorageCleanup: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:run-storage-cleanup",
       tag: WS_METHODS.serverRunStorageCleanup,

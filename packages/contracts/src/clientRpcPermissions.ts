@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import { GitPreparePullRequestThreadInput } from "./git.ts";
 import {
   AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   AuthSettingsWriteScope,
   AuthProvidersManageScope,
   AuthSourceControlWriteScope,
@@ -16,6 +17,8 @@ import { ProviderInstanceMutation } from "./providerInstance.ts";
 export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.serverUpdateSettings]: AuthSettingsWriteScope,
   [WS_METHODS.serverRunStorageCleanup]: AuthSettingsWriteScope,
+  [WS_METHODS.serverRemoveDeletedThreadWorktree]: AuthSourceControlWriteScope,
+  [WS_METHODS.serverGetThreadWorktreeCleanupEligibility]: AuthOrchestrationReadScope,
   // Endpoint checks exist to configure exports, so they need the same grant as saving them.
   [WS_METHODS.serverCheckOtlpEndpoint]: AuthSettingsWriteScope,
   [WS_METHODS.pullRequestsRunAction]: AuthSourceControlWriteScope,
