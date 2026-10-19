@@ -834,7 +834,18 @@ it.effect(
                 }>;
               }>("../../../mobile/src/features/threads/ThreadAgentsSheet.tsx"),
             );
-            vi.stubGlobal("document", { getElementById: () => null });
+            let focusedTab: string | null = null;
+            vi.stubGlobal("document", {
+              getElementById: (id: string) =>
+                web?.root.findAll((node) => node.props.role === "tab" && node.props.id === id)
+                  .length
+                  ? {
+                      focus() {
+                        focusedTab = id;
+                      },
+                    }
+                  : null,
+            });
             vi.stubGlobal("window", Object.assign(new EventTarget(), { localStorage }));
             // Layout inputs are host events, not physical geometry evidence.
             let shift = 0;
@@ -917,11 +928,38 @@ it.effect(
                 );
               }),
             );
-            const details = web!.root.findAllByType("details")[0]!;
+            expect(text(web!.root)).toContain("Completion unconfirmed");
+            expect(text(web!.root)).toContain("Result available");
+            expect(text(web!.root)).toContain("Historical view");
+            expect(text(web!.root)).toContain("Capture is incomplete.");
+            expect(text(web!.root)).toContain("missed native interval");
+            expect(text(web!.root)).not.toContain("historical-table");
+            expect(text(web!.root)).not.toContain("Observation stale");
+            const technical = web!.root.findAllByType("details")[0]!;
+            expect(technical.props.open).toBe(false);
+            yield* Effect.promise(() =>
+              act(async () => invoke(technical, "onToggle", { currentTarget: { open: true } })),
+            );
+            expect(technical.props.open).toBe(true);
+            expect(text(technical)).toContain("Table ID: historical-table");
+            expect(text(technical)).toContain(
+              "Observation stale · Capture incomplete · Protocol finished · Outcome available · Native closure unknown · Members released · Director unknown",
+            );
+            yield* Effect.promise(() =>
+              act(async () => invoke(technical, "onToggle", { currentTarget: { open: false } })),
+            );
+            expect(technical.props.open).toBe(false);
+            expect(text(technical)).not.toContain("Observation stale");
+            expect(text(web!.root)).toContain("Native closure could not be confirmed.");
+            const details = web!.root.findAllByType("details")[1]!;
             yield* Effect.promise(() =>
               act(async () => invoke(details, "onToggle", { currentTarget: { open: true } })),
             );
-            expect(text(web!.root)).toContain("architect · specialist · completed");
+            expect(text(web!.root)).toContain("Specialist · architect · #1");
+            expect(text(details)).toContain("Completed");
+            const identifiers = details.findAllByType("details")[0]!;
+            expect(identifiers.props.open).not.toBe(true);
+            expect(text(identifiers)).toContain("Member ID: specialist");
             yield* Effect.promise(() => press(web!, "Open Architect table"));
             expect(host.navigate).toHaveBeenCalledWith({
               to: "/architect/$environmentId/$threadId/$tableId",
@@ -929,12 +967,55 @@ it.effect(
             });
             yield* Effect.promise(() => act(async () => web!.update(table())));
             expect(text(web!.root)).toContain("missed native interval");
+            expect(text(web!.root)).not.toContain("Observation stale");
             yield* Effect.promise(() => press(web!, "Read original brief"));
+            const expectBriefMode = (selected: "Reading" | "Source") => {
+              for (const label of ["Reading", "Source"]) {
+                const button = control(web!, label);
+                const active = label === selected;
+                expect(button.props["aria-pressed"]).toBe(active);
+                expect(button.props.className).toContain(
+                  active ? "bg-primary" : "border-transparent",
+                );
+                expect(button.props.className).not.toContain(
+                  active ? "border-transparent" : "bg-primary",
+                );
+                expect(button.findByType("span").props.className).toBe(
+                  active ? "font-semibold" : "font-normal",
+                );
+              }
+            };
+            expectBriefMode("Reading");
+            const readingText = text(web!.root);
+            expect(readingText).toContain("EXACT END 🦉");
             yield* Effect.promise(() => press(web!, "Source"));
+            expectBriefMode("Source");
             expect(web!.root.findByType("pre").children.join("")).toBe(original);
             yield* Effect.promise(() => press(web!, "Reading"));
+            expectBriefMode("Reading");
+            expect(text(web!.root)).toBe(readingText);
             expect(text(web!.root)).toContain("EXACT END 🦉");
             yield* Effect.promise(() => press(web!, "Back to Summary"));
+            // Host focus and class checks do not establish browser painting or contrast.
+            const expectMainTabFocus = () => {
+              for (const label of ["Summary", "Debate", "Participants"]) {
+                const button = control(web!, label);
+                const classes = String(button.props.className).split(" ");
+                expect(classes).toContain("focus-visible:outline-2");
+                expect(classes).toContain("focus-visible:-outline-offset-2");
+                expect(classes).toContain(
+                  button.props["aria-selected"]
+                    ? "focus-visible:outline-primary-foreground"
+                    : "focus-visible:outline-ring",
+                );
+                expect(classes).not.toContain(
+                  button.props["aria-selected"]
+                    ? "focus-visible:outline-ring"
+                    : "focus-visible:outline-primary-foreground",
+                );
+              }
+            };
+            expectMainTabFocus();
             // Keyboard navigation changes the actual surface rather than only checking attributes.
             yield* Effect.promise(() =>
               act(async () =>
@@ -945,6 +1026,41 @@ it.effect(
               ),
             );
             expect(text(web!.root)).toContain("Proposal latest 🧠");
+            expect(focusedTab).toBe("architect-tab-Debate");
+            expectMainTabFocus();
+            expect(control(web!, "Debate").props).toMatchObject({
+              "aria-selected": true,
+              tabIndex: 0,
+            });
+            expect(control(web!, "Debate").props.className).toContain("bg-primary");
+            expect(control(web!, "Debate").props.className).toContain("font-semibold");
+            expect(control(web!, "Summary").props.className).toContain("text-muted-foreground");
+            expect(control(web!, "Summary").props.className).not.toContain("bg-primary");
+            yield* Effect.promise(() =>
+              act(async () =>
+                invoke(control(web!, "Debate"), "onKeyDown", {
+                  key: "End",
+                  preventDefault() {},
+                }),
+              ),
+            );
+            expect(text(web!.root)).toContain("Separate specialist mandate 🏗️");
+            expect(focusedTab).toBe("architect-tab-Participants");
+            expectMainTabFocus();
+            expect(control(web!, "Participants").props.className).toContain("bg-primary");
+            yield* Effect.promise(() =>
+              act(async () =>
+                invoke(control(web!, "Participants"), "onKeyDown", {
+                  key: "Home",
+                  preventDefault() {},
+                }),
+              ),
+            );
+            expect(text(web!.root)).toContain("Exact recommendation 🧠");
+            expect(focusedTab).toBe("architect-tab-Summary");
+            expectMainTabFocus();
+            expect(control(web!, "Summary").props.className).toContain("font-semibold");
+            yield* Effect.promise(() => press(web!, "Debate"));
             yield* Effect.promise(() => press(web!, "Round 1"));
             expect(text(web!.root)).toContain("Proposal earlier 🧠");
             expect(text(web!.root)).toContain(
@@ -1040,9 +1156,55 @@ it.effect(
               }),
             );
             expect(text(native!.root)).toContain("Architect table");
-            yield* Effect.promise(() =>
-              press(native!, "Architect table · 2 participants · finished"),
-            );
+            expect(text(native!.root)).toContain("Completion unconfirmed");
+            expect(text(native!.root)).toContain("missed native interval");
+            expect(text(native!.root)).not.toContain("Observation stale");
+            yield* Effect.promise(() => press(native!, "Technical details"));
+            expect(control(native!, "Technical details").props.accessibilityState).toMatchObject({
+              expanded: true,
+            });
+            expect(text(native!.root)).toContain("Table ID: historical-table");
+            expect(text(native!.root)).toContain("Native closure unknown");
+            yield* Effect.promise(() => press(native!, "Technical details"));
+            expect(control(native!, "Technical details").props.accessibilityState).toMatchObject({
+              expanded: false,
+            });
+            expect(text(native!.root)).not.toContain("Observation stale");
+            expect(text(native!.root)).toContain("Native closure could not be confirmed.");
+            yield* Effect.promise(() => press(native!, "Participants"));
+            expect(text(native!.root)).toContain("Specialist · architect · #1");
+            expect(text(native!.root)).toContain("Completed");
+            expect(text(native!.root)).not.toContain("Member ID: specialist");
+            yield* Effect.promise(() => press(native!, "Technical identifiers"));
+            expect(text(native!.root)).toContain("Member ID: specialist");
+            yield* Effect.promise(() => press(native!, "Participants"));
+            expect(text(native!.root)).not.toContain("Specialist · architect · #1");
+            // Real app focus state, with native hosts substituted: not a device paint check.
+            const focusNativeAction = async (label: string, filled: boolean) => {
+              const before = control(native!, label);
+              const classes = before.props.className;
+              const selection = before.props.accessibilityState;
+              const presentation = registry.get(tablePresentationAtom(target));
+              const content = text(native!.root);
+              expect(String(classes).split(" ")).not.toContain("outline-2");
+              await act(async () => invoke(before, "onFocus", {}));
+              const focused = control(native!, label);
+              const cue = String(focused.props.className).split(" ");
+              expect(cue).toContain("outline-2");
+              expect(cue).toContain("-outline-offset-2");
+              expect(cue).toContain(filled ? "outline-primary-foreground" : "outline-primary");
+              expect(cue).not.toContain(filled ? "outline-primary" : "outline-primary-foreground");
+              expect(cue.includes("bg-primary")).toBe(filled);
+              expect(focused.props.accessibilityState).toEqual(selection);
+              expect(registry.get(tablePresentationAtom(target))).toBe(presentation);
+              expect(text(native!.root)).toBe(content);
+              await act(async () => invoke(focused, "onBlur", {}));
+              expect(control(native!, label).props.className).toBe(classes);
+              expect(control(native!, label).props.accessibilityState).toEqual(selection);
+              expect(registry.get(tablePresentationAtom(target))).toBe(presentation);
+              expect(text(native!.root)).toBe(content);
+            };
+            yield* Effect.promise(() => focusNativeAction("Open Architect table", true));
             yield* Effect.promise(() => press(native!, "Open Architect table"));
             expect(host.dispatch).toHaveBeenLastCalledWith({
               type: "REPLACE",
@@ -1070,6 +1232,10 @@ it.effect(
             yield* Effect.promise(() => press(native!, "Read original brief"));
             yield* Effect.promise(() => press(native!, "Source"));
             expect(text(native!.root)).toContain(original);
+            expect(control(native!, "Source").props.className).toContain("bg-primary");
+            expect(control(native!, "Reading").props.className).not.toContain("bg-primary");
+            yield* Effect.promise(() => focusNativeAction("Source", true));
+            yield* Effect.promise(() => focusNativeAction("Reading", false));
             yield* Effect.promise(() => press(native!, "Reading"));
             expect(text(native!.root)).toContain("EXACT END 🦉");
             yield* Effect.promise(() => press(native!, "Back to Summary"));
@@ -1079,6 +1245,16 @@ it.effect(
               accessibilityRole: "tab",
               accessibilityState: { selected: true },
             });
+            expect(control(native!, "Debate").props.className).toContain("bg-primary");
+            expect(control(native!, "Debate").findByType("Text").props.className).toContain(
+              "font-t3-bold",
+            );
+            expect(control(native!, "Summary").props.className).not.toContain("bg-primary");
+            expect(control(native!, "Summary").findByType("Text").props.className).toContain(
+              "text-foreground-muted",
+            );
+            yield* Effect.promise(() => focusNativeAction("Debate", true));
+            yield* Effect.promise(() => focusNativeAction("Summary", false));
             const nativeEarlier = () =>
               native!.root
                 .findAll(

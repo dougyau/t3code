@@ -5,6 +5,7 @@ import {
   participantModel,
   recordSections,
   tableObservation,
+  tableStatus,
   tablePresentationAtom,
   tableTabs,
   type ReadingPoint,
@@ -14,7 +15,7 @@ import {
   createPiArchitectureAtoms,
   type PiArchitectureAtoms,
 } from "@t3tools/client-runtime/state/piArchitecture/queries";
-import type { PiArchitectureDetailRecord } from "@t3tools/contracts";
+import type { PiArchitectureDetailRecord, PiArchitectureSummary } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
 import {
@@ -36,6 +37,7 @@ import { SelectableMarkdownText } from "../../native/SelectableMarkdownText";
 import { environmentThreadDetails } from "../../state/threads";
 import { useMarkdownPreviewStyles } from "../files/FileMarkdownPreview";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
+import { cn } from "../../lib/cn";
 
 export const mobilePiArchitecture = createPiArchitectureAtoms(connectionAtomRuntime, (target) =>
   environmentThreadDetails.threadAtom({
@@ -68,7 +70,9 @@ export function ArchitectureAction(props: {
   readonly onPress: () => void;
   readonly expanded?: boolean;
   readonly selected?: boolean;
+  readonly primary?: boolean;
 }) {
+  const [focused, setFocused] = useState(false);
   return (
     <Pressable
       accessibilityRole={props.selected === undefined ? "button" : "tab"}
@@ -77,10 +81,63 @@ export function ArchitectureAction(props: {
         ...(props.selected === undefined ? {} : { selected: props.selected }),
       }}
       onPress={props.onPress}
-      className="rounded-lg border border-border px-3 py-2 active:opacity-70"
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+      className={cn(
+        "rounded-lg border px-3 py-2 active:opacity-70",
+        props.selected || props.primary ? "border-primary bg-primary" : "border-border",
+        focused && "outline-2 -outline-offset-2",
+        focused &&
+          (props.selected || props.primary ? "outline-primary-foreground" : "outline-primary"),
+      )}
     >
-      <Text className="text-sm text-foreground">{props.children}</Text>
+      <Text
+        className={cn(
+          "text-sm",
+          props.selected || props.primary
+            ? "font-t3-bold text-primary-foreground"
+            : props.selected === false
+              ? "text-foreground-muted"
+              : "text-foreground",
+        )}
+      >
+        {props.children}
+      </Text>
     </Pressable>
+  );
+}
+
+export function NativeTableStatus({ summary }: { readonly summary: PiArchitectureSummary }) {
+  const [technical, setTechnical] = useState(false);
+  const status = tableStatus(summary);
+  return (
+    <View className="min-w-0 gap-2">
+      <View className="flex-row flex-wrap items-baseline gap-x-3 gap-y-1">
+        <Text className="font-t3-bold text-sm text-foreground">{status.state}</Text>
+        <Text className="text-sm text-foreground">{status.result}</Text>
+        {status.context ? (
+          <Text className="text-sm text-foreground-muted">{status.context}</Text>
+        ) : null}
+      </View>
+      {status.warnings.map((warning) => (
+        <Text key={warning} accessibilityRole="alert" className="text-sm text-foreground">
+          {warning}
+        </Text>
+      ))}
+      <ArchitectureAction expanded={technical} onPress={() => setTechnical(!technical)}>
+        Technical details
+      </ArchitectureAction>
+      {technical ? (
+        <View className="gap-1">
+          <Text selectable className="text-xs text-foreground-muted">
+            Table ID: {summary.tableId}
+          </Text>
+          <Text selectable className="text-xs text-foreground-muted">
+            {tableObservation(summary)}
+          </Text>
+        </View>
+      ) : null}
+    </View>
   );
 }
 
@@ -201,13 +258,7 @@ export function NativeArchitectTable(props: {
     <View className="flex-1 bg-screen">
       <ScreenHeader title="Architect table" onBack={props.onCoordinator} />
       <View className="gap-2 border-b border-border px-4 py-2">
-        <Text className="text-xs text-foreground-muted">{target.tableId}</Text>
-        {summary ? (
-          <Text className="text-xs text-foreground-muted">{tableObservation(summary)}</Text>
-        ) : null}
-        {summary?.gaps.length ? (
-          <Text accessibilityRole="alert">Capture gaps: {summary.gaps.join(", ")}</Text>
-        ) : null}
+        {summary ? <NativeTableStatus summary={summary} /> : null}
         <View className="flex-row flex-wrap gap-2">
           {tableTabs.map((tab) => (
             <ArchitectureAction

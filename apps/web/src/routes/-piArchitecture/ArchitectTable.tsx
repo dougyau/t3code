@@ -4,7 +4,6 @@ import {
   participantModel,
   recordSections,
   tableKey,
-  tableObservation,
   tablePresentationAtom,
   tableTabs,
   type ReadingPoint,
@@ -30,6 +29,7 @@ import { observeResize } from "../../lib/observeResize";
 import { cn } from "../../lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "../../workspaceTitlebar";
 import { piArchitecture } from "./state";
+import { TableStatus } from "./TableStatus";
 
 export interface ArchitectTableProps {
   readonly target: TableTarget;
@@ -173,25 +173,32 @@ export function ArchitectTable({
             Return to coordinator
           </Button>
         </div>
-        <p className="mt-2 break-all text-sm text-muted-foreground">{target.tableId}</p>
-        {summary ? <p className="mt-2 text-sm">{tableObservation(summary)}</p> : null}
-        {summary?.gaps.length ? <p role="status">Capture gaps: {summary.gaps.join(", ")}</p> : null}
+        {summary ? (
+          <div className="mt-3">
+            <TableStatus summary={summary} />
+          </div>
+        ) : null}
       </header>
       <div
         role="tablist"
         aria-label="Architect table sections"
-        className="flex shrink-0 gap-2 border-b p-2"
+        className="flex shrink-0 flex-wrap gap-2 border-b p-2"
       >
         {tableTabs.map((tab, index) => (
-          <Button
+          <button
             key={tab}
             role="tab"
             id={`architect-tab-${tab}`}
             aria-controls="architect-reading-pane"
             aria-selected={presentation.tab === tab}
             tabIndex={presentation.tab === tab ? 0 : -1}
-            variant={presentation.tab === tab ? "secondary" : "ghost"}
-            size="sm"
+            type="button"
+            className={cn(
+              "rounded-md border-b-2 px-3 py-2 text-sm focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
+              presentation.tab === tab
+                ? "border-primary bg-primary font-semibold text-primary-foreground focus-visible:outline-primary-foreground"
+                : "border-transparent font-normal text-muted-foreground hover:bg-muted hover:text-foreground",
+            )}
             onClick={() => changeTab(tab)}
             onKeyDown={(event) => {
               const next =
@@ -212,7 +219,7 @@ export function ArchitectTable({
             }}
           >
             {tab}
-          </Button>
+          </button>
         ))}
       </div>
       <div
@@ -248,20 +255,24 @@ export function ArchitectTable({
                   Back to {presentation.tab}
                 </Button>
                 <Button
-                  variant="ghost"
+                  variant={presentation.source ? "ghost" : "default"}
                   size="sm"
                   aria-pressed={!presentation.source}
                   onClick={() => update({ source: false })}
                 >
-                  Reading
+                  <span className={presentation.source ? "font-normal" : "font-semibold"}>
+                    Reading
+                  </span>
                 </Button>
                 <Button
-                  variant="ghost"
+                  variant={presentation.source ? "default" : "ghost"}
                   size="sm"
                   aria-pressed={presentation.source}
                   onClick={() => update({ source: true })}
                 >
-                  Source
+                  <span className={presentation.source ? "font-semibold" : "font-normal"}>
+                    Source
+                  </span>
                 </Button>
               </div>
               <CapturedContent

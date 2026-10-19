@@ -1,7 +1,96 @@
-import { EnvironmentId, ThreadId, type PiArchitectureDetailRecord } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProviderInstanceId,
+  ThreadId,
+  type PiArchitectureDetailRecord,
+  type PiArchitectureSummary,
+} from "@t3tools/contracts";
 import { AtomRegistry } from "effect/reactivity";
 import { expect, it } from "vite-plus/test";
-import { debateGroups, recordSections, tablePresentationAtom, tableTabs } from "./model.ts";
+import {
+  debateGroups,
+  recordSections,
+  tablePresentationAtom,
+  tableStatus,
+  tableTabs,
+} from "./model.ts";
+
+const historical: PiArchitectureSummary = {
+  tableId: "opaque-table-id",
+  threadId: ThreadId.make("coordinator"),
+  providerInstanceId: ProviderInstanceId.make("pi"),
+  coordinatorSessionId: "session",
+  roomId: "room",
+  mode: "table",
+  participants: 2,
+  lifecycle: {
+    stage: "closing",
+    round: 2,
+    protocolState: "finished",
+    outcome: "available",
+    closure: { state: "released", members: "released", director: "released" },
+  },
+  capture: "closed",
+  observation: "stale",
+  gaps: [],
+};
+
+it("presents a finished historical table without claiming success or exposing diagnostic enums", () => {
+  expect(tableStatus(historical)).toEqual({
+    state: "Finished",
+    result: "Result available",
+    context: "Historical view",
+    warnings: [],
+  });
+});
+
+it("keeps active work last-known when stale and never infers completion from other fields", () => {
+  const running = {
+    ...historical,
+    lifecycle: { ...historical.lifecycle, protocolState: "running" as const },
+  };
+  expect(tableStatus({ ...running, observation: "current" }).state).toBe("Running");
+  expect(tableStatus(running)).toMatchObject({
+    state: "Last known: Running",
+    context: "Historical view",
+  });
+  expect(
+    tableStatus({
+      ...running,
+      lifecycle: { ...running.lifecycle, protocolState: "waiting", outcome: "pending" },
+    }),
+  ).toMatchObject({ state: "Last known: Waiting", result: "Result pending" });
+});
+
+it("does not let available results or closed capture conceal failure, cancellation or uncertainty", () => {
+  for (const [protocolState, state] of [
+    ["failed", "Failed"],
+    ["cancelled", "Cancelled"],
+    ["closure-unknown", "Completion unconfirmed"],
+  ] as const) {
+    expect(
+      tableStatus({ ...historical, lifecycle: { ...historical.lifecycle, protocolState } }).state,
+    ).toBe(state);
+  }
+  const uncertain = tableStatus({
+    ...historical,
+    observation: "partial",
+    capture: "incomplete",
+    gaps: ["Missing final interval"],
+    lifecycle: {
+      ...historical.lifecycle,
+      closure: { state: "unknown", members: "released", director: "unknown" },
+    },
+  });
+  expect(uncertain).toMatchObject({
+    state: "Completion unconfirmed",
+    context: "Partial view",
+  });
+  expect(uncertain.warnings.join(" ")).toContain("Only part of this table was observed.");
+  expect(uncertain.warnings.join(" ")).toContain("Capture is incomplete.");
+  expect(uncertain.warnings.join(" ")).toContain("Missing final interval");
+  expect(uncertain.warnings.join(" ")).toContain("Native closure could not be confirmed.");
+});
 
 it("isolates reading anchors by environment, coordinator and table", () => {
   const registry = AtomRegistry.make();

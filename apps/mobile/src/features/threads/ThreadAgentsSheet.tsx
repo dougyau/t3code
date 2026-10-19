@@ -23,9 +23,15 @@ import { NativeStackScreenOptions, nativeHeaderScrollEdgeEffects } from "../../n
 import { SubagentRow } from "./SubagentRow";
 import { MaterialScreenContent } from "../../components/MaterialScreenContent";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
-import { ArchitectureAction, mobilePiArchitecture } from "./ThreadArchitectTableScreen";
+import {
+  ArchitectureAction,
+  mobilePiArchitecture,
+  NativeTableStatus,
+} from "./ThreadArchitectTableScreen";
 import {
   isTableWorker,
+  participantExecution,
+  participantLabel,
   type TableTarget,
 } from "@t3tools/client-runtime/state/piArchitecture/model";
 import type { PiArchitectureSummary } from "@t3tools/contracts";
@@ -174,50 +180,62 @@ function NativeTableEntry(props: {
   readonly onOpen: (target: TableTarget) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [identifiers, setIdentifiers] = useState(false);
   const canRead = useAtomValue(mobilePiArchitecture.read.permissionAtom(props.environmentId));
   return (
-    <View className="gap-2 border-b border-border py-3">
+    <View className="my-2 min-w-0 gap-3 rounded-lg border border-border p-4">
+      <View className="flex-row flex-wrap items-baseline justify-between gap-2">
+        <Text className="font-t3-bold text-sm text-foreground">Architect table</Text>
+        <Text className="text-xs text-foreground-muted">
+          {props.table.participants} participants
+        </Text>
+      </View>
+      <NativeTableStatus summary={props.table} />
+      {canRead ? (
+        <ArchitectureAction
+          primary
+          onPress={() =>
+            props.onOpen({
+              environmentId: props.environmentId,
+              threadId: props.table.threadId,
+              tableId: props.table.tableId,
+            })
+          }
+        >
+          Open Architect table
+        </ArchitectureAction>
+      ) : (
+        <Text>Requires orchestration read permission.</Text>
+      )}
       <ArchitectureAction expanded={expanded} onPress={() => setExpanded(!expanded)}>
-        Architect table · {props.table.participants} participants ·{" "}
-        {props.table.lifecycle.protocolState}
+        Participants
       </ArchitectureAction>
-      {expanded ? (
+      {expanded && canRead ? (
         <>
-          <Text className="text-xs text-foreground-muted">
-            {props.table.tableId} · Capture {props.table.capture} · {props.table.observation} ·
-            Native closure {props.table.lifecycle.closure.state}
-          </Text>
-          {canRead ? (
-            <>
-              <ArchitectureAction
-                onPress={() =>
-                  props.onOpen({
-                    environmentId: props.environmentId,
-                    threadId: props.table.threadId,
-                    tableId: props.table.tableId,
-                  })
-                }
-              >
-                Open Architect table
-              </ArchitectureAction>
-              <NativeTableRoster
-                target={{
-                  environmentId: props.environmentId,
-                  threadId: props.table.threadId,
-                  tableId: props.table.tableId,
-                }}
-              />
-            </>
-          ) : (
-            <Text>Requires orchestration read permission.</Text>
-          )}
+          <NativeTableRoster
+            identifiers={identifiers}
+            target={{
+              environmentId: props.environmentId,
+              threadId: props.table.threadId,
+              tableId: props.table.tableId,
+            }}
+          />
+          <ArchitectureAction expanded={identifiers} onPress={() => setIdentifiers(!identifiers)}>
+            Technical identifiers
+          </ArchitectureAction>
         </>
       ) : null}
     </View>
   );
 }
 
-function NativeTableRoster({ target }: { readonly target: TableTarget }) {
+function NativeTableRoster({
+  target,
+  identifiers,
+}: {
+  readonly target: TableTarget;
+  readonly identifiers: boolean;
+}) {
   const result = useAtomValue(
     mobilePiArchitecture.query({
       environmentId: target.environmentId,
@@ -231,9 +249,17 @@ function NativeTableRoster({ target }: { readonly target: TableTarget }) {
         data.items
           .filter((record) => record.kind === "member")
           .map((member) => (
-            <Text key={member.id}>
-              {member.roleId} · {member.id} · {member.execution}
-            </Text>
+            <View key={member.id} className="min-w-0 gap-1">
+              <Text className="font-t3-medium text-sm text-foreground">
+                {participantLabel(member)}
+              </Text>
+              <Text className="text-xs text-foreground-muted">{participantExecution(member)}</Text>
+              {identifiers ? (
+                <Text selectable className="text-xs text-foreground-muted">
+                  Member ID: {member.id} · Assignment ID: {member.assignmentId}
+                </Text>
+              ) : null}
+            </View>
           ))
       ) : (
         <Text>{result._tag === "Failure" ? "Roster unavailable" : "Loading roster…"}</Text>

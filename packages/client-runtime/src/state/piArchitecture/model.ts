@@ -57,6 +57,62 @@ export function participantModel(member: Member) {
   return `Selected model: ${member.model?.selected ?? "unavailable"} · Activated model: ${member.model?.activated ?? "unavailable"}`;
 }
 
+export function participantLabel(member: Member) {
+  const label = { director: "Director", specialist: "Specialist", support: "Support" }[
+    member.function
+  ];
+  return `${label} · ${member.roleId} · #${member.ordinal}`;
+}
+
+export function participantExecution(member: Member) {
+  return {
+    accepted: "Accepted",
+    running: "Running",
+    completed: "Completed",
+    failed: "Failed",
+    cancelled: "Cancelled",
+  }[member.execution];
+}
+
+/** Protocol completion, result availability and capture quality are independent facts. */
+export function tableStatus(summary: PiArchitectureSummary) {
+  const { lifecycle } = summary;
+  const closureUnknown = Object.values(lifecycle.closure).includes("unknown");
+  const active = ["starting", "running", "waiting"].includes(lifecycle.protocolState);
+  const state = {
+    starting: "Starting",
+    running: "Running",
+    waiting: "Waiting",
+    finished: closureUnknown ? "Completion unconfirmed" : "Finished",
+    failed: "Failed",
+    cancelled: "Cancelled",
+    "closure-unknown": "Completion unconfirmed",
+  }[lifecycle.protocolState];
+  const warnings = [];
+  if (summary.observation === "partial") warnings.push("Only part of this table was observed.");
+  if (summary.capture === "incomplete") warnings.push("Capture is incomplete.");
+  if (summary.gaps.length) warnings.push(`Capture gaps: ${summary.gaps.join(", ")}`);
+  if (closureUnknown || lifecycle.protocolState === "closure-unknown")
+    warnings.push("Native closure could not be confirmed.");
+  else if (Object.values(lifecycle.closure).includes("pending"))
+    warnings.push("Native cleanup is still pending.");
+  return {
+    state: active && summary.observation !== "current" ? `Last known: ${state}` : state,
+    result: {
+      pending: "Result pending",
+      available: "Result available",
+      unavailable: "Result unavailable",
+    }[lifecycle.outcome],
+    context:
+      summary.observation === "stale"
+        ? "Historical view"
+        : summary.observation === "partial"
+          ? "Partial view"
+          : null,
+    warnings,
+  };
+}
+
 export function debateGroups(records: readonly PiArchitectureDetailRecord[]) {
   const groups = new Map<string, Publication[]>();
   for (const record of records) {

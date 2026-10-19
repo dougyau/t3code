@@ -7,7 +7,12 @@ import { AsyncResult } from "effect/reactivity";
 import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { retainTimelinePosition } from "../../components/chat/timelineScrollAnchoring";
 import { Button } from "../../components/ui/button";
+import {
+  participantExecution,
+  participantLabel,
+} from "@t3tools/client-runtime/state/piArchitecture/model";
 import { piArchitecture } from "./state";
+import { TableStatus } from "./TableStatus";
 
 export function ArchitectLineage(props: {
   readonly environmentId: EnvironmentId;
@@ -29,22 +34,16 @@ function TableEntry({
   const [expanded, setExpanded] = useState(false);
   const canRead = useAtomValue(piArchitecture.read.permissionAtom(environmentId));
   return (
-    <details
-      className="min-w-0 rounded-md border p-2"
-      onToggle={(event) => setExpanded(event.currentTarget.open)}
-    >
-      <summary className="cursor-pointer text-sm font-medium">
-        Architect table · {table.participants} participants · {table.lifecycle.protocolState}
-      </summary>
-      <div className="mt-2 flex min-w-0 flex-col gap-2">
-        <p className="break-all text-xs text-muted-foreground">{table.tableId}</p>
-        <p className="text-xs">
-          Capture {table.capture} · {table.observation} · Native closure{" "}
-          {table.lifecycle.closure.state}
-        </p>
+    <section className="min-w-0 rounded-lg border p-4 [overflow-wrap:anywhere]">
+      <div className="flex min-w-0 flex-col gap-3">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h3 className="text-sm font-semibold">Architect table</h3>
+          <span className="text-xs text-muted-foreground">{table.participants} participants</span>
+        </div>
+        <TableStatus summary={table} />
         <div>
           <Button
-            variant="outline"
+            variant="default"
             size="sm"
             disabled={!canRead}
             onClick={() => {
@@ -61,9 +60,12 @@ function TableEntry({
           </Button>
         </div>
         {!canRead ? <p className="text-xs">Requires orchestration read permission.</p> : null}
-        {expanded && canRead ? <TableRoster environmentId={environmentId} table={table} /> : null}
+        <details onToggle={(event) => setExpanded(event.currentTarget.open)}>
+          <summary className="cursor-pointer text-sm font-medium">Participants</summary>
+          {expanded && canRead ? <TableRoster environmentId={environmentId} table={table} /> : null}
+        </details>
       </div>
-    </details>
+    </section>
   );
 }
 
@@ -82,13 +84,19 @@ function TableRoster({
   );
   const data = Option.getOrNull(AsyncResult.value(result));
   return (
-    <ul className="text-sm">
+    <ul className="mt-3 flex min-w-0 flex-col gap-3 text-sm">
       {data?.kind === "records" ? (
         data.items
           .filter((record) => record.kind === "member")
           .map((member) => (
-            <li key={member.id}>
-              {member.roleId} · {member.id} · {member.execution}
+            <li key={member.id} className="min-w-0">
+              <p className="font-medium">{participantLabel(member)}</p>
+              <p className="text-xs text-muted-foreground">{participantExecution(member)}</p>
+              <details className="mt-1 text-xs text-muted-foreground">
+                <summary className="cursor-pointer">Technical identifiers</summary>
+                <p>Member ID: {member.id}</p>
+                <p>Assignment ID: {member.assignmentId}</p>
+              </details>
             </li>
           ))
       ) : (
