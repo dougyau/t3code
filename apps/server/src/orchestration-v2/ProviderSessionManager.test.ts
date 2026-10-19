@@ -14,6 +14,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
   type ProviderSessionId,
   type PiNativeWorkerLaunch,
   type PiNativeWorkerCheckpoint,
@@ -931,6 +932,190 @@ const writeResidencyCheckpoint = Effect.fnUntraced(function* (
   });
   assert.isTrue(receipt.committed);
 });
+
+it.effect.each(["completed-root", "owned-node", "other-provider-thread", "missing-root"] as const)(
+  "collects Architecture only with a legitimate ordinary coordinator anchor: %s",
+  (anchor) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const owner = { ...residencyOwner, coordinatorSessionId: "native-thread" };
+      const batch: ProviderAdapter.ProviderArchitectureBatch = {
+        roomId: "root-room",
+        checkpoint: { owner, ownerGeneration: 1, snapshotId: "root-cut", cut: 1 },
+        capture: "open",
+        gaps: [],
+        records: [
+          {
+            kind: "room",
+            id: "root-room",
+            mode: "table",
+            origin: {
+              coordinatorSessionId: owner.coordinatorSessionId,
+              tool: "architecture_start",
+              toolCallId: "root-start",
+              memberId: "director",
+              instanceId: "director",
+              assignmentId: "director-assignment",
+            },
+            goalSource: { kind: "worker-workbrief", instanceId: "director" },
+            lifecycle: {
+              stage: "preparation",
+              round: 1,
+              protocolState: "running",
+              outcome: "pending",
+              closure: { state: "pending", members: "pending", director: "pending" },
+            },
+            pendingDoubtIds: [],
+          },
+          {
+            kind: "member",
+            id: "director",
+            assignmentId: "director-assignment",
+            instanceId: "director",
+            roleId: "architect",
+            function: "director",
+            ordinal: 0,
+            admittedAt: 1,
+            mandate: { source: "root-workbrief", instanceId: "director" },
+            execution: "running",
+            conversationRefs: [],
+          },
+        ],
+      };
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("root-coordinator-thread");
+        const providerSessionId = yield* ids.allocate.providerSession({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const parent = {
+          ...makeProviderThread({ idAllocator: ids, threadId, providerSessionId, now }),
+          ownerNodeId: anchor === "owned-node" ? NodeId.make("owned-provider-node") : null,
+        };
+        if (anchor !== "owned-node") assert.isNull(parent.ownerNodeId);
+        const runId = ids.derive.run({ threadId, ordinal: 1 });
+        const rootNodeId = ids.derive.rootNode({ runId });
+        const run = {
+          id: runId,
+          threadId,
+          ordinal: 1,
+          providerInstanceId: modelSelection.instanceId,
+          modelSelection,
+          providerThreadId:
+            anchor === "other-provider-thread" ? ProviderThreadId.make("unrelated") : parent.id,
+          userMessageId: MessageId.make("root-user-message"),
+          rootNodeId: anchor === "missing-root" ? null : rootNodeId,
+          activeAttemptId: ids.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          status: "completed" as const,
+          requestedAt: now,
+          startedAt: now,
+          completedAt: now,
+          checkpointId: null,
+          contextHandoffId: null,
+        };
+        yield* sink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now }),
+            {
+              id: yield* ids.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: parent,
+            },
+            {
+              id: yield* ids.allocate.event({ threadId }),
+              type: "run.created",
+              threadId,
+              occurredAt: now,
+              payload: run,
+            },
+            // A newer unrelated run must never supply the coordinator's root.
+            {
+              id: yield* ids.allocate.event({ threadId }),
+              type: "run.created",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...run,
+                id: ids.derive.run({ threadId, ordinal: 2 }),
+                ordinal: 2,
+                providerThreadId: ProviderThreadId.make("newer-unrelated"),
+                rootNodeId: NodeId.make("wrong-root"),
+              },
+            },
+          ],
+        });
+        // open awaits the real collector's initial pass; no timer or polling is needed.
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        const archives = yield* sink.architectures(threadId);
+        const thread = yield* projections.getThread(threadId);
+        const members = yield* sink.nativeWorkers(providerSessionId);
+        if (anchor === "completed-root" || anchor === "owned-node") {
+          assert.lengthOf(archives, 1);
+          assert.equal(archives[0]?.parentProviderThreadId, parent.id);
+          assert.deepEqual(archives[0]?.records, batch.records);
+          assert.equal(thread.nativeTables?.[0]?.roomId, batch.roomId);
+          assert.lengthOf(members, 1);
+          assert.deepEqual(members[0]?.nativeWorker?.launch, {
+            source: "architecture_roster",
+            providerInstanceId: modelSelection.instanceId,
+            providerSessionId,
+            parentThreadId: threadId,
+            parentProviderThreadId: parent.id,
+            parentNodeId: parent.ownerNodeId ?? rootNodeId,
+            coordinatorSessionId: owner.coordinatorSessionId,
+            roomId: batch.roomId,
+            memberId: "director",
+            assignmentId: "director-assignment",
+            instanceId: "director",
+            roleId: "architect",
+          });
+        } else {
+          assert.isEmpty(archives);
+          assert.isEmpty(thread.nativeTables ?? []);
+          assert.isEmpty(members);
+        }
+        yield* manager.close(providerSessionId);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            nativeWorkers: () => ({
+              ...residencyPort(() => Effect.succeed({ state: "pending" })),
+              owner,
+              readArchitectures: () => Effect.succeed([batch]),
+              read: (launch, expected) => {
+                if (expected === undefined) return Effect.die("Expected admitted checkpoint");
+                return Effect.succeed({
+                  launch,
+                  expectedCheckpoint: expected,
+                  checkpoint: expected,
+                  records: [],
+                  bindings: [],
+                  more: false,
+                  summary: {
+                    launch,
+                    execution: "running",
+                    result: "pending",
+                    capture: "opening",
+                    availability: "ready",
+                    gaps: [],
+                  },
+                });
+              },
+            }),
+          }),
+        ),
+      );
+    }),
+);
 
 it.effect(
   "observes Architecture while foreground is idle and fences the retired owner on close",
