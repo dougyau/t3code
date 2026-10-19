@@ -236,6 +236,7 @@ it("distinguishes missing, empty and unknown-completeness originals without leak
     expect(texts()).not.toContain("Brief unavailable");
     expect(texts()).toContain("Brief completeness not reported.");
     expect(texts()).not.toContain("Complete brief");
+    if (withoutBrief.launch.source !== "team_assign") throw new Error("Expected team fixture");
     const launch = { ...withoutBrief.launch, source: "agent_spawn" as const };
     await act(async () => state.update(registry, { ...withoutBrief, launch, brief: " \n\t " }));
     expect(texts()).toContain(" \n\t ");
@@ -347,6 +348,8 @@ it("opens the ID-only reader above the observed child and returns to that exact 
 it("uses execution only in visible and spoken footer text, keeps unreported activated models explicit, and leaves non-native presentation alone", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const base = nativeWorkerFixture();
+  if (base.launch.source !== "team_assign") throw new Error("Expected team fixture");
+  const launch = base.launch;
   const { activated: _activated, execution: _execution, roleId: _role, ...unreported } = base;
   await act(async () => {
     renderer = create(
@@ -357,7 +360,7 @@ it("uses execution only in visible and spoken footer text, keeps unreported acti
         status={null}
         nativeWorker={{
           ...unreported,
-          launch: { ...base.launch, source: "agent_spawn" },
+          launch: { ...launch, source: "agent_spawn" },
           selected: { model: "selected-only" },
         }}
         onOpenParent={null}

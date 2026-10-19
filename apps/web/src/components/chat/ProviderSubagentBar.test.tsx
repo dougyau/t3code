@@ -151,6 +151,7 @@ it("reads exact long partial text, switches observation, follows updates and nev
   expect(renderedText()).toContain("Activated modelgpt-effective");
   expect(renderedText()).toContain("unsupported_content");
   expect(renderedText()).toContain("Gaps do not determine");
+  if (worker.launch.source !== "team_assign") throw new Error("Expected team fixture");
   const next = nativeWorkerFixture({
     brief: "new worker text",
     briefComplete: true,
@@ -205,6 +206,7 @@ it.each([
 
 it("does not imply execution or activation from selected models and observation fields", async () => {
   const worker = nativeWorkerFixture();
+  if (worker.launch.source !== "team_assign") throw new Error("Expected team fixture");
   const { execution: _execution, result: _result, roleId: _roleId, ...unknown } = worker;
   await mount({
     ...unknown,

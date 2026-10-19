@@ -1677,6 +1677,14 @@ const WsOrchestrationV2GetThreadProjectionRpc = Rpc.make(
     error: Schema.Union([OrchestrationV2GetThreadProjectionError, EnvironmentAuthorizationError]),
   },
 );
+const WsOrchestrationV2GetPiArchitectureRpc = Rpc.make(
+  ORCHESTRATION_V2_WS_METHODS.getPiArchitecture,
+  {
+    payload: OrchestrationV2RpcSchemas.getPiArchitecture.input,
+    success: OrchestrationV2RpcSchemas.getPiArchitecture.output,
+    error: Schema.Union([OrchestrationV2GetThreadProjectionError, EnvironmentAuthorizationError]),
+  },
+);
 
 const WsOrchestrationV2StopWorkflowRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS.stopWorkflow, {
   payload: OrchestrationV2RpcSchemas.stopWorkflow.input,
@@ -2065,6 +2073,7 @@ export const WsCoreRpcGroup = RpcGroup.make(
   WsOrchestrationV2SearchThreadStreamRpc,
   WsOrchestrationV2GetArchivedShellSnapshotRpc,
   WsOrchestrationV2GetThreadProjectionRpc,
+  WsOrchestrationV2GetPiArchitectureRpc,
   WsOrchestrationV2LaunchThreadRpc,
   WsOrchestrationV2SubscribeArchivedShellRpc,
   WsOrchestrationV2SubscribeShellRpc,

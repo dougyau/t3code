@@ -41,6 +41,16 @@ vi.mock("react-native-screens", () => ({
 vi.mock("react-native-safe-area-context", () => ({ useSafeAreaInsets: () => ({ bottom: 0 }) }));
 vi.mock("../../components/AndroidScreenHeader", () => ({ AndroidSheetHeader: "Header" }));
 vi.mock("../../components/AppText", () => ({ AppText: "Text" }));
+vi.mock("../../components/ScreenHeader", () => ({ ScreenHeader: "Header" }));
+vi.mock("../../native/SelectableMarkdownText", () => ({ SelectableMarkdownText: "Markdown" }));
+vi.mock("../files/FileMarkdownPreview", () => ({
+  useMarkdownPreviewStyles: () => ({ nativeTextStyle: {} }),
+}));
+vi.mock("../../connection/runtime", async () => {
+  const { Atom } = await import("effect/reactivity");
+  const Layer = await import("effect/Layer");
+  return { connectionAtomRuntime: Atom.runtime(Layer.empty) };
+});
 vi.mock("../../components/AppSymbol", () => ({ SymbolView: "Symbol" }));
 vi.mock("../../components/ProviderIcon", () => ({ ProviderIcon: "Icon" }));
 vi.mock("../../components/MaterialScreenContent", () => ({ MaterialScreenContent: "Material" }));
@@ -74,6 +84,7 @@ vi.mock("../../state/threads", async () => {
     await import("../../../../../packages/client-runtime/src/state/orchestrationV2TestFixtures");
   const team = nativeSubagentFixture();
   const launch = team.nativeWorker!.launch;
+  if (launch.source !== "team_assign") throw new Error("Expected tool-launched fixture");
   const independent = nativeSubagentFixture({
     id: NodeId.make("independent"),
     childThreadId: ThreadId.make("independent-chat"),

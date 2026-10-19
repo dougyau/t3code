@@ -1,8 +1,11 @@
 import type {
+  PiArchitectureReadInput,
+  PiArchitectureReadResult,
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
   OrchestrationV2ThreadHistoryPage,
 } from "@t3tools/contracts";
+import * as ArchitectureQuery from "./ArchitectureQuery.ts";
 import {
   latestExecutedRun,
   latestRootProviderFailure,
@@ -322,6 +325,9 @@ export interface OrchestratorV2Shape {
   readonly getThreadProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadProjection, OrchestratorV2Error>;
+  readonly getPiArchitecture: (
+    input: PiArchitectureReadInput,
+  ) => Effect.Effect<PiArchitectureReadResult, OrchestratorV2Error>;
   readonly getCheckpointContext: (
     threadId: ThreadId,
   ) => Effect.Effect<ProjectionCheckpointContext, OrchestratorV2Error>;
@@ -11373,6 +11379,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projectionStore
         .getThreadRecords(threadId, fields, filter)
         .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
+    getPiArchitecture: (input) =>
+      Effect.gen(function* () {
+        yield* projectionStore.getThread(input.threadId);
+        const archives = yield* eventSink.architectures(
+          input.threadId,
+          input.kind === "tables" ? undefined : input.tableId,
+        );
+        const workers = yield* projectionStore.getThreadRecords(input.threadId, ["subagents"]);
+        return yield* ArchitectureQuery.read(input, archives, workers.subagents);
+      }).pipe(
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
+        ),
+      ),
     getThreadProjection: (threadId) =>
       projectionStore
         .getThreadProjection(threadId)
@@ -11497,6 +11517,7 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
     getMessageCount: (threadId) => Effect.fail(new OrchestratorProjectionError({ threadId })),
     getTurnItem: ({ threadId }) => Effect.fail(new OrchestratorProjectionError({ threadId })),
     getThreadRecords: (threadId) => Effect.fail(new OrchestratorProjectionError({ threadId })),
+    getPiArchitecture: ({ threadId }) => Effect.fail(new OrchestratorProjectionError({ threadId })),
     getThreadProjection: (threadId) =>
       Effect.fail(
         new OrchestratorProjectionError({

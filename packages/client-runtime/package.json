@@ -3,6 +3,14 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./state/piArchitecture/model": {
+      "types": "./src/state/piArchitecture/model.ts",
+      "default": "./src/state/piArchitecture/model.ts"
+    },
+    "./state/piArchitecture/queries": {
+      "types": "./src/state/piArchitecture/queries.ts",
+      "default": "./src/state/piArchitecture/queries.ts"
+    },
     "./native-worker-message": {
       "types": "./src/nativeWorkerMessage.ts",
       "default": "./src/nativeWorkerMessage.ts"

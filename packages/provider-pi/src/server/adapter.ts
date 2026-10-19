@@ -109,10 +109,25 @@ import { PiWorkerBridge } from "./workerBridge.ts";
 export const PI_PROVIDER = ProviderDriverKind.make("pi");
 const PI_DRIVER_KIND = PI_PROVIDER;
 const DEFAULT_PI_SETTINGS = Schema.decodeSync(PiSettings)({});
-const decodeSpawnResult = Schema.decodeUnknownOption(Schema.Struct({ instanceId: TrimmedNonEmptyString }));
-const decodeAssignmentResult = Schema.decodeUnknownOption(Schema.Struct({
-  id: TrimmedNonEmptyString, instanceId: TrimmedNonEmptyString, roleId: TrimmedNonEmptyString,
-}));
+const decodeSpawnResult = Schema.decodeUnknownOption(
+  Schema.Struct({ instanceId: TrimmedNonEmptyString }),
+);
+const decodeAssignmentResult = Schema.decodeUnknownOption(
+  Schema.Struct({
+    id: TrimmedNonEmptyString,
+    instanceId: TrimmedNonEmptyString,
+    roleId: TrimmedNonEmptyString,
+  }),
+);
+const decodeArchitectureResult = Schema.decodeUnknownOption(
+  Schema.Struct({
+    roomId: TrimmedNonEmptyString,
+    assignmentId: TrimmedNonEmptyString,
+    memberId: TrimmedNonEmptyString,
+    instanceId: TrimmedNonEmptyString,
+    roleId: TrimmedNonEmptyString,
+  }),
+);
 
 /**
  * Sentinel model slug meaning "do not call set_model": Pi resolves the model
@@ -568,8 +583,11 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         yield* Effect.addFinalizer((exit) => Scope.close(attemptScope, exit));
         const workers = new PiWorkerBridge(platform, launchFailed);
         let spawnAttempted = false;
-        yield* Scope.addFinalizer(attemptScope,
-          Effect.sync(() => { if (!spawnAttempted) workers.cleanupDirectory(true); }),
+        yield* Scope.addFinalizer(
+          attemptScope,
+          Effect.sync(() => {
+            if (!spawnAttempted) workers.cleanupDirectory(true);
+          }),
         );
         const scopedLaunch = yield* agentScope.wrap({
           command: binary,
@@ -586,22 +604,23 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           args: scopedLaunch.args,
           cwd,
           env: launch.env,
-          ...(workers.launchArgs.length === 0 ? {} : {
-            bridgeOptions: [
-              "--pitako-agent-bridge" as const,
-            ],
-          }),
+          ...(workers.launchArgs.length === 0
+            ? {}
+            : {
+                bridgeOptions: ["--pitako-agent-bridge" as const],
+              }),
         }).pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
           Effect.provideService(Scope.Scope, attemptScope),
         );
-        yield* Scope.addFinalizer(attemptScope,
-            workers.close.pipe(
-              Effect.andThen(connection.shutdown),
-              Effect.tap((orderlyExit) => Effect.sync(() => workers.cleanupDirectory(orderlyExit))),
-              Effect.asVoid,
-            ),
-          );
+        yield* Scope.addFinalizer(
+          attemptScope,
+          workers.close.pipe(
+            Effect.andThen(connection.shutdown),
+            Effect.tap((orderlyExit) => Effect.sync(() => workers.cleanupDirectory(orderlyExit))),
+            Effect.asVoid,
+          ),
+        );
         return { connection, workers, attemptScope };
       });
       const selected = yield* Effect.gen(function* () {
@@ -614,13 +633,17 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           Effect.flatMap((state) =>
             recordString(state, "sessionFile")
               ? Effect.succeed(true)
-              : Effect.fail(new PiRpcError({ operation: "bootstrap", detail: "missing sessionFile" })),
+              : Effect.fail(
+                  new PiRpcError({ operation: "bootstrap", detail: "missing sessionFile" }),
+                ),
           ),
           Effect.catchTags({
             PiRpcError: (error) =>
               error.operation === "read" || error.operation === "write"
                 ? initial.connection.bridgeOptionsRejected.pipe(
-                    Effect.flatMap((rejected) => rejected ? Effect.succeed(false) : Effect.fail(error)),
+                    Effect.flatMap((rejected) =>
+                      rejected ? Effect.succeed(false) : Effect.fail(error),
+                    ),
                   )
                 : Effect.fail(error),
           }),
@@ -814,10 +837,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           expectedPointer !== undefined && expectedPointer.list.nativeSessionId !== nativeSessionId;
         const sessionGeneration = Math.max(
           (previous?.sessionGeneration ?? 0) +
-            (previous !== undefined &&
-            previous.list.nativeSessionId !== nativeSessionId
-              ? 1
-              : 0),
+            (previous !== undefined && previous.list.nativeSessionId !== nativeSessionId ? 1 : 0),
           (expectedPointer?.sessionGeneration ?? 0) + (replacedSession ? 1 : 0),
         );
         const captureVersion =
@@ -1241,7 +1261,11 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             : "completed"
           : "running";
         const base = baseItemFields(turn, toolCallId, startedAt, emittedAt);
-        if (phase === "start" && coordinatorSessionId !== undefined && !turn.toolContexts.has(toolCallId)) {
+        if (
+          phase === "start" &&
+          coordinatorSessionId !== undefined &&
+          !turn.toolContexts.has(toolCallId)
+        ) {
           turn.toolContexts.set(toolCallId, {
             providerInstanceId: options.instanceId,
             providerSessionId: input.providerSessionId,
@@ -1251,7 +1275,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             runId: turn.turnInput.runId,
             runAttemptId: turn.turnInput.attemptId,
             toolNodeId: base.nodeId,
-            coordinatorSessionId, toolCallId,
+            coordinatorSessionId,
+            toolCallId,
           });
         }
         yield* emitItemNode(
@@ -1314,14 +1339,31 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const details = recordField(resultRecord, "details");
         const spawn = Option.getOrUndefined(decodeSpawnResult(details));
         const assignment = Option.getOrUndefined(decodeAssignmentResult(details));
+        const architecture = Option.getOrUndefined(decodeArchitectureResult(details));
         const nativeWorkerLaunch: PiNativeWorkerLaunch | undefined =
           completed && !isError && context !== undefined
             ? toolName === "agent_spawn"
-              ? spawn === undefined ? undefined : { ...context, source: "agent_spawn", instanceId: spawn.instanceId }
+              ? spawn === undefined
+                ? undefined
+                : { ...context, source: "agent_spawn", instanceId: spawn.instanceId }
               : toolName === "team_assign" && assignment !== undefined
-                ? { ...context, source: "team_assign", instanceId: assignment.instanceId,
-                    assignmentId: assignment.id, roleId: assignment.roleId }
-                : undefined
+                ? {
+                    ...context,
+                    source: "team_assign",
+                    instanceId: assignment.instanceId,
+                    assignmentId: assignment.id,
+                    roleId: assignment.roleId,
+                  }
+                : toolName === "architecture_start" && architecture !== undefined
+                  ? {
+                      ...context,
+                      source: "team_assign",
+                      entrypoint: "architecture_start",
+                      instanceId: architecture.instanceId,
+                      assignmentId: architecture.assignmentId,
+                      roleId: architecture.roleId,
+                    }
+                  : undefined
             : undefined;
         yield* emit({
           type: "turn_item.updated",

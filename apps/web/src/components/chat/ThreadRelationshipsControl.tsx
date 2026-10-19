@@ -5,6 +5,8 @@ import { ThreadDetailsSection } from "./ThreadDetailsSection";
 import { CollapsibleSectionHeader, SectionHeaderStatus } from "../ui/collapsible-section-header";
 import { SubagentTooltipContent } from "./SubagentTooltipContent";
 import { retainTimelinePosition } from "./timelineScrollAnchoring";
+import { isTableWorker } from "@t3tools/client-runtime/state/piArchitecture/model";
+import { ArchitectLineage } from "../../routes/-piArchitecture/ArchitectLineage";
 import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
@@ -287,6 +289,12 @@ function ThreadRelationshipRows(props: {
     return deriveThreadRelationshipGraph({ threads: shells, projection });
   }, [archivedShells, projection, props.environmentId, threadShells]);
   const currentThread = projection?.thread ?? graph.nodes.get(props.threadId)?.thread;
+  const tables = projection?.thread.nativeTables ?? [];
+  const tableChildren = new Set(
+    (projection?.subagents ?? [])
+      .filter((worker) => tables.some((table) => isTableWorker(table, worker)))
+      .flatMap((worker) => (worker.childThreadId ? [worker.childThreadId] : [])),
+  );
   const currentProject = projects.find((project) => project.id === currentThread?.projectId);
   const navigate = useNavigate();
   const mergeBack = useAtomCommand(threadEnvironment.mergeBack);
@@ -327,18 +335,21 @@ function ThreadRelationshipRows(props: {
     team = [],
     active = [],
     previous = [],
-  } = groupBy(relationshipRows, ({ edge }) => {
-    if (edge.kind !== "subagent" || isParentThreadRelationship(edge, props.threadId))
-      return "related";
-    const agent = subagentsByThreadId.get(edge.targetThreadId);
-    if (agent?.nativeWorker?.launch.source === "team_assign") return "team";
-    if (agent && isOpenNativeWorker(agent)) return "active";
-    return ["completed", "failed", "error", "cancelled", "interrupted", "idle"].includes(
-      edge.status ?? "",
-    )
-      ? "previous"
-      : "active";
-  });
+  } = groupBy(
+    relationshipRows.filter((row) => !tableChildren.has(row.threadId)),
+    ({ edge }) => {
+      if (edge.kind !== "subagent" || isParentThreadRelationship(edge, props.threadId))
+        return "related";
+      const agent = subagentsByThreadId.get(edge.targetThreadId);
+      if (agent?.nativeWorker?.launch.source === "team_assign") return "team";
+      if (agent && isOpenNativeWorker(agent)) return "active";
+      return ["completed", "failed", "error", "cancelled", "interrupted", "idle"].includes(
+        edge.status ?? "",
+      )
+        ? "previous"
+        : "active";
+    },
+  );
   const groups = [
     { id: "related", label: null, rows: related, expanded: true },
     { id: "active", label: null, rows: active, expanded: true },
@@ -349,9 +360,15 @@ function ThreadRelationshipRows(props: {
   const runningCount =
     (projection?.subagents.filter(
       (agent) => agent.childThreadId === null && agent.status === "running",
-    ).length ?? 0) + active.filter(({ edge }) => edge.status === "running").length;
+    ).length ?? 0) +
+    relationshipRows.filter(
+      ({ edge }) =>
+        edge.kind === "subagent" &&
+        !isParentThreadRelationship(edge, props.threadId) &&
+        edge.status === "running",
+    ).length;
 
-  if (relationshipRows.length === 0 && runningCount === 0) {
+  if (relationshipRows.length === 0 && runningCount === 0 && tables.length === 0) {
     return null;
   }
 
@@ -456,6 +473,7 @@ function ThreadRelationshipRows(props: {
         ) : null
       }
     >
+      <ArchitectLineage environmentId={props.environmentId} tables={tables} />
       {groups.map((group) => (
         <ThreadLineageGroup key={`${scopedThreadKey(ref)}:${group.id}`} {...group}>
           {(visibleRows) =>

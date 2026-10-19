@@ -1,4 +1,6 @@
 import {
+  PiArchitectureReadInput,
+  PiArchitectureReadResult,
   OrchestratorMcpCapabilitiesResult,
   OrchestrationV2StopWorkflowInput,
   OrchestratorMcpCreateThreadsInput,
@@ -59,6 +61,19 @@ const OrchestratorCapabilitiesTool = Tool.make("orchestrator_capabilities", {
   dependencies,
 })
   .annotate(Tool.Title, "Get orchestration capabilities")
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
+const PiArchitectureReadTool = Tool.make("t3_pi_architecture_read", {
+  description:
+    "Read only observed Pi architecture tables, settled publications and original briefs from T3's archive. Pages and text continuations remain in one committed revision; this never controls or recovers a native runtime.",
+  parameters: Schema.Struct({ query: PiArchitectureReadInput }),
+  success: PiArchitectureReadResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true);
@@ -286,6 +301,7 @@ export const OrchestratorToolkit = Toolkit.make(
   CreateThreadsTool,
   ThreadListTool,
   ThreadReadTool,
+  PiArchitectureReadTool,
   ThreadUpdateTool,
   ThreadSendTool,
   ThreadWaitTool,

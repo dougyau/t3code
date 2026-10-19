@@ -1,6 +1,6 @@
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import type { ScopedThreadRef } from "@t3tools/contracts";
-import { useNavigate } from "@tanstack/react-router";
+import { Outlet, useNavigate, useParams } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 
 import ChatView from "./ChatView";
@@ -21,8 +21,16 @@ import {
   buildThreadRouteParams,
   isThreadRouteSnapshotAuthoritative,
   resolveThreadRouteRenderState,
+  resolveThreadRouteTarget,
   type ThreadRouteTarget,
 } from "../threadRoutes";
+
+/** Table routes share coordinator params, but must not select its chat surface. */
+export function ThreadRouteOutlet() {
+  const params = useParams({ strict: false });
+  const target = resolveThreadRouteTarget(params);
+  return !("tableId" in params) && target ? <ThreadRouteView target={target} /> : <Outlet />;
+}
 
 /**
  * The single chat surface behind both `/draft/$draftId` and

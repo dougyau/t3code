@@ -19,7 +19,10 @@ import {
   OrchestrationV2Subagent,
   OrchestrationV2TurnItem,
   PiChecklistCapture,
-  PiNativeWorkerLaunch,
+  PiNativeWorkerAdmission,
+  PiArchitectureRecord,
+  PiArchitectureCheckpoint,
+  PiArchitectureText,
   PiNativeWorkerSummary,
   PiNativeWorkerCheckpoint,
   PiNativeWorkerRecord,
@@ -575,19 +578,43 @@ export interface ProviderNativeWorkersPort {
   readonly owner: PiNativeWorkerOwner | undefined;
   /** Coalescible read hints, never launch admission or ordinary provider events. */
   readonly hints: Stream.Stream<void>;
-  readonly reconcile: (launch: PiNativeWorkerLaunch) => Effect.Effect<PiNativeWorkerSummary, Error>;
+  readonly reconcile: (
+    launch: PiNativeWorkerAdmission,
+  ) => Effect.Effect<PiNativeWorkerSummary, Error>;
   readonly read: (
-    launch: PiNativeWorkerLaunch,
+    launch: PiNativeWorkerAdmission,
     checkpoint?: PiNativeWorkerCheckpoint,
   ) => Effect.Effect<ProviderNativeWorkerBatch, Error>;
   /** Call only with launches already admitted by the ordered subscriber. */
-  readonly hasPendingWork: (admitted: ReadonlyArray<PiNativeWorkerLaunch>) => Effect.Effect<boolean>;
+  readonly hasPendingWork: (
+    admitted: ReadonlyArray<PiNativeWorkerAdmission>,
+  ) => Effect.Effect<boolean>;
   /** Owner-global residency only; never root-stream liveness or launch admission. */
   readonly readBackgroundPending: () => Effect.Effect<ProviderBackgroundPending>;
+  readonly readArchitectures?: () => Effect.Effect<ReadonlyArray<ProviderArchitectureBatch>, Error>;
+}
+
+/** A catalog observation establishes no room cut or membership. */
+export class ProviderArchitectureCatalogLoss extends Schema.TaggedError<ProviderArchitectureCatalogLoss>()(
+  "ProviderArchitectureCatalogLoss",
+  {
+    catalogGap: Schema.String,
+    owner: PiNativeWorkerOwner,
+    ownerGeneration: Schema.Number,
+  },
+) {}
+
+export interface ProviderArchitectureBatch {
+  readonly roomId: string;
+  readonly checkpoint: PiArchitectureCheckpoint;
+  readonly records: ReadonlyArray<PiArchitectureRecord>;
+  readonly capture: "open" | "closed" | "incomplete";
+  readonly gaps: ReadonlyArray<string>;
+  readonly original?: PiArchitectureText;
 }
 
 export interface ProviderNativeWorkerBatch {
-  readonly launch: PiNativeWorkerLaunch;
+  readonly launch: PiNativeWorkerAdmission;
   readonly summary: PiNativeWorkerSummary;
   readonly expectedCheckpoint: PiNativeWorkerCheckpoint | undefined;
   readonly checkpoint: PiNativeWorkerCheckpoint;

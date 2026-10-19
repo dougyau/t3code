@@ -119,6 +119,13 @@ const handlers = {
       return yield* service.readThread(scope, input);
     }),
   ),
+  t3_pi_architecture_read: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      return yield* service.readPiArchitecture(scope, input.query);
+    }),
+  ),
   t3_thread_update: McpToolAccess.writesThreads(
     (input) => [input.threadId],
     (input) =>

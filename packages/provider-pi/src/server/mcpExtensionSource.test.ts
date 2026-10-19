@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodeModule from "node:module";
 import * as NodeVM from "node:vm";
 import { assert, describe, expect, it } from "@effect/vitest";
+import { T3_CODE_ORCHESTRATION_INSTRUCTIONS } from "@t3tools/provider-core/server/orchestrationInstructions";
 
 import { PI_T3_MCP_EXTENSION_SOURCE } from "./mcpExtensionSource.ts";
 import { loadMcpBridge } from "./mcpBridge.testkit.ts";
@@ -47,6 +48,52 @@ async function loadHooks(commands: ReadonlyArray<SkillCommand> = []) {
   });
   return handlers;
 }
+
+describe("Pi orchestration instructions", () => {
+  it.each([false, true])(
+    "injects Mermaid guidance through before_agent_start without a manual append, modern=%s",
+    async (modern) => {
+      const bridge = await loadMcpBridge({ modern });
+      const start = bridge.handlers.get("before_agent_start");
+      assert.isDefined(start);
+      const event = Object.freeze({
+        systemPrompt: "Pi base instructions.\nPreserve the user's language and project rules.",
+        prompt: "/skill:review Explain this flow without changing my request.",
+        images: [{ type: "image", data: "fixture" }],
+      });
+      const result = await start!(event, { ui: { notify: assert.fail } });
+      assert.equal(
+        result.systemPrompt,
+        event.systemPrompt + "\n\n" + T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim(),
+      );
+      assert.include(
+        result.systemPrompt,
+        "For flowcharts, sequence diagrams, state diagrams, and relationship diagrams, use Markdown code blocks with the `mermaid` language instead of ASCII diagrams.",
+      );
+      assert.include(
+        result.systemPrompt,
+        "Reserve HTML for visualizations that Mermaid cannot represent adequately.",
+      );
+      assert.include(
+        result.systemPrompt,
+        "check it with `html_preview`, then publish it with `html_render` before your final reply.",
+      );
+      assert.notInclude(
+        result.systemPrompt,
+        "When a chart, table, diagram, image collage, or mockup",
+      );
+      // The hook changes only the system channel, leaving Pi's user/skill expansion intact.
+      assert.deepEqual(Object.keys(result), ["systemPrompt"]);
+      const next = await start!(event, { ui: { notify: assert.fail } });
+      assert.equal(next.systemPrompt, result.systemPrompt);
+    },
+  );
+
+  it("does not install the prompt hook without T3 MCP credentials", async () => {
+    const hooks = await loadHooks();
+    assert.isFalse(hooks.has("before_agent_start"));
+  });
+});
 
 describe("Pi MCP tool results", () => {
   it("returns mixed screenshot blocks and typed script output without repeating structured text", async () => {

@@ -61,6 +61,7 @@ const busyTurnPrefix = (providerThreadId: ProviderThreadId) => `${providerThread
 const busyTurnKey = (providerThreadId: ProviderThreadId, runOrdinal: number) =>
   `${busyTurnPrefix(providerThreadId)}${runOrdinal}`;
 const UNLOAD_THREAD_TIMEOUT_MS = 10 * 1000;
+const isArchitectureCatalogLoss = Schema.is(ProviderAdapter.ProviderArchitectureCatalogLoss);
 
 export const ProviderSessionReleaseReason = Schema.Literals([
   "idle_timeout",
@@ -805,59 +806,156 @@ export const layerWithOptions = (
                 input.entry.requestEventPermit.withPermits(1),
               ),
             ),
-            Effect.exit(Effect.gen(function* () {
-              const port = input.entry.runtime.nativeWorkers;
-              if (port === undefined) return;
-              const members = yield* eventSink.nativeWorkers(input.entry.runtime.providerSessionId);
-              for (const member of members) {
-                if (member.childThreadId === null || member.providerThreadId === null ||
-                  member.nativeWorker === undefined) continue;
-                const child = yield* projectionStore.getThreadRecords(member.childThreadId, ["providerThreads"]);
-                const providerThread = child.providerThreads.find((row) => row.id === member.providerThreadId);
-                const checkpoint = providerThread?.nativeMetadata?.nativeWorkerCheckpoint;
-                if (checkpoint === undefined || !input.entry.nativeWorkerOwners.some((snapshot) =>
-                  snapshot.generation === checkpoint.ownerGeneration &&
-                  NodeUtil.isDeepStrictEqual(snapshot.owner, checkpoint.owner))) continue;
-                const closed = checkpoint.capture === "closed";
-                const retired = {
-                  ...checkpoint, ownerGeneration: checkpoint.ownerGeneration + 1,
-                  capture: closed ? "closed" as const : "incomplete" as const,
-                  gaps: closed ? checkpoint.gaps : [...new Set([...checkpoint.gaps, "stale_owner" as const])],
-                };
-                const receipt = yield* eventSink.writeNativeWorker({
-                  launch: checkpoint.launch, ownerGeneration: checkpoint.ownerGeneration,
-                  expectedCheckpoint: checkpoint, checkpoint: retired, retire: true,
-                  build: (committedMember, committedThread) => Effect.gen(function* () {
-                    const eventId = yield* idAllocator.allocate.event({
-                      threadId: member.childThreadId!,
-                      providerSessionId: input.entry.runtime.providerSessionId,
-                    });
-                    return { sourceProgress: false, events: [
-                      {
-                        id: eventId, type: "provider-thread.updated" as const,
-                        threadId: member.childThreadId!, occurredAt: input.releasedAt,
-                        payload: { ...committedThread,
-                          nativeMetadata: { ...committedThread.nativeMetadata, nativeWorkerCheckpoint: retired },
-                          updatedAt: input.releasedAt },
-                      },
-                      {
-                        id: yield* idAllocator.allocate.event({ threadId: member.threadId }),
-                        type: "subagent.updated" as const, threadId: member.threadId,
-                        occurredAt: input.releasedAt,
-                        payload: { ...committedMember,
-                          nativeWorker: { ...member.nativeWorker!, capture: retired.capture, gaps: retired.gaps },
-                          updatedAt: input.releasedAt },
-                      },
-                    ] };
-                  }),
-                });
-                if (!receipt.committed) {
-                  return yield* new EventSink.EventSinkWriteError({
-                    eventCount: 2, cause: "Native retirement checkpoint changed.",
+            Effect.exit(
+              Effect.gen(function* () {
+                const port = input.entry.runtime.nativeWorkers;
+                if (port === undefined) return;
+                const members = yield* eventSink.nativeWorkers(
+                  input.entry.runtime.providerSessionId,
+                );
+                for (const member of members) {
+                  if (
+                    member.childThreadId === null ||
+                    member.providerThreadId === null ||
+                    member.nativeWorker === undefined
+                  )
+                    continue;
+                  const child = yield* projectionStore.getThreadRecords(member.childThreadId, [
+                    "providerThreads",
+                  ]);
+                  const providerThread = child.providerThreads.find(
+                    (row) => row.id === member.providerThreadId,
+                  );
+                  const checkpoint = providerThread?.nativeMetadata?.nativeWorkerCheckpoint;
+                  if (
+                    checkpoint === undefined ||
+                    !input.entry.nativeWorkerOwners.some(
+                      (snapshot) =>
+                        snapshot.generation === checkpoint.ownerGeneration &&
+                        NodeUtil.isDeepStrictEqual(snapshot.owner, checkpoint.owner),
+                    )
+                  )
+                    continue;
+                  const closed = checkpoint.capture === "closed";
+                  const retired = {
+                    ...checkpoint,
+                    ownerGeneration: checkpoint.ownerGeneration + 1,
+                    capture: closed ? ("closed" as const) : ("incomplete" as const),
+                    gaps: closed
+                      ? checkpoint.gaps
+                      : [...new Set([...checkpoint.gaps, "stale_owner" as const])],
+                  };
+                  const receipt = yield* eventSink.writeNativeWorker({
+                    launch: checkpoint.launch,
+                    ownerGeneration: checkpoint.ownerGeneration,
+                    expectedCheckpoint: checkpoint,
+                    checkpoint: retired,
+                    retire: true,
+                    build: (committedMember, committedThread) =>
+                      Effect.gen(function* () {
+                        const eventId = yield* idAllocator.allocate.event({
+                          threadId: member.childThreadId!,
+                          providerSessionId: input.entry.runtime.providerSessionId,
+                        });
+                        return {
+                          sourceProgress: false,
+                          events: [
+                            {
+                              id: eventId,
+                              type: "provider-thread.updated" as const,
+                              threadId: member.childThreadId!,
+                              occurredAt: input.releasedAt,
+                              payload: {
+                                ...committedThread,
+                                nativeMetadata: {
+                                  ...committedThread.nativeMetadata,
+                                  nativeWorkerCheckpoint: retired,
+                                },
+                                updatedAt: input.releasedAt,
+                              },
+                            },
+                            {
+                              id: yield* idAllocator.allocate.event({ threadId: member.threadId }),
+                              type: "subagent.updated" as const,
+                              threadId: member.threadId,
+                              occurredAt: input.releasedAt,
+                              payload: {
+                                ...committedMember,
+                                nativeWorker: {
+                                  ...member.nativeWorker!,
+                                  capture: retired.capture,
+                                  gaps: retired.gaps,
+                                },
+                                updatedAt: input.releasedAt,
+                              },
+                            },
+                          ],
+                        };
+                      }),
                   });
+                  if (!receipt.committed) {
+                    return yield* new EventSink.EventSinkWriteError({
+                      eventCount: 2,
+                      cause: "Native retirement checkpoint changed.",
+                    });
+                  }
                 }
-              }
-            })),
+                for (const threadId of input.entry.attachedThreadIds) {
+                  for (const archive of yield* eventSink.architectures(threadId)) {
+                    if (
+                      archive.providerSessionId !== input.entry.runtime.providerSessionId ||
+                      !input.entry.nativeWorkerOwners.some(
+                        (snapshot) =>
+                          snapshot.generation === archive.checkpoint.ownerGeneration &&
+                          NodeUtil.isDeepStrictEqual(snapshot.owner, archive.checkpoint.owner),
+                      )
+                    )
+                      continue;
+                    yield* eventSink.writeArchitecture({
+                      threadId,
+                      tableId: archive.summary.tableId,
+                      isConnected: Effect.succeed(true),
+                      build: (previous) =>
+                        Effect.gen(function* () {
+                          if (
+                            !previous ||
+                            previous.retired ||
+                            !NodeUtil.isDeepStrictEqual(previous.checkpoint, archive.checkpoint)
+                          )
+                            return undefined;
+                          const summary = {
+                            ...previous.summary,
+                            observation: "stale" as const,
+                            capture:
+                              previous.summary.capture === "closed"
+                                ? ("closed" as const)
+                                : ("incomplete" as const),
+                            gaps: [...new Set([...previous.summary.gaps, "stale_owner"])],
+                          };
+                          const thread = yield* projectionStore.getThread(threadId);
+                          return {
+                            archive: { ...previous, retired: true, summary },
+                            events: [
+                              {
+                                id: yield* idAllocator.allocate.event({ threadId }),
+                                type: "thread.metadata-updated",
+                                threadId,
+                                occurredAt: input.releasedAt,
+                                payload: {
+                                  ...thread,
+                                  nativeTables: thread.nativeTables?.map((table) =>
+                                    table.tableId === summary.tableId ? summary : table,
+                                  ),
+                                },
+                              },
+                            ],
+                          };
+                        }),
+                    });
+                  }
+                }
+              }),
+            ),
           ],
           { concurrency: 1 },
         ).pipe(Effect.flatMap(Exit.asVoidAll));
@@ -927,7 +1025,11 @@ export const layerWithOptions = (
         Effect.gen(function* () {
           const key = sessionKey(input.providerSessionId);
           const candidate = (yield* Ref.get(sessions)).get(key);
-          if (candidate !== undefined && input.idleFence !== undefined && !input.idleFence(candidate)) {
+          if (
+            candidate !== undefined &&
+            input.idleFence !== undefined &&
+            !input.idleFence(candidate)
+          ) {
             return [Option.none<LiveSessionEntry>(), yield* DateTime.now] as const;
           }
           if (candidate !== undefined) rememberNativeOwner(candidate);
@@ -1135,7 +1237,8 @@ export const layerWithOptions = (
           const probedRuntime = entry.runtime;
           if (probedRuntime.nativeWorkers !== undefined) {
             const targetValid = (latest: LiveSessionEntry) =>
-              latest.runtime === probedRuntime && latest.busyTurns.size === 0 &&
+              latest.runtime === probedRuntime &&
+              latest.busyTurns.size === 0 &&
               latest.idleGeneration === input.generation;
             const decision = yield* nativeIdleDecision(entry, targetValid);
             if (decision.kind === "stale") return;
@@ -1145,14 +1248,17 @@ export const layerWithOptions = (
               return yield* releaseIfStillIdle(input);
             }
             yield* releaseEntry({
-              providerSessionId: input.providerSessionId, reason: "idle_timeout",
-              cancelIdleFiber: false, onlyIfIdleGeneration: input.generation,
+              providerSessionId: input.providerSessionId,
+              reason: "idle_timeout",
+              cancelIdleFiber: false,
+              onlyIfIdleGeneration: input.generation,
               idleFence: decision.fence,
             }).pipe(logReleaseFailure(input.providerSessionId));
             // A permit wait may invalidate the observation without replacing the
             // idle cycle. That cycle still owns its next evaluation.
             const latest = (yield* Ref.get(sessions)).get(key);
-            if (latest !== undefined && targetValid(latest)) return yield* releaseIfStillIdle(input);
+            if (latest !== undefined && targetValid(latest))
+              return yield* releaseIfStillIdle(input);
             return;
           }
           const hasPendingWork =
@@ -1679,17 +1785,17 @@ export const layerWithOptions = (
                 if (decision.kind === "defer") return decision;
                 fence = decision.fence;
               } else {
-                const hasPendingWork = entry.runtime.hasPendingBackgroundWorkForThread === undefined
-                  ? false
-                  : yield* entry.runtime.hasPendingBackgroundWorkForThread(pending.providerThread)
-                      .pipe(Effect.catchCause(() => Effect.succeed(false)));
+                const hasPendingWork =
+                  entry.runtime.hasPendingBackgroundWorkForThread === undefined
+                    ? false
+                    : yield* entry.runtime
+                        .hasPendingBackgroundWorkForThread(pending.providerThread)
+                        .pipe(Effect.catchCause(() => Effect.succeed(false)));
                 if (hasPendingWork) return { kind: "defer", delayMs: idleTimeoutMs } as const;
               }
               const unloading = yield* Ref.modify(sessions, (current) => {
                 const latest = current.get(key);
-                if (
-                  latest === undefined || !fence(latest)
-                ) {
+                if (latest === undefined || !fence(latest)) {
                   return [false, current] as const;
                 }
                 const loadedProviderThreadKeyByThread = new Map(
@@ -1805,23 +1911,34 @@ export const layerWithOptions = (
           });
         return {
           ...runtime,
-          ...(runtime.nativeWorkers === undefined ? {} : {
-            nativeWorkers: {
-              get owner() {
-                if (!nativeLifetime.nativeWorkersConnected.value) return undefined;
-                rememberNativeOwner({ runtime, nativeWorkerOwners: nativeLifetime.nativeWorkerOwners });
-                return runtime.nativeWorkers?.owner;
-              },
-              get ownerGeneration() { return runtime.nativeWorkers!.ownerGeneration; },
-              hints: runtime.nativeWorkers.hints,
-              reconcile: runtime.nativeWorkers.reconcile, read: runtime.nativeWorkers.read,
-              hasPendingWork: runtime.nativeWorkers.hasPendingWork,
-              readBackgroundPending: runtime.nativeWorkers.readBackgroundPending,
-            },
-            hasPendingBackgroundWork: nativeWorkersPending(runtime),
-            hasPendingBackgroundWorkForThread: (thread: OrchestrationV2ProviderThread) =>
-              nativeWorkersPending(runtime, thread),
-          }),
+          ...(runtime.nativeWorkers === undefined
+            ? {}
+            : {
+                nativeWorkers: {
+                  get owner() {
+                    if (!nativeLifetime.nativeWorkersConnected.value) return undefined;
+                    rememberNativeOwner({
+                      runtime,
+                      nativeWorkerOwners: nativeLifetime.nativeWorkerOwners,
+                    });
+                    return runtime.nativeWorkers?.owner;
+                  },
+                  get ownerGeneration() {
+                    return runtime.nativeWorkers!.ownerGeneration;
+                  },
+                  hints: runtime.nativeWorkers.hints,
+                  reconcile: runtime.nativeWorkers.reconcile,
+                  read: runtime.nativeWorkers.read,
+                  hasPendingWork: runtime.nativeWorkers.hasPendingWork,
+                  readBackgroundPending: runtime.nativeWorkers.readBackgroundPending,
+                  ...(runtime.nativeWorkers.readArchitectures === undefined
+                    ? {}
+                    : { readArchitectures: runtime.nativeWorkers.readArchitectures }),
+                },
+                hasPendingBackgroundWork: nativeWorkersPending(runtime),
+                hasPendingBackgroundWorkForThread: (thread: OrchestrationV2ProviderThread) =>
+                  nativeWorkersPending(runtime, thread),
+              }),
           subscribeEvents,
           events: Stream.unwrap(
             subscribeEvents.pipe(Effect.map((subscription) => subscription.events)),
@@ -2014,21 +2131,37 @@ export const layerWithOptions = (
           ),
         );
 
-      const rememberNativeOwner = (entry: Pick<LiveSessionEntry, "runtime" | "nativeWorkerOwners">) => {
+      const rememberNativeOwner = (
+        entry: Pick<LiveSessionEntry, "runtime" | "nativeWorkerOwners">,
+      ) => {
         const port = entry.runtime.nativeWorkers;
-        if (port?.owner === undefined || entry.nativeWorkerOwners.some((snapshot) =>
-          snapshot.generation === port.ownerGeneration && NodeUtil.isDeepStrictEqual(snapshot.owner, port.owner))) return;
+        if (
+          port?.owner === undefined ||
+          entry.nativeWorkerOwners.some(
+            (snapshot) =>
+              snapshot.generation === port.ownerGeneration &&
+              NodeUtil.isDeepStrictEqual(snapshot.owner, port.owner),
+          )
+        )
+          return;
         entry.nativeWorkerOwners.push({ owner: port.owner, generation: port.ownerGeneration });
       };
 
       // These reads are residency-only: the boolean ingestion/stream helper
       // below deliberately keeps its admitted-member semantics.
-      const residencySource = <E>(effect: Effect.Effect<ProviderAdapter.ProviderBackgroundPending, E>) =>
-        effect.pipe(Effect.catchCause((cause) => Cause.hasInterrupts(cause)
-          ? Effect.interrupt
-          : Effect.succeed<ProviderAdapter.ProviderBackgroundPending>({
-              state: "unavailable", reason: "source_unavailable",
-            })));
+      const residencySource = <E>(
+        effect: Effect.Effect<ProviderAdapter.ProviderBackgroundPending, E>,
+      ) =>
+        effect.pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : Effect.succeed<ProviderAdapter.ProviderBackgroundPending>({
+                  state: "unavailable",
+                  reason: "source_unavailable",
+                }),
+          ),
+        );
 
       const readNativeResidency = Effect.fnUntraced(function* (
         runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
@@ -2036,36 +2169,64 @@ export const layerWithOptions = (
         owner: ProviderAdapter.ProviderNativeWorkersPort["owner"],
         ownerGeneration: number,
       ) {
-        const ordinary = () => residencySource((runtime.hasPendingBackgroundWork ?? Effect.succeed(false))
-          .pipe(Effect.map((pending): ProviderAdapter.ProviderBackgroundPending => ({ state: pending ? "pending" : "none" }))));
-        const local = () => residencySource(Effect.gen(function* () {
-          const members = yield* eventSink.nativeWorkers(runtime.providerSessionId);
-          let unknown = false;
-          for (const member of members) {
-            if (member.nativeWorker === undefined) continue;
-            const childThreadId = member.childThreadId;
-            if (childThreadId === null) {
-              unknown = true;
-              continue;
-            }
-            const state = yield* residencySource(Effect.gen(function* () {
-              const child = yield* projectionStore.getThreadRecords(childThreadId, ["providerThreads"]);
-              const checkpoint = child.providerThreads.find((row) => row.id === member.providerThreadId)
-                ?.nativeMetadata?.nativeWorkerCheckpoint;
-              if (checkpoint === undefined) return { state: "unavailable", reason: "source_unavailable" } as const;
-              if (checkpoint.ownerGeneration !== ownerGeneration ||
-                !NodeUtil.isDeepStrictEqual(checkpoint.owner, owner)) return { state: "none" } as const;
-              const pending = checkpoint.capture === "opening" || checkpoint.capture === "open" ||
-                checkpoint.bindingCursors.some((saved) => !saved.omission && (saved.more || saved.fragment)) ||
-                checkpoint.bindings.some((binding) => !checkpoint.bindingCursors.some((saved) =>
-                  saved.generation === binding.generation));
-              return { state: pending ? "pending" : "none" } as const;
-            }));
-            if (state.state === "pending") return state;
-            if (state.state === "unavailable") unknown = true;
-          }
-          return unknown ? { state: "unavailable", reason: "source_unavailable" } as const : { state: "none" } as const;
-        }));
+        const ordinary = () =>
+          residencySource(
+            (runtime.hasPendingBackgroundWork ?? Effect.succeed(false)).pipe(
+              Effect.map((pending): ProviderAdapter.ProviderBackgroundPending => ({
+                state: pending ? "pending" : "none",
+              })),
+            ),
+          );
+        const local = () =>
+          residencySource(
+            Effect.gen(function* () {
+              const members = yield* eventSink.nativeWorkers(runtime.providerSessionId);
+              let unknown = false;
+              for (const member of members) {
+                if (member.nativeWorker === undefined) continue;
+                const childThreadId = member.childThreadId;
+                if (childThreadId === null) {
+                  unknown = true;
+                  continue;
+                }
+                const state = yield* residencySource(
+                  Effect.gen(function* () {
+                    const child = yield* projectionStore.getThreadRecords(childThreadId, [
+                      "providerThreads",
+                    ]);
+                    const checkpoint = child.providerThreads.find(
+                      (row) => row.id === member.providerThreadId,
+                    )?.nativeMetadata?.nativeWorkerCheckpoint;
+                    if (checkpoint === undefined)
+                      return { state: "unavailable", reason: "source_unavailable" } as const;
+                    if (
+                      checkpoint.ownerGeneration !== ownerGeneration ||
+                      !NodeUtil.isDeepStrictEqual(checkpoint.owner, owner)
+                    )
+                      return { state: "none" } as const;
+                    const pending =
+                      checkpoint.capture === "opening" ||
+                      checkpoint.capture === "open" ||
+                      checkpoint.bindingCursors.some(
+                        (saved) => !saved.omission && (saved.more || saved.fragment),
+                      ) ||
+                      checkpoint.bindings.some(
+                        (binding) =>
+                          !checkpoint.bindingCursors.some(
+                            (saved) => saved.generation === binding.generation,
+                          ),
+                      );
+                    return { state: pending ? "pending" : "none" } as const;
+                  }),
+                );
+                if (state.state === "pending") return state;
+                if (state.state === "unavailable") unknown = true;
+              }
+              return unknown
+                ? ({ state: "unavailable", reason: "source_unavailable" } as const)
+                : ({ state: "none" } as const);
+            }),
+          );
         const beforeOrdinary = yield* ordinary();
         const beforeLocal = yield* local();
         const native = yield* residencySource(port.readBackgroundPending());
@@ -2073,8 +2234,11 @@ export const layerWithOptions = (
         const afterOrdinary = yield* ordinary();
         const afterLocal = yield* local();
         const states = [beforeOrdinary, beforeLocal, native, afterOrdinary, afterLocal];
-        return states.find((state) => state.state === "pending") ??
-          states.find((state) => state.state === "unavailable") ?? { state: "none" } as const;
+        return (
+          states.find((state) => state.state === "pending") ??
+          states.find((state) => state.state === "unavailable") ??
+          ({ state: "none" } as const)
+        );
       });
 
       const nativeIdleDecision = Effect.fnUntraced(function* (
@@ -2088,124 +2252,314 @@ export const layerWithOptions = (
         const observation = yield* readNativeResidency(entry.runtime, port, owner, ownerGeneration);
         const now = yield* Clock.currentTimeMillis;
         const sameObservation = (latest: LiveSessionEntry, pin: number | null) =>
-          targetValid(latest) && latest.runtime.nativeWorkers === port &&
-          port.ownerGeneration === ownerGeneration && NodeUtil.isDeepStrictEqual(port.owner, owner) &&
-          latest.idleGeneration === entry.idleGeneration && latest.busyTurns === entry.busyTurns &&
-          latest.lastActivityAtMs === entry.lastActivityAtMs && latest.pinnedSinceMs === pin;
-        return yield* Ref.modify(sessions, (current): readonly [
-          { readonly kind: "stale" } | { readonly kind: "retry" } |
-          { readonly kind: "defer"; readonly delayMs: number } |
-          { readonly kind: "act"; readonly fence: (live: LiveSessionEntry) => boolean },
-          Map<string, LiveSessionEntry>
-        ] => {
-          const key = sessionKey(entry.runtime.providerSessionId);
-          const latest = current.get(key);
-          if (latest === undefined || !targetValid(latest)) return [{ kind: "stale" } as const, current];
-          if (!sameObservation(latest, entry.pinnedSinceMs)) return [{ kind: "retry" } as const, current];
-          const pinnedSinceMs = observation.state === "unavailable" ? latest.pinnedSinceMs ?? now : null;
-          const updated = new Map(current);
-          updated.set(key, { ...latest, pinnedSinceMs });
-          const remaining = pinnedSinceMs === null ? 0 : maxIdlePinMs - (now - pinnedSinceMs);
-          if (observation.state === "pending" || (observation.state === "unavailable" && remaining > 0)) {
-            return [{ kind: "defer", delayMs: observation.state === "pending" ? idleTimeoutMs : Math.min(idleTimeoutMs, remaining) } as const, updated];
-          }
-          // Keep an expired episode for sibling unloads. Only certainty or real
-          // activity may clear it; a thread removal is neither.
-          return [{ kind: "act", fence: (live: LiveSessionEntry) => sameObservation(live, pinnedSinceMs) } as const, updated];
-        });
+          targetValid(latest) &&
+          latest.runtime.nativeWorkers === port &&
+          port.ownerGeneration === ownerGeneration &&
+          NodeUtil.isDeepStrictEqual(port.owner, owner) &&
+          latest.idleGeneration === entry.idleGeneration &&
+          latest.busyTurns === entry.busyTurns &&
+          latest.lastActivityAtMs === entry.lastActivityAtMs &&
+          latest.pinnedSinceMs === pin;
+        return yield* Ref.modify(
+          sessions,
+          (
+            current,
+          ): readonly [
+            (
+              | { readonly kind: "stale" }
+              | { readonly kind: "retry" }
+              | { readonly kind: "defer"; readonly delayMs: number }
+              | { readonly kind: "act"; readonly fence: (live: LiveSessionEntry) => boolean }
+            ),
+            Map<string, LiveSessionEntry>,
+          ] => {
+            const key = sessionKey(entry.runtime.providerSessionId);
+            const latest = current.get(key);
+            if (latest === undefined || !targetValid(latest))
+              return [{ kind: "stale" } as const, current];
+            if (!sameObservation(latest, entry.pinnedSinceMs))
+              return [{ kind: "retry" } as const, current];
+            const pinnedSinceMs =
+              observation.state === "unavailable" ? (latest.pinnedSinceMs ?? now) : null;
+            const updated = new Map(current);
+            updated.set(key, { ...latest, pinnedSinceMs });
+            const remaining = pinnedSinceMs === null ? 0 : maxIdlePinMs - (now - pinnedSinceMs);
+            if (
+              observation.state === "pending" ||
+              (observation.state === "unavailable" && remaining > 0)
+            ) {
+              return [
+                {
+                  kind: "defer",
+                  delayMs:
+                    observation.state === "pending"
+                      ? idleTimeoutMs
+                      : Math.min(idleTimeoutMs, remaining),
+                } as const,
+                updated,
+              ];
+            }
+            // Keep an expired episode for sibling unloads. Only certainty or real
+            // activity may clear it; a thread removal is neither.
+            return [
+              {
+                kind: "act",
+                fence: (live: LiveSessionEntry) => sameObservation(live, pinnedSinceMs),
+              } as const,
+              updated,
+            ];
+          },
+        );
       });
 
       const nativeWorkersPending = (
         runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
         providerThread?: OrchestrationV2ProviderThread,
-      ) => Effect.gen(function* () {
-        const ordinary = providerThread === undefined ? runtime.hasPendingBackgroundWork
-          : runtime.hasPendingBackgroundWorkForThread?.(providerThread);
-        if (ordinary !== undefined && (yield* ordinary)) return true;
-        const port = runtime.nativeWorkers;
-        if (port === undefined) return false;
-        const members = yield* eventSink.nativeWorkers(runtime.providerSessionId);
-        const launches = [];
-        for (const member of members) {
-          if (member.childThreadId === null || member.nativeWorker === undefined ||
-            (providerThread !== undefined && member.nativeWorker.launch.parentProviderThreadId !== providerThread.id)) continue;
-          const child = yield* projectionStore.getThreadRecords(member.childThreadId, ["providerThreads"]);
-          const checkpoint = child.providerThreads.find((row) => row.id === member.providerThreadId)
-            ?.nativeMetadata?.nativeWorkerCheckpoint;
-          if (checkpoint?.ownerGeneration === port.ownerGeneration &&
-            NodeUtil.isDeepStrictEqual(checkpoint.owner, port.owner)) {
-            if (checkpoint.bindingCursors.some((saved) => !saved.omission && (saved.more || saved.fragment))) {
-              return true;
-            }
-            launches.push(member.nativeWorker.launch);
-          }
-        }
-        return launches.length > 0 && (yield* port.hasPendingWork(launches));
-      }).pipe(Effect.catchCause(() => Effect.succeed(false)));
-
-      const startNativeImporter = (entry: LiveSessionEntry) => Effect.gen(function* () {
-        const port = entry.runtime.nativeWorkers;
-        if (port === undefined) return;
-        const afterSequence = yield* eventSink.latestSequence();
-        const importPermit = yield* Semaphore.make(1);
-        const importCommitted = Effect.gen(function* () {
-          const members = yield* eventSink.nativeWorkers(entry.runtime.providerSessionId);
-          rememberNativeOwner(entry);
+      ) =>
+        Effect.gen(function* () {
+          const ordinary =
+            providerThread === undefined
+              ? runtime.hasPendingBackgroundWork
+              : runtime.hasPendingBackgroundWorkForThread?.(providerThread);
+          if (ordinary !== undefined && (yield* ordinary)) return true;
+          const port = runtime.nativeWorkers;
+          if (port === undefined) return false;
+          const members = yield* eventSink.nativeWorkers(runtime.providerSessionId);
+          const launches = [];
           for (const member of members) {
-            if (member.childThreadId === null || member.nativeWorker === undefined) continue;
-            const childThreadId = member.childThreadId;
-            const launch = member.nativeWorker.launch;
-            yield* Effect.gen(function* () {
-              let more = true;
-              while (more) {
-                const current = (yield* Ref.get(sessions)).get(sessionKey(entry.runtime.providerSessionId));
-                if (current?.runtime !== entry.runtime) return;
-                const child = yield* projectionStore.getThreadRecords(childThreadId, ["providerThreads"]);
-                const checkpoint = child.providerThreads.find((row) => row.id === member.providerThreadId)
-                  ?.nativeMetadata?.nativeWorkerCheckpoint;
-                if (checkpoint === undefined || checkpoint.ownerGeneration !== port.ownerGeneration ||
-                  !NodeUtil.isDeepStrictEqual(checkpoint.owner, port.owner)) break;
-                const batch = yield* port.read(launch, checkpoint);
-                const stillConnected = (yield* Ref.get(sessions)).get(sessionKey(entry.runtime.providerSessionId));
-                if (stillConnected?.runtime !== entry.runtime ||
-                  batch.checkpoint.ownerGeneration !== port.ownerGeneration ||
-                  !NodeUtil.isDeepStrictEqual(batch.checkpoint.owner, port.owner)) return;
-                const receipt = yield* providerEventIngestor.ingestNativeWorker(batch,
-                  Ref.get(sessions).pipe(Effect.map((latest) =>
-                    latest.get(sessionKey(entry.runtime.providerSessionId))?.runtime === entry.runtime &&
-                    batch.checkpoint.ownerGeneration === port.ownerGeneration &&
-                    NodeUtil.isDeepStrictEqual(batch.checkpoint.owner, port.owner))),
-                );
-                if (!receipt.committed) break;
-                if (receipt.sourceProgress) {
-                  yield* observeActivity(entry.runtime.providerSessionId,
-                    touchActivity(entry.runtime.providerSessionId, { providerActivity: true }));
-                }
-                more = batch.more;
+            if (
+              member.childThreadId === null ||
+              member.nativeWorker === undefined ||
+              (providerThread !== undefined &&
+                member.nativeWorker.launch.parentProviderThreadId !== providerThread.id)
+            )
+              continue;
+            const child = yield* projectionStore.getThreadRecords(member.childThreadId, [
+              "providerThreads",
+            ]);
+            const checkpoint = child.providerThreads.find(
+              (row) => row.id === member.providerThreadId,
+            )?.nativeMetadata?.nativeWorkerCheckpoint;
+            if (
+              checkpoint?.ownerGeneration === port.ownerGeneration &&
+              NodeUtil.isDeepStrictEqual(checkpoint.owner, port.owner)
+            ) {
+              if (
+                checkpoint.bindingCursors.some(
+                  (saved) => !saved.omission && (saved.more || saved.fragment),
+                )
+              ) {
+                return true;
               }
-            }).pipe(Effect.catchCause((cause) => Effect.logWarning(
-              "orchestration-v2.native-worker-import-failed",
-              { providerSessionId: entry.runtime.providerSessionId, subagentId: member.id, cause },
-            )));
+              launches.push(member.nativeWorker.launch);
+            }
           }
-        }).pipe(importPermit.withPermits(1), Effect.catchCause((cause) => Effect.logWarning(
-          "orchestration-v2.native-worker-import-failed",
-          { providerSessionId: entry.runtime.providerSessionId, cause },
-        )));
-        // Capture is driven by committed admission and coalescible source hints,
-        // not by the ordinary provider event pump or a run subscription lifetime.
-        yield* Stream.merge(
-          port.hints,
-          eventSink.stream({ afterSequence, eventType: "thread.created" }).pipe(Stream.map(() => undefined)),
-        ).pipe(
-          Stream.runForEach(() => importCommitted),
-          Effect.forkIn(entry.scope),
+          return launches.length > 0 && (yield* port.hasPendingWork(launches));
+        }).pipe(Effect.catchCause(() => Effect.succeed(false)));
+
+      const startNativeImporter = (entry: LiveSessionEntry) =>
+        Effect.gen(function* () {
+          const port = entry.runtime.nativeWorkers;
+          if (port === undefined) return;
+          const afterSequence = yield* eventSink.latestSequence();
+          const importPermit = yield* Semaphore.make(1);
+          const importCommitted = Effect.gen(function* () {
+            yield* Effect.gen(function* () {
+              if (port.readArchitectures && port.owner) {
+                const owner = { ...port.owner };
+                const ownerGeneration = port.ownerGeneration;
+                const connected = Ref.get(sessions).pipe(
+                  Effect.map(
+                    (latest) =>
+                      latest.get(sessionKey(entry.runtime.providerSessionId))?.runtime ===
+                        entry.runtime &&
+                      entry.nativeWorkersConnected.value &&
+                      ownerGeneration === port.ownerGeneration &&
+                      NodeUtil.isDeepStrictEqual(owner, port.owner),
+                  ),
+                );
+                const observation = yield* port.readArchitectures().pipe(
+                  Effect.matchEffect({
+                    onSuccess: Effect.succeed,
+                    onFailure: (cause) =>
+                      Effect.gen(function* () {
+                        if (isArchitectureCatalogLoss(cause)) return cause;
+                        yield* Effect.logWarning("orchestration-v2.architecture-import-failed", {
+                          providerSessionId: entry.runtime.providerSessionId,
+                          cause,
+                        });
+                        return [];
+                      }),
+                  }),
+                );
+                if (!(yield* connected)) return;
+                if (
+                  "catalogGap" in observation &&
+                  (observation.ownerGeneration !== ownerGeneration ||
+                    !NodeUtil.isDeepStrictEqual(observation.owner, owner))
+                )
+                  return;
+                const current = (yield* Ref.get(sessions)).get(
+                  sessionKey(entry.runtime.providerSessionId),
+                );
+                for (const threadId of current?.attachedThreadIds ?? []) {
+                  const projection = yield* projectionStore.getThreadRecords(threadId, [
+                    "providerThreads",
+                  ]);
+                  const parent = projection.providerThreads.find(
+                    (thread) =>
+                      thread.providerSessionId === entry.runtime.providerSessionId &&
+                      thread.providerInstanceId ===
+                        entry.runtime.providerSession.providerInstanceId &&
+                      thread.nativeThreadRef?.nativeId === owner.coordinatorSessionId,
+                  );
+                  if (!parent?.ownerNodeId) continue;
+                  const batches =
+                    "catalogGap" in observation
+                      ? (yield* eventSink.architectures(threadId))
+                          .filter(
+                            (archive) =>
+                              !archive.retired &&
+                              archive.providerSessionId === entry.runtime.providerSessionId &&
+                              archive.parentProviderThreadId === parent.id &&
+                              archive.summary.providerInstanceId === parent.providerInstanceId &&
+                              archive.checkpoint.ownerGeneration <= ownerGeneration &&
+                              NodeUtil.isDeepStrictEqual(archive.checkpoint.owner, owner),
+                          )
+                          .map((archive): ProviderAdapter.ProviderArchitectureBatch => ({
+                            roomId: archive.summary.roomId,
+                            checkpoint: {
+                              owner,
+                              ownerGeneration,
+                              snapshotId: "",
+                              cut: 0,
+                            },
+                            records: [],
+                            capture: "incomplete",
+                            gaps: [observation.catalogGap],
+                          }))
+                      : observation;
+                  for (const batch of batches) {
+                    if (
+                      !NodeUtil.isDeepStrictEqual(batch.checkpoint.owner, owner) ||
+                      batch.checkpoint.ownerGeneration !== ownerGeneration
+                    )
+                      continue;
+                    yield* providerEventIngestor.ingestArchitecture({
+                      threadId,
+                      providerInstanceId: parent.providerInstanceId,
+                      providerSessionId: entry.runtime.providerSessionId,
+                      parentProviderThreadId: parent.id,
+                      parentNodeId: parent.ownerNodeId,
+                      batch,
+                      isConnected: connected,
+                    });
+                  }
+                }
+              }
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("orchestration-v2.architecture-import-failed", {
+                  providerSessionId: entry.runtime.providerSessionId,
+                  cause,
+                }),
+              ),
+            );
+            const members = yield* eventSink.nativeWorkers(entry.runtime.providerSessionId);
+            rememberNativeOwner(entry);
+            for (const member of members) {
+              if (member.childThreadId === null || member.nativeWorker === undefined) continue;
+              const childThreadId = member.childThreadId;
+              const launch = member.nativeWorker.launch;
+              yield* Effect.gen(function* () {
+                let more = true;
+                while (more) {
+                  const current = (yield* Ref.get(sessions)).get(
+                    sessionKey(entry.runtime.providerSessionId),
+                  );
+                  if (current?.runtime !== entry.runtime) return;
+                  const child = yield* projectionStore.getThreadRecords(childThreadId, [
+                    "providerThreads",
+                  ]);
+                  const checkpoint = child.providerThreads.find(
+                    (row) => row.id === member.providerThreadId,
+                  )?.nativeMetadata?.nativeWorkerCheckpoint;
+                  if (
+                    checkpoint === undefined ||
+                    checkpoint.ownerGeneration !== port.ownerGeneration ||
+                    !NodeUtil.isDeepStrictEqual(checkpoint.owner, port.owner)
+                  )
+                    break;
+                  const batch = yield* port.read(launch, checkpoint);
+                  const stillConnected = (yield* Ref.get(sessions)).get(
+                    sessionKey(entry.runtime.providerSessionId),
+                  );
+                  if (
+                    stillConnected?.runtime !== entry.runtime ||
+                    batch.checkpoint.ownerGeneration !== port.ownerGeneration ||
+                    !NodeUtil.isDeepStrictEqual(batch.checkpoint.owner, port.owner)
+                  )
+                    return;
+                  const receipt = yield* providerEventIngestor.ingestNativeWorker(
+                    batch,
+                    Ref.get(sessions).pipe(
+                      Effect.map(
+                        (latest) =>
+                          latest.get(sessionKey(entry.runtime.providerSessionId))?.runtime ===
+                            entry.runtime &&
+                          batch.checkpoint.ownerGeneration === port.ownerGeneration &&
+                          NodeUtil.isDeepStrictEqual(batch.checkpoint.owner, port.owner),
+                      ),
+                    ),
+                  );
+                  if (!receipt.committed) break;
+                  if (receipt.sourceProgress) {
+                    yield* observeActivity(
+                      entry.runtime.providerSessionId,
+                      touchActivity(entry.runtime.providerSessionId, { providerActivity: true }),
+                    );
+                  }
+                  more = batch.more;
+                }
+              }).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("orchestration-v2.native-worker-import-failed", {
+                    providerSessionId: entry.runtime.providerSessionId,
+                    subagentId: member.id,
+                    cause,
+                  }),
+                ),
+              );
+            }
+          }).pipe(
+            importPermit.withPermits(1),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("orchestration-v2.native-worker-import-failed", {
+                providerSessionId: entry.runtime.providerSessionId,
+                cause,
+              }),
+            ),
+          );
+          // Capture is driven by committed admission and coalescible source hints,
+          // not by the ordinary provider event pump or a run subscription lifetime.
+          yield* Stream.merge(
+            port.hints,
+            eventSink
+              .stream({ afterSequence, eventType: "thread.created" })
+              .pipe(Stream.map(() => undefined)),
+          ).pipe(
+            Stream.runForEach(() => importCommitted),
+            Effect.forkIn(entry.scope),
+          );
+          yield* importCommitted;
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("orchestration-v2.native-worker-import-start-failed", {
+              providerSessionId: entry.runtime.providerSessionId,
+              cause,
+            }),
+          ),
         );
-        yield* importCommitted;
-      }).pipe(Effect.catchCause((cause) => Effect.logWarning(
-        "orchestration-v2.native-worker-import-start-failed",
-        { providerSessionId: entry.runtime.providerSessionId, cause },
-      )));
 
       const startEventPump = (entry: LiveSessionEntry) => {
         let stoppedByProvider = false;
@@ -2226,7 +2580,8 @@ export const layerWithOptions = (
                     event.providerThreadId,
                     event.runOrdinal,
                   )
-                : entry.runtime.nativeWorkers !== undefined && event.type === "provider_session.updated"
+                : entry.runtime.nativeWorkers !== undefined &&
+                    event.type === "provider_session.updated"
                   ? Effect.void
                   : touchActivity(entry.runtime.providerSessionId, { providerActivity: true }),
             ).pipe(
@@ -2480,8 +2835,12 @@ export const layerWithOptions = (
               const eventSubscribers = yield* Ref.make<
                 ReadonlyMap<number, Queue.Queue<ProviderSessionEventSignal, Cause.Done>>
               >(new Map());
-              const nativeLifetime: Pick<LiveSessionEntry, "nativeWorkersConnected" | "nativeWorkerOwners"> = {
-                nativeWorkerOwners: [], nativeWorkersConnected: { value: true },
+              const nativeLifetime: Pick<
+                LiveSessionEntry,
+                "nativeWorkersConnected" | "nativeWorkerOwners"
+              > = {
+                nativeWorkerOwners: [],
+                nativeWorkersConnected: { value: true },
               };
               const exposedRuntime = decorateRuntime(runtime, eventSubscribers, nativeLifetime);
               const now = yield* Clock.currentTimeMillis;
