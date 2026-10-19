@@ -202,6 +202,123 @@ it("labels structured confirmed outcomes without inventing a roster author or te
   expect(sections).toContainEqual({ title: "Disagreement", text: "Separate disagreement" });
 });
 
+it.each([
+  {
+    body: {
+      kind: "composition",
+      snapshotId: "s",
+      reason: "Director-only is sufficient",
+      specialists: [],
+    },
+    sections: [{ title: "Composition", text: "Director-only is sufficient" }],
+  },
+  {
+    body: {
+      kind: "composition",
+      snapshotId: "s",
+      reason: "Continuity and new evidence",
+      specialists: [
+        { kind: "retain", memberId: "existing", mandate: "Keep focus", reason: "Continuity" },
+        { kind: "add", candidateRef: "candidate", mandate: "Check evidence", reason: "New angle" },
+      ],
+    },
+    sections: [
+      { title: "Composition", text: "Continuity and new evidence" },
+      { title: "Retain · existing", text: "Keep focus\n\nContinuity" },
+      { title: "Add · candidate", text: "Check evidence\n\nNew angle" },
+    ],
+  },
+  {
+    body: {
+      kind: "composition",
+      snapshotId: "old",
+      specialists: [
+        { candidateRef: "old-candidate", mandate: "Old mandate", reason: "Old reason" },
+      ],
+    },
+    sections: [{ title: "old-candidate", text: "Old mandate\n\nOld reason" }],
+  },
+  {
+    body: {
+      kind: "answer",
+      answer: "Historical answer",
+      evidence: ["Proof"],
+      limits: [],
+      doubts: [],
+    },
+    sections: [
+      { title: "Answer", text: "Historical answer" },
+      { title: "Evidence", text: "Proof" },
+    ],
+  },
+  {
+    body: {
+      kind: "consultation-plan",
+      resolutions: [],
+      support: [{ role: "scout", brief: "Historical support", doubtIds: ["d"], prerequisites: [] }],
+    },
+    sections: [{ title: "scout", text: "Historical support" }],
+  },
+])(
+  "presents current composition and historical bodies without losing their content: %j",
+  ({ body, sections }) => {
+    expect(
+      recordSections(
+        {
+          kind: "publication",
+          id: "p",
+          ordinal: 1,
+          memberId: "director",
+          assignmentId: "assignment",
+          messageId: "p",
+          textId: "publication:p",
+          stage: "composition",
+          snapshotId: "s",
+          turnId: "t",
+          attemptId: "a",
+        },
+        JSON.stringify({ body }),
+      ),
+    ).toEqual(sections);
+  },
+);
+
+it.each(["composition", "TeamAssignment.task", "root-workbrief"] as const)(
+  "presents truthful individual mandate source: %s",
+  (source) => {
+    expect(
+      recordSections(
+        {
+          kind: "member",
+          id: "member",
+          assignmentId: "assignment",
+          instanceId: "instance",
+          roleId: "architect",
+          function: "specialist",
+          execution: "running",
+          ordinal: 1,
+          mandateSource: source,
+          textId: "member:member",
+          workerThreadId: null,
+          bindingCount: 0,
+        },
+        JSON.stringify({
+          mandate:
+            source === "root-workbrief"
+              ? { source, instanceId: "instance" }
+              : { source, text: "Individual task, not the root goal" },
+        }),
+      ),
+    ).toEqual([
+      {
+        title: `Individual mandate · ${source}`,
+        text:
+          source === "root-workbrief" ? "See original brief" : "Individual task, not the root goal",
+      },
+    ]);
+  },
+);
+
 it("keeps later instruction author/order/application separate and reports corrupt capture", () => {
   const control = {
     kind: "control" as const,

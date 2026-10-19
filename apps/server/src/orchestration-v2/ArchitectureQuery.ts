@@ -32,7 +32,7 @@ function detail(
       return {
         kind: record.kind,
         id,
-        mode: record.mode,
+        ...(record.mode === undefined ? {} : { mode: record.mode }),
         lifecycle: record.lifecycle,
         pendingDoubtIds: record.pendingDoubtIds,
         originalTextId: "original",

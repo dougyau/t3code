@@ -87,6 +87,9 @@ export default defineConfig({
       // Macroscope's glob-per-line ignore grammar, not Markdown: formatting
       // it rewrites `*` as `_` and joins lines.
       ".macroscope/ignore.md",
+      // Pinned upstream protocol copies must remain byte-for-byte.
+      "packages/provider-pi/src/server/pitako/bridge/protocol.js",
+      "packages/provider-pi/src/server/pitako/bridge/protocol.d.ts",
       ".alchemy",
       "dist",
       "dist-electron",

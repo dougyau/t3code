@@ -824,6 +824,108 @@ layer("Architecture persisted import", (it) => {
       }),
   );
 
+  it.effect(
+    "roundtrips mode-free composition and individual mandate without substituting the root brief",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* seedNativeWorker(false);
+        const a = architecture(f);
+        const { mode, ...room } = a.room;
+        assert.equal(mode, "table"); // The other fixtures retain historical modes.
+        const mandate = "Individual composition mandate 🧭\n".repeat(40);
+        const specialist: PiArchitectureRecord = {
+          ...a.member,
+          id: "specialist",
+          assignmentId: "specialist-assignment",
+          instanceId: "specialist-instance",
+          function: "specialist",
+          mandate: { source: "composition", text: mandate },
+          compositionMessageId: "composition",
+          compositionChoiceIndex: 0,
+          selection: { compositionMessageId: "composition", choiceIndex: 0 },
+          state: "active",
+        };
+        const publication: PiArchitectureRecord = {
+          kind: "publication",
+          id: "composition",
+          message: {
+            id: "composition",
+            ordinal: 1,
+            roomId: room.id,
+            memberId: a.member.id,
+            assignmentId: a.member.assignmentId,
+            author: "director",
+            stage: "composition",
+            snapshotId: "snapshot",
+            turnId: "turn",
+            attemptId: "attempt",
+            native: { sessionId: "session", toolCallId: "submit", persistence: "unconfirmed" },
+            doubts: [],
+            body: {
+              kind: "composition",
+              snapshotId: "snapshot",
+              reason: "Preserve continuity",
+              specialists: [{ kind: "retain", memberId: "specialist", mandate, reason: "Needed" }],
+            },
+          },
+        };
+        const records = [room, a.member, specialist, publication];
+        yield* f.ingestor.ingestArchitecture({
+          ...a.input,
+          batch: { ...a.batch, records },
+        });
+        const archives = yield* f.sink.architectures(f.parent.threadId);
+        assert.deepEqual(archives[0]!.records, records);
+        assert.notProperty(archives[0]!.summary, "mode");
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const parent = yield* projections.getThreadProjection(f.parent.threadId);
+        assert.notProperty(parent.thread.nativeTables![0], "mode");
+        const child = parent.subagents.find(
+          (child) => child.nativeWorker?.launch.instanceId === "specialist-instance",
+        )!;
+        assert.isAbove(child.prompt.length, 0);
+        assert.isTrue(mandate.startsWith(child.prompt));
+        assert.isAtMost(child.prompt.length, 512);
+        assert.deepEqual(child.nativeWorker?.mandate, {
+          source: "composition",
+          text: child.prompt,
+          complete: false,
+        });
+        assert.isUndefined(child.nativeWorker?.brief);
+        const input = { threadId: f.parent.threadId, tableId: archives[0]!.summary.tableId };
+        const result = yield* decodeArchitectureReadResult(
+          yield* queryArchitecture({ ...input, kind: "records" }, archives, parent.subagents),
+        );
+        if (result.kind !== "records") throw Error("Expected records");
+        assert.notProperty(result.summary, "mode");
+        assert.notProperty(
+          result.items.find((record) => record.kind === "room")!,
+          "mode",
+        );
+        const detail = result.items.find(
+          (record) => record.kind === "member" && record.id === "specialist",
+        );
+        if (detail?.kind !== "member") throw Error("Expected specialist");
+        assert.equal(detail.mandateSource, "composition");
+        for (const [textId, expected] of [
+          ["member:specialist", { mandate: specialist.mandate, bindings: [] }],
+          [
+            "publication:composition",
+            {
+              body: publication.message.body,
+              doubts: [],
+              native: publication.message.native,
+            },
+          ],
+        ] as const) {
+          const text = yield* queryArchitecture({ ...input, kind: "text", textId }, archives, []);
+          if (text.kind !== "text") throw Error("Expected text");
+          assert.deepEqual(JSON.parse(text.text), expected);
+        }
+        assert.deepEqual(archives[0]!.original, a.batch.original);
+      }),
+  );
+
   it.effect("queries structured failure attribution and ordered instruction provenance", () =>
     Effect.gen(function* () {
       const f = yield* seedNativeWorker(false);

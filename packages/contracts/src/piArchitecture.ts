@@ -5,6 +5,11 @@ import { ProviderInstanceId } from "./providerInstance.ts";
 const Strings = Schema.Array(Schema.String);
 const Doubt = Schema.Struct({ question: Schema.String, purpose: Schema.String });
 const Doubts = Schema.Array(Doubt);
+const NonEmptyString = Schema.String.check(Schema.isMinLength(1));
+const CompositionChoice = {
+  mandate: NonEmptyString,
+  reason: NonEmptyString,
+};
 const Resolution = Schema.Struct({
   doubtId: Schema.String,
   status: Schema.Literals(["answered", "partial", "rejected", "failed"]),
@@ -24,14 +29,36 @@ export const PiArchitectureSynthesis = Schema.Struct({
 export const PiArchitectureBody = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("composition"),
-    snapshotId: Schema.String,
+    snapshotId: NonEmptyString,
+    reason: NonEmptyString,
+    specialists: Schema.Array(
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.Literal("add"),
+          candidateRef: NonEmptyString,
+          ...CompositionChoice,
+        }),
+        Schema.Struct({
+          kind: Schema.Literal("retain"),
+          memberId: NonEmptyString,
+          ...CompositionChoice,
+        }),
+      ]),
+    ).check(Schema.isMaxLength(5)),
+  }),
+  // History has no composition reason or choice kind. Do not let malformed
+  // current submissions fall through to this branch and lose their identity.
+  Schema.Struct({
+    kind: Schema.Literal("composition"),
+    snapshotId: NonEmptyString,
+    reason: Schema.optionalKey(Schema.Never),
     specialists: Schema.Array(
       Schema.Struct({
-        candidateRef: Schema.String,
-        mandate: Schema.String,
-        reason: Schema.String,
+        kind: Schema.optionalKey(Schema.Never),
+        candidateRef: NonEmptyString,
+        ...CompositionChoice,
       }),
-    ),
+    ).check(Schema.isMinLength(1), Schema.isMaxLength(5)),
   }),
   Schema.Struct({ kind: Schema.Literal("preparation"), analysis: Schema.String, doubts: Doubts }),
   Schema.Struct({
@@ -152,12 +179,22 @@ export const PiArchitectureMember = Schema.Struct({
   admittedAt: Schema.Number,
   mandate: Schema.Union([
     Schema.Struct({ source: Schema.Literal("root-workbrief"), instanceId: Schema.String }),
-    Schema.Struct({ source: Schema.Literal("TeamAssignment.task"), text: Schema.String }),
+    Schema.Struct({
+      source: Schema.Literals(["TeamAssignment.task", "composition"]),
+      text: Schema.String,
+    }),
   ]),
   execution: Schema.Literals(["accepted", "running", "completed", "failed", "cancelled"]),
   workerRef: Schema.optional(PiArchitectureWorkerRef),
   conversationRefs: Schema.Array(PiArchitectureWorkerRef),
   compositionMessageId: Schema.optional(Schema.String),
+  compositionChoiceIndex: Schema.optional(NonNegativeInt),
+  selection: Schema.optional(
+    Schema.Struct({ compositionMessageId: Schema.String, choiceIndex: NonNegativeInt }),
+  ),
+  state: Schema.optional(
+    Schema.Literals(["preparing", "active", "closing", "closed", "closure-unknown"]),
+  ),
   supersededByCompositionId: Schema.optional(Schema.String),
 });
 export type PiArchitectureMember = typeof PiArchitectureMember.Type;
@@ -165,7 +202,7 @@ export const PiArchitectureRecord = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("room"),
     id: Schema.String,
-    mode: Schema.Literals(["table", "consultation"]),
+    mode: Schema.optionalKey(Schema.Literals(["table", "consultation"])),
     origin: Schema.Struct({
       coordinatorSessionId: Schema.String,
       tool: Schema.Literal("architecture_start"),
@@ -293,7 +330,7 @@ export type PiArchitectureText = typeof PiArchitectureText.Type;
 export const PiArchitectureSummary = Schema.Struct({
   tableId: TrimmedNonEmptyString,
   ...PiArchitectureAnchor.fields,
-  mode: Schema.Literals(["table", "consultation"]),
+  mode: Schema.optionalKey(Schema.Literals(["table", "consultation"])),
   participants: NonNegativeInt,
   lifecycle: PiArchitectureLifecycle,
   capture: Schema.Literals(["open", "closed", "incomplete"]),
@@ -334,7 +371,7 @@ export const PiArchitectureDetailRecord = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("room"),
     id: Schema.String,
-    mode: Schema.Literals(["table", "consultation"]),
+    mode: Schema.optionalKey(Schema.Literals(["table", "consultation"])),
     lifecycle: PiArchitectureLifecycle,
     pendingDoubtIds: Strings,
     originalTextId: Schema.Literal("original"),
@@ -348,7 +385,7 @@ export const PiArchitectureDetailRecord = Schema.Union([
     function: PiArchitectureMember.fields.function,
     execution: PiArchitectureMember.fields.execution,
     ordinal: NonNegativeInt,
-    mandateSource: Schema.Literals(["root-workbrief", "TeamAssignment.task"]),
+    mandateSource: Schema.Literals(["root-workbrief", "TeamAssignment.task", "composition"]),
     textId: Schema.String,
     workerThreadId: Schema.NullOr(ThreadId),
     model: Schema.optional(

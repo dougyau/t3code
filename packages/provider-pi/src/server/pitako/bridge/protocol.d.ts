@@ -212,12 +212,18 @@ export function success(request: Request, result: unknown): { version: 2; id: st
 
 /** Passive Architecture export. These declarations load no runtime dependencies. */
 export interface ArchitectureRef extends Owner { kind: "architecture"; roomId: string }
-export type PublicArchitectureBody =
+/** Decoder-only legacy bodies; never a live submission schema. */
+export type HistoricalArchitectureBody =
   | { kind: "composition"; snapshotId: string; specialists: { candidateRef: string; mandate: string; reason: string }[] }
+  | { kind: "answer"; answer: string; evidence: string[]; limits: string[]; doubts: { question: string; purpose: string }[] };
+export type PublicArchitectureBody =
+  | HistoricalArchitectureBody
+  | { kind: "composition"; snapshotId: string; reason: string; specialists: (
+      { kind: "retain"; memberId: string; mandate: string; reason: string } |
+      { kind: "add"; candidateRef: string; mandate: string; reason: string })[] }
   | { kind: "preparation"; analysis: string; doubts: { question: string; purpose: string }[] }
   | { kind: "contribution"; proposal: string; arguments: string[]; objections: { memberId: string; messageId: string; argument: string }[]; doubts: { question: string; purpose: string }[] }
   | { kind: "decision"; action: "continue" | "consult" | "synthesize" | "recompose"; reason: string }
-  | { kind: "answer"; answer: string; evidence: string[]; limits: string[]; doubts: { question: string; purpose: string }[] }
   | { kind: "consultation-plan"; resolutions: { doubtId: string; status: "answered" | "rejected"; answer: string }[]; support: { role: "scout" | "researcher" | "oracle"; brief: string; doubtIds: string[]; prerequisites: number[] }[] }
   | { kind: "consultation-response"; doubtIds: string[]; answer: string; evidence: string[]; limits: string[]; doubts: { question: string; purpose: string }[] }
   | { kind: "knowledge"; resolutions: { doubtId: string; status: "answered" | "partial" | "rejected" | "failed"; answer: string; supportIds: string[] }[] }
@@ -246,15 +252,15 @@ export interface PublicKnowledgeBoundary {
 }
 export type ArchitectureRecord =
   | PublicKnowledgeBoundary
-  | { kind: "room"; id: string; mode: "table" | "consultation"; origin: { coordinatorSessionId: string; tool: "architecture_start"; toolCallId: string; memberId: string; assignmentId: string; instanceId: string }; goalSource: { kind: "worker-workbrief"; instanceId: string }; lifecycle: ArchitectureLifecycle; pendingDoubtIds: string[] }
-  | { kind: "member"; id: string; assignmentId: string; instanceId: string; roleId: string; function: "director" | "specialist" | "support"; ordinal: number; admittedAt: number; mandate: { source: "root-workbrief"; instanceId: string } | { source: "TeamAssignment.task"; text: string }; execution: "accepted" | "running" | "completed" | "failed" | "cancelled"; workerRef?: WorkerReadReference; conversationRefs: WorkerReadReference[]; compositionMessageId?: string; supersededByCompositionId?: string }
+  | { kind: "room"; id: string; mode?: "table" | "consultation"; origin: { coordinatorSessionId: string; tool: "architecture_start"; toolCallId: string; memberId: string; assignmentId: string; instanceId: string }; goalSource: { kind: "worker-workbrief"; instanceId: string }; lifecycle: ArchitectureLifecycle; pendingDoubtIds: string[] }
+  | { kind: "member"; id: string; assignmentId: string; instanceId: string; roleId: string; function: "director" | "specialist" | "support"; ordinal: number; admittedAt: number; mandate: { source: "root-workbrief"; instanceId: string } | { source: "TeamAssignment.task" | "composition"; text: string }; execution: "accepted" | "running" | "completed" | "failed" | "cancelled"; workerRef?: WorkerReadReference; conversationRefs: WorkerReadReference[]; compositionMessageId?: string; compositionChoiceIndex?: number; selection?: { compositionMessageId: string; choiceIndex: number }; state?: "preparing" | "active" | "closing" | "closed" | "closure-unknown"; supersededByCompositionId?: string }
   | { kind: "publication"; id: string; message: PublicArchitectureMessage }
   | { kind: "control"; id: string; order: number; action: "context" | "priorities" | "finish" | "stop"; text?: string; author: { coordinatorSessionId: string; toolCallId: string }; application: { state: "pending" } | { state: "applied"; stage: ArchitectureLifecycle["stage"]; round: number } }
   | { kind: "failure"; id: string; phase: "preparation" | "admission" | "turn" | "disband" | "director-close"; error: string; memberId?: string; assignmentId?: string; stage?: PublicArchitectureStage; round?: number }
   | { kind: "outcome"; id: "final"; source: "background-settlement"; status: "completed" | "failed" | "cancelled"; content: { kind: "synthesis"; body: PublicSynthesisBody } | { kind: "text"; text: string } };
 export interface ArchitectureFragment { kind: "fragment"; recordId: string; encoding: "base64-json"; byteOffset: number; totalBytes: number; data: string }
 export type ArchitectureAvailability = { state: "unavailable"; reason: "unknown_room" | "not_captured" | "snapshot_oversized" } | { state: "stale_owner" | "stale_cursor" | "invalid_cursor" };
-export interface ArchitectureCatalogItem { ref: ArchitectureRef; mode: "table" | "consultation"; director: { memberId: string; assignmentId: string; instanceId: string }; lifecycle: ArchitectureLifecycle }
+export interface ArchitectureCatalogItem { ref: ArchitectureRef; mode?: "table" | "consultation"; director: { memberId: string; assignmentId: string; instanceId: string }; lifecycle: ArchitectureLifecycle }
 export interface ArchitectureCatalogPage { format: "architecture-public-v1"; state: "ready"; owner: Owner; snapshotId: string; cut: number; items: ArchitectureCatalogItem[]; next: string | null }
 export type ArchitectureCatalog = ArchitectureCatalogPage | { state: "unavailable"; reason: "not_captured" | "snapshot_oversized" } | { state: "stale_owner" | "stale_cursor" | "invalid_cursor" };
 export interface ArchitecturePage { format: "architecture-public-v1"; state: "ready"; ref: ArchitectureRef; snapshotId: string; cut: number; capture: { state: "open" | "closed" | "incomplete"; finalCut: number | null; gaps: ("not_captured" | "capture_failed")[] }; records: (ArchitectureRecord | ArchitectureFragment)[]; next: string | null }

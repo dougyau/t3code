@@ -948,7 +948,6 @@ it.effect.each(["completed-root", "owned-node", "other-provider-thread", "missin
           {
             kind: "room",
             id: "root-room",
-            mode: "table",
             origin: {
               coordinatorSessionId: owner.coordinatorSessionId,
               tool: "architecture_start",
@@ -1061,6 +1060,8 @@ it.effect.each(["completed-root", "owned-node", "other-provider-thread", "missin
           assert.equal(archives[0]?.parentProviderThreadId, parent.id);
           assert.deepEqual(archives[0]?.records, batch.records);
           assert.equal(thread.nativeTables?.[0]?.roomId, batch.roomId);
+          assert.notProperty(archives[0]!.summary, "mode");
+          assert.notProperty(thread.nativeTables![0], "mode");
           assert.lengthOf(members, 1);
           assert.deepEqual(members[0]?.nativeWorker?.launch, {
             source: "architecture_roster",
