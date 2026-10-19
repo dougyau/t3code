@@ -2413,7 +2413,19 @@ export const layerWithOptions = (
                         entry.runtime.providerSession.providerInstanceId &&
                       thread.nativeThreadRef?.nativeId === owner.coordinatorSessionId,
                   );
-                  if (!parent?.ownerNodeId) continue;
+                  if (!parent) continue;
+                  // Ordinary coordinators own no node. Their latest matching run
+                  // remains a valid anchor after foreground completion.
+                  const parentNodeId =
+                    parent.ownerNodeId ??
+                    (yield* projectionStore.getThreadRecords(threadId, ["runs"])).runs
+                      .filter(
+                        (run) =>
+                          run.providerThreadId === parent.id &&
+                          run.providerInstanceId === parent.providerInstanceId,
+                      )
+                      .sort((a, b) => b.ordinal - a.ordinal)[0]?.rootNodeId;
+                  if (parentNodeId === null || parentNodeId === undefined) continue;
                   const batches =
                     "catalogGap" in observation
                       ? (yield* eventSink.architectures(threadId))
@@ -2450,7 +2462,7 @@ export const layerWithOptions = (
                       providerInstanceId: parent.providerInstanceId,
                       providerSessionId: entry.runtime.providerSessionId,
                       parentProviderThreadId: parent.id,
-                      parentNodeId: parent.ownerNodeId,
+                      parentNodeId,
                       batch,
                       isConnected: connected,
                     });
