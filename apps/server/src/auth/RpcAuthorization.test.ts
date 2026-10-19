@@ -202,6 +202,43 @@ describe("RPC authorization scopes", () => {
   });
 });
 
+it.effect.each([false, true])(
+  "Architecture queries require destination orchestration-read, grant=%s",
+  (allowed) =>
+    Effect.gen(function* () {
+      const method = ORCHESTRATION_V2_WS_METHODS.getPiArchitecture;
+      const group = WsRpcGroup.omit(
+        ...[...WsRpcGroup.requests.keys()].filter(
+          (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, typeof method> => tag !== method,
+        ),
+      );
+      let handled = false;
+      const client = yield* RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            group.toLayerHandler(method, () =>
+              Effect.sync(() => {
+                handled = true;
+                return { kind: "tables" as const, items: [], next: null };
+              }),
+            ),
+            RpcAuthorization.layer(allowed ? [AuthOrchestrationReadScope] : []),
+          ),
+        ),
+      );
+      const read = client[method]({
+        threadId: ThreadId.make("destination-thread"),
+        kind: "tables",
+      });
+      if (allowed) expect(yield* read).toEqual({ kind: "tables", items: [], next: null });
+      else
+        expect(yield* read.pipe(Effect.flip)).toMatchObject({
+          requiredPermission: AuthOrchestrationReadScope,
+        });
+      expect(handled).toBe(allowed);
+    }).pipe(Effect.scoped),
+);
+
 it("requires operate permission for host retry while preserving read-only listing", () => {
   expect(requiredScopeForDeviceList({})).toBe(AuthOrchestrationReadScope);
   expect(requiredScopeForDeviceList({ retryHostId: "remote-host" })).toBe(

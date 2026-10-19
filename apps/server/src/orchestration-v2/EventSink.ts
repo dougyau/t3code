@@ -8,7 +8,7 @@ import {
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
   type PiNativeWorkerCheckpoint,
-  type PiNativeWorkerLaunch,
+  type PiNativeWorkerAdmission,
   type OrchestrationV2Subagent,
   OrchestrationV2DomainEvent,
   OrchestrationV2StoredEvent,
@@ -42,6 +42,7 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import * as ArchitectureArchive from "./ArchitectureArchive.ts";
 
 /**
  * ERRORS
@@ -81,27 +82,58 @@ export type EventSinkV2Error = typeof EventSinkV2Error.Type;
  * SERVICE DEFINITION
  */
 export interface EventSinkV2Shape {
-  readonly nativeWorkers: (providerSessionId: PiNativeWorkerLaunch["providerSessionId"]) =>
-    Effect.Effect<ReadonlyArray<OrchestrationV2Subagent>, EventSinkV2Error>;
+  readonly architectures: (
+    threadId: ThreadId,
+    tableId?: string,
+  ) => Effect.Effect<ReadonlyArray<ArchitectureArchive.ArchitectureArchive>, EventSinkV2Error>;
+  readonly writeArchitecture: (input: {
+    readonly threadId: ThreadId;
+    readonly tableId: string;
+    readonly isConnected: Effect.Effect<boolean>;
+    readonly build: (
+      previous: ArchitectureArchive.ArchitectureArchive | undefined,
+    ) => Effect.Effect<
+      | {
+          readonly archive: ArchitectureArchive.ArchitectureArchive;
+          readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
+        }
+      | undefined,
+      unknown
+    >;
+  }) => Effect.Effect<boolean, EventSinkV2Error>;
+  readonly nativeWorkers: (
+    providerSessionId: PiNativeWorkerAdmission["providerSessionId"],
+  ) => Effect.Effect<ReadonlyArray<OrchestrationV2Subagent>, EventSinkV2Error>;
   /** Native capture's admission/CAS and derived reads share the append transaction. */
   readonly writeNativeWorker: (input: {
-    readonly launch: PiNativeWorkerLaunch;
+    readonly launch: PiNativeWorkerAdmission;
     readonly ownerGeneration: number;
     readonly expectedCheckpoint: PiNativeWorkerCheckpoint | undefined;
     readonly checkpoint: PiNativeWorkerCheckpoint;
     readonly retire?: boolean;
     readonly isConnected?: Effect.Effect<boolean>;
-    readonly build: (subagent: OrchestrationV2Subagent, providerThread: OrchestrationV2ProviderThread) =>
-      Effect.Effect<{
+    readonly build: (
+      subagent: OrchestrationV2Subagent,
+      providerThread: OrchestrationV2ProviderThread,
+    ) => Effect.Effect<
+      {
         readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
-        readonly checklistCapture?: { readonly providerThreadId: ProviderThreadId; readonly capture: PiChecklistCapture };
+        readonly checklistCapture?: {
+          readonly providerThreadId: ProviderThreadId;
+          readonly capture: PiChecklistCapture;
+        };
         readonly sourceProgress: boolean;
-      }, unknown>;
-  }) => Effect.Effect<{
-    readonly committed: boolean;
-    readonly sourceProgress: boolean;
-    readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
-  }, EventSinkV2Error>;
+      },
+      unknown
+    >;
+  }) => Effect.Effect<
+    {
+      readonly committed: boolean;
+      readonly sourceProgress: boolean;
+      readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
+    },
+    EventSinkV2Error
+  >;
   readonly write: (input: {
     readonly checklistCapture?: {
       readonly providerThreadId: ProviderThreadId;
@@ -252,6 +284,7 @@ const layerBase: Layer.Layer<
   EventSinkV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    yield* ArchitectureArchive.setup(sql).pipe(Effect.orDie);
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
@@ -365,16 +398,17 @@ const layerBase: Layer.Layer<
       // Full-row snapshots (including run finalization) are not selector authority.
       // Read the preimage in this transaction, not when a provider event was received.
       for (const event of events) {
-        if (!nativeCapture && (
-          event.type === "subagent.updated" ||
-          event.type === "turn-item.updated" ||
-          event.type === "message.updated" ||
-          event.type === "thread.model-selection-updated" ||
-          event.type === "plan.updated" ||
-          event.type === "provider-thread.updated"
-        )) {
-          const threadId = event.type === "subagent.updated"
-            ? event.payload.childThreadId : event.threadId;
+        if (
+          !nativeCapture &&
+          (event.type === "subagent.updated" ||
+            event.type === "turn-item.updated" ||
+            event.type === "message.updated" ||
+            event.type === "thread.model-selection-updated" ||
+            event.type === "plan.updated" ||
+            event.type === "provider-thread.updated")
+        ) {
+          const threadId =
+            event.type === "subagent.updated" ? event.payload.childThreadId : event.threadId;
           if (threadId != null) {
             const rows = yield* sql<{ native_child: number }>`
               SELECT 1 AS native_child FROM orchestration_v2_projection_provider_threads
@@ -650,8 +684,10 @@ const layerBase: Layer.Layer<
             );
             // A stale startup snapshot cannot install a new native session while
             // retaining the previous session's list. Reject before position writes too.
-            if ((input.resetChecklistSession !== undefined && !prepared.checklistAccepted) ||
-              (input.isConnected !== undefined && !(yield* input.isConnected))) {
+            if (
+              (input.resetChecklistSession !== undefined && !prepared.checklistAccepted) ||
+              (input.isConnected !== undefined && !(yield* input.isConnected))
+            ) {
               return {
                 committed: false as const,
                 storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
@@ -743,53 +779,98 @@ const layerBase: Layer.Layer<
             sourceProgress: false,
             storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
           };
-          const members = yield* ProjectionStore.readNativeWorkers(sql, input.launch.providerSessionId);
+          const members = yield* ProjectionStore.readNativeWorkers(
+            sql,
+            input.launch.providerSessionId,
+          );
           const member = members.find((worker) =>
-            NodeUtil.isDeepStrictEqual(worker.nativeWorker?.launch, input.launch));
+            NodeUtil.isDeepStrictEqual(worker.nativeWorker?.launch, input.launch),
+          );
           if (member?.childThreadId == null || member.providerThreadId === null) return rejected;
-          const child = yield* ProjectionStore.readProviderThread(sql, member.childThreadId, member.providerThreadId);
+          const child = yield* ProjectionStore.readProviderThread(
+            sql,
+            member.childThreadId,
+            member.providerThreadId,
+          );
           const current = child?.nativeMetadata?.nativeWorkerCheckpoint;
-          const runs = yield* sql<{
-            readonly attempt: string | null;
-            readonly providerThreadId: string | null;
-            readonly providerInstanceId: string;
-          }>`
+          const tool = input.launch.source === "architecture_roster" ? undefined : input.launch;
+          const roster = input.launch.source === "architecture_roster" ? input.launch : undefined;
+          const archives =
+            roster === undefined ? [] : yield* ArchitectureArchive.read(sql, roster.parentThreadId);
+          if (
+            roster &&
+            !archives.some(
+              (archive) =>
+                archive.summary.providerInstanceId === roster.providerInstanceId &&
+                archive.summary.coordinatorSessionId === roster.coordinatorSessionId &&
+                archive.summary.roomId === roster.roomId &&
+                archive.providerSessionId === roster.providerSessionId &&
+                archive.parentProviderThreadId === roster.parentProviderThreadId &&
+                archive.records.some(
+                  (record) =>
+                    record.kind === "member" &&
+                    record.id === roster.memberId &&
+                    record.assignmentId === roster.assignmentId &&
+                    record.instanceId === roster.instanceId,
+                ),
+            )
+          )
+            return rejected;
+          const runs =
+            tool === undefined
+              ? []
+              : yield* sql<{
+                  readonly attempt: string | null;
+                  readonly providerThreadId: string | null;
+                  readonly providerInstanceId: string;
+                }>`
             SELECT json_extract(payload_json, '$.activeAttemptId') AS attempt,
               json_extract(payload_json, '$.providerThreadId') AS providerThreadId,
               json_extract(payload_json, '$.providerInstanceId') AS providerInstanceId
             FROM orchestration_v2_projection_runs
-            WHERE thread_id = ${input.launch.parentThreadId} AND run_id = ${input.launch.runId}
+            WHERE thread_id = ${tool.parentThreadId} AND run_id = ${tool.runId}
           `;
           if (
-            child === undefined || child.ownerNodeId !== member.id ||
+            child === undefined ||
+            child.ownerNodeId !== member.id ||
             child.appThreadId !== member.childThreadId ||
             member.threadId !== input.launch.parentThreadId ||
-            member.runId !== input.launch.runId ||
-            member.parentNodeId !== input.launch.toolNodeId ||
+            member.runId !== (tool?.runId ?? null) ||
+            member.parentNodeId !== (tool?.toolNodeId ?? roster?.parentNodeId) ||
             child.providerSessionId !== input.launch.providerSessionId ||
             child.providerInstanceId !== input.launch.providerInstanceId ||
-            (input.retire !== true && (
-              runs[0]?.providerThreadId !== input.launch.parentProviderThreadId ||
-              runs[0]?.providerInstanceId !== input.launch.providerInstanceId ||
-              runs[0]?.attempt !== input.launch.runAttemptId)) ||
+            (tool !== undefined &&
+              input.retire !== true &&
+              (runs[0]?.providerThreadId !== input.launch.parentProviderThreadId ||
+                runs[0]?.providerInstanceId !== input.launch.providerInstanceId ||
+                runs[0]?.attempt !== tool.runAttemptId)) ||
             !NodeUtil.isDeepStrictEqual(current, input.expectedCheckpoint) ||
             current?.ownerGeneration !== input.ownerGeneration ||
-            input.checkpoint.ownerGeneration !== input.ownerGeneration + (input.retire === true ? 1 : 0) ||
+            input.checkpoint.ownerGeneration !==
+              input.ownerGeneration + (input.retire === true ? 1 : 0) ||
             !NodeUtil.isDeepStrictEqual(input.checkpoint.launch, input.launch) ||
             !NodeUtil.isDeepStrictEqual(current.owner, input.checkpoint.owner)
-          ) return rejected;
+          )
+            return rejected;
           if (input.isConnected !== undefined && !(yield* input.isConnected)) return rejected;
           const built = yield* input.build(member, child);
           if (input.isConnected !== undefined && !(yield* input.isConnected)) return rejected;
-          const prepared = yield* prepareEvents(built.events, built.checklistCapture, undefined, true);
+          const prepared = yield* prepareEvents(
+            built.events,
+            built.checklistCapture,
+            undefined,
+            true,
+          );
           if (!prepared.checklistAccepted) {
             return yield* Effect.die(new Error("Native checklist capture rejected."));
           }
-          const storedEvents = yield* eventStore.append({ events: yield* normalizeTurnItems(prepared.events) });
+          const storedEvents = yield* eventStore.append({
+            events: yield* normalizeTurnItems(prepared.events),
+          });
           yield* applyStoredEvents(storedEvents);
           return { committed: true, sourceProgress: built.sourceProgress, storedEvents };
         }),
-        (result) => result.committed ? publishStoredEvents(result.storedEvents) : Effect.void,
+        (result) => (result.committed ? publishStoredEvents(result.storedEvents) : Effect.void),
       );
     });
 
@@ -1044,13 +1125,51 @@ const layerBase: Layer.Layer<
     };
 
     return EventSinkV2.of({
+      architectures: (threadId, tableId) =>
+        ArchitectureArchive.read(sql, threadId, tableId).pipe(
+          Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 0, cause })),
+        ),
+      writeArchitecture: (input) =>
+        commitThenPublish(
+          Effect.gen(function* () {
+            const rejected = {
+              committed: false,
+              storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+            };
+            if (!(yield* input.isConnected)) return rejected;
+            const previous = (yield* ArchitectureArchive.read(
+              sql,
+              input.threadId,
+              input.tableId,
+            ))[0];
+            const built = yield* input.build(previous);
+            if (!built || !(yield* input.isConnected)) return rejected;
+            if (
+              built.archive.summary.threadId !== input.threadId ||
+              built.archive.summary.tableId !== input.tableId
+            )
+              return yield* Effect.die(new Error("Architecture archive anchor differs"));
+            const prepared = yield* prepareEvents(built.events, undefined, undefined, true);
+            const storedEvents = yield* eventStore.append({
+              events: yield* normalizeTurnItems(prepared.events),
+            });
+            yield* applyStoredEvents(storedEvents);
+            yield* ArchitectureArchive.write(sql, built.archive);
+            return { committed: true, storedEvents };
+          }),
+          (result) => (result.committed ? publishStoredEvents(result.storedEvents) : Effect.void),
+        ).pipe(
+          Effect.map((result) => result.committed),
+          Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 0, cause })),
+        ),
       nativeWorkers: (providerSessionId) =>
         ProjectionStore.readNativeWorkers(sql, providerSessionId).pipe(
           Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 0, cause })),
         ),
-      writeNativeWorker: (input) => writeNativeWorkerEffect(input).pipe(
-        Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 0, cause })),
-      ),
+      writeNativeWorker: (input) =>
+        writeNativeWorkerEffect(input).pipe(
+          Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 0, cause })),
+        ),
       write: (input) =>
         writeEffect({ ...input, effects: [] }).pipe(
           Effect.mapError(

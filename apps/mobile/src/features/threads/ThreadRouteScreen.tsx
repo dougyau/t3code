@@ -118,7 +118,10 @@ function ThreadPane(props: { readonly children: ReactNode }) {
   );
 }
 
-function ThreadRouteFallbackLayout(props: { readonly children: ReactNode }) {
+function ThreadRouteFallbackLayout(props: {
+  readonly children: ReactNode;
+  readonly onBack?: (() => void) | undefined;
+}) {
   const returnToList = useWorkspaceListNavigation("threads");
   const { layout } = useAdaptiveWorkspaceLayout();
   const { themeVariables } = useAppearancePreferences();
@@ -129,7 +132,7 @@ function ThreadRouteFallbackLayout(props: { readonly children: ReactNode }) {
       <ScreenHeader
         title="Thread"
         options={{ contentStyle: { backgroundColor: themeVariables["--color-header"] } }}
-        onBack={layout.usesSplitView ? undefined : returnToList}
+        onBack={props.onBack ?? (layout.usesSplitView ? undefined : returnToList)}
         hideBottomBorder
       />
       <ThreadPane>{props.children}</ThreadPane>
@@ -137,9 +140,9 @@ function ThreadRouteFallbackLayout(props: { readonly children: ReactNode }) {
   );
 }
 
-function OpeningThreadLoadingScreen() {
+function OpeningThreadLoadingScreen(props: { readonly onBack?: (() => void) | undefined }) {
   return (
-    <ThreadRouteFallbackLayout>
+    <ThreadRouteFallbackLayout onBack={props.onBack}>
       <LoadingScreen
         message="Opening thread…"
         messagePlacement="above-spinner"
@@ -154,6 +157,7 @@ type ThreadRouteScreenRouteProps = StaticScreenProps<{
   readonly threadId: string;
   /** A prompt link's draft text. See useThreadPromptLink. */
   readonly prompt?: string | string[];
+  readonly architectParticipant?: boolean;
 }>;
 
 interface ThreadRouteScreenProps extends ThreadRouteScreenRouteProps {
@@ -165,9 +169,10 @@ interface ThreadRouteScreenProps extends ThreadRouteScreenRouteProps {
 function ThreadUnavailableScreen(props: {
   readonly actionLabel: string;
   readonly onAction: () => void;
+  readonly onBack?: (() => void) | undefined;
 }) {
   return (
-    <ThreadRouteFallbackLayout>
+    <ThreadRouteFallbackLayout onBack={props.onBack}>
       <ScrollView
         contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={{
@@ -189,8 +194,27 @@ function ThreadUnavailableScreen(props: {
   );
 }
 
-export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
+function ThreadWorkspaceBackHandler() {
   useAndroidWorkspaceBack("threads");
+  return null;
+}
+
+export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
+  const navigation = useNavigation();
+  return (
+    <>
+      {!props.route.params.architectParticipant ? <ThreadWorkspaceBackHandler /> : null}
+      <ThreadRouteScreenContent
+        {...props}
+        {...(props.route.params.architectParticipant
+          ? { onReturnToThread: () => navigation.goBack() }
+          : {})}
+      />
+    </>
+  );
+}
+
+function ThreadRouteScreenContent(props: ThreadRouteScreenProps) {
   const connectionsReady = useConnectionsReady();
   const { connectionState } = useRemoteConnectionStatus();
   const { selectedThread } = useThreadSelection();
@@ -216,7 +240,7 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
   useThreadPromptLink(params, routeThreadKey);
 
   if (environmentId === null || threadIdRaw === null) {
-    return <OpeningThreadLoadingScreen />;
+    return <OpeningThreadLoadingScreen onBack={props.onReturnToThread} />;
   }
 
   // Render the full thread chrome (header, feed, composer) as soon as the
@@ -238,11 +262,12 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
   });
 
   if (stillHydrating) {
-    return <OpeningThreadLoadingScreen />;
+    return <OpeningThreadLoadingScreen onBack={props.onReturnToThread} />;
   }
 
   return (
     <ThreadUnavailableScreen
+      onBack={props.onReturnToThread}
       actionLabel={
         routeEnvironmentRuntime === null ? "Manage environments" : "Reconnect environment"
       }

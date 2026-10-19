@@ -22,6 +22,8 @@ import {
   type PiNativeWorkerCheckpoint,
   type PiNativeWorkerSummary,
   type PiNativeWorkerRecord,
+  type PiArchitectureRecord,
+  PiArchitectureReadResult,
   ProviderDriverKind,
   ProviderInstanceId,
   PlanId,
@@ -37,13 +39,16 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as SqlClient from "effect/sql/SqlClient";
 import { vi } from "vite-plus/test";
 
 import { toolOutputImages } from "@t3tools/shared/toolOutput";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EventSink from "./EventSink.ts";
+import { read as queryArchitecture } from "./ArchitectureQuery.ts";
 import * as EventStore from "./EventStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -97,6 +102,7 @@ const modelSelection = {
   model: "gpt-5.4",
 } satisfies ModelSelection;
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
+const decodeArchitectureReadResult = Schema.decodeEffect(PiArchitectureReadResult);
 
 function threadCreatedEvent(
   now: DateTime.Utc,
@@ -389,6 +395,696 @@ const seedNativeWorker = Effect.fnUntraced(function* (admit = true) {
     batch,
     turnItem,
   };
+});
+
+layer("Architecture persisted import", (it) => {
+  const architecture = (f: Effect.Success<ReturnType<typeof seedNativeWorker>>) => {
+    const room: Extract<PiArchitectureRecord, { kind: "room" }> = {
+      kind: "room",
+      id: "room-1",
+      mode: "table",
+      origin: {
+        coordinatorSessionId: f.launch.coordinatorSessionId,
+        tool: "architecture_start",
+        toolCallId: "start",
+        memberId: "director",
+        assignmentId: f.launch.assignmentId!,
+        instanceId: f.launch.instanceId,
+      },
+      goalSource: { kind: "worker-workbrief", instanceId: f.launch.instanceId },
+      lifecycle: {
+        stage: "preparation",
+        round: 0,
+        protocolState: "running",
+        outcome: "pending",
+        closure: { state: "pending", members: "pending", director: "pending" },
+      },
+      pendingDoubtIds: [],
+    };
+    const member: Extract<PiArchitectureRecord, { kind: "member" }> = {
+      kind: "member",
+      id: "director",
+      assignmentId: f.launch.assignmentId!,
+      instanceId: f.launch.instanceId,
+      roleId: "architect",
+      function: "director",
+      ordinal: 0,
+      admittedAt: 1,
+      mandate: { source: "root-workbrief", instanceId: f.launch.instanceId },
+      execution: "running",
+      conversationRefs: [],
+    };
+    const batch: ProviderAdapter.ProviderArchitectureBatch = {
+      roomId: room.id,
+      checkpoint: { owner: f.checkpoint.owner, ownerGeneration: 1, cut: 1, snapshotId: "cut-1" },
+      records: [room, member],
+      capture: "open",
+      gaps: [],
+      original: {
+        id: "original",
+        text: "  # Encargo\ncafé 🧭 中文\n".repeat(400),
+        source: "original WorkBrief",
+        complete: true,
+      },
+    };
+    const input = {
+      threadId: f.parent.threadId,
+      providerInstanceId: f.launch.providerInstanceId,
+      providerSessionId: f.launch.providerSessionId,
+      parentProviderThreadId: f.launch.parentProviderThreadId,
+      parentNodeId: f.launch.toolNodeId,
+      batch,
+      isConnected: Effect.succeed(true),
+    };
+    return { room, member, batch, input };
+  };
+
+  it.effect.each([true, false])("converges tool/roster admission, tool first=%s", (toolFirst) =>
+    Effect.gen(function* () {
+      const f = yield* seedNativeWorker(toolFirst);
+      const a = architecture(f);
+      yield* f.ingestor.ingestArchitecture(a.input);
+      yield* f.ingestor.ingestNormalized({
+        providerSessionId: f.launch.providerSessionId,
+        providerInstanceId: f.launch.providerInstanceId,
+        threadId: f.parent.threadId,
+        runId: f.run.id,
+        event: {
+          type: "turn_item.updated",
+          driver: ProviderDriverKind.make("pi"),
+          turnItem: f.turnItem,
+        },
+        nativeWorkerAdmission: { summary: f.summary, checkpoint: f.checkpoint },
+      });
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const parent = yield* projections.getThreadProjection(f.parent.threadId);
+      assert.equal(parent.subagents.length, 1);
+      const child = parent.subagents[0]!;
+      assert.equal(child.runId, null);
+      assert.equal(child.nativeWorker?.launch.source, "architecture_roster");
+      assert.isTrue(a.batch.original!.text.startsWith(child.prompt));
+      assert.isAbove(child.prompt.length, 0);
+      assert.isAtMost(child.prompt.length, 512);
+      assert.equal(
+        (yield* f.sink.architectures(f.parent.threadId))[0]?.original?.text,
+        a.batch.original!.text,
+      );
+      assert.equal(parent.thread.nativeTables?.[0]?.participants, 1);
+      assert.equal(
+        (yield* projections.getThreadProjection(child.childThreadId!)).providerThreads.length,
+        1,
+      );
+    }),
+  );
+
+  it.effect(
+    "imports failed/replacement members without conversation refs and replays idempotently",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* seedNativeWorker(false);
+        const a = architecture(f);
+        a.batch = {
+          ...a.batch,
+          records: [
+            a.room,
+            a.member,
+            {
+              ...a.member,
+              id: "failed",
+              instanceId: "failed",
+              function: "specialist",
+              execution: "failed",
+              mandate: { source: "TeamAssignment.task", text: "Mandato exacto\n " },
+            },
+            {
+              ...a.member,
+              id: "replacement",
+              instanceId: "replacement",
+              function: "specialist",
+              mandate: { source: "TeamAssignment.task", text: "Sustitución" },
+            },
+          ],
+        };
+        const input = { ...a.input, batch: a.batch };
+        yield* f.ingestor.ingestArchitecture(input);
+        const eventStore = yield* EventStore.EventStoreV2;
+        const sequence = yield* eventStore.latestSequence({ threadId: f.parent.threadId });
+        yield* f.ingestor.ingestArchitecture(input);
+        assert.equal(yield* eventStore.latestSequence({ threadId: f.parent.threadId }), sequence);
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const parent = yield* projections.getThreadProjection(f.parent.threadId);
+        assert.equal(parent.subagents.length, 3);
+        assert.equal(parent.thread.nativeTables?.[0]?.participants, 3);
+        assert.equal(
+          parent.subagents.find((s) => s.nativeWorker?.launch.instanceId === "failed")?.prompt,
+          "Mandato exacto\n ",
+        );
+        const failed = parent.subagents.find((s) => s.nativeWorker?.launch.instanceId === "failed");
+        assert.deepEqual(failed?.nativeWorker?.mandate, {
+          source: "TeamAssignment.task",
+          text: "Mandato exacto\n ",
+          complete: true,
+        });
+        assert.isUndefined(failed?.nativeWorker?.brief);
+        assert.equal(
+          parent.subagents.find((s) => s.nativeWorker?.launch.instanceId === "failed")?.nativeWorker
+            ?.execution,
+          "failed",
+        );
+      }),
+  );
+
+  it.effect("keeps long goals and mandates in the archive, not in the shell", () =>
+    Effect.gen(function* () {
+      const f = yield* seedNativeWorker(false);
+      const a = architecture(f);
+      const mandate = `${"x".repeat(511)}🧭\n${"literal 中文  ".repeat(2000)}`;
+      const original = {
+        id: "original",
+        text: mandate,
+        source: "original WorkBrief" as const,
+        complete: true,
+      };
+      yield* f.ingestor.ingestArchitecture({
+        ...a.input,
+        batch: {
+          ...a.batch,
+          original,
+          records: [
+            a.room,
+            a.member,
+            {
+              ...a.member,
+              id: "specialist",
+              instanceId: "specialist",
+              function: "specialist",
+              mandate: { source: "TeamAssignment.task", text: mandate },
+            },
+          ],
+        },
+      });
+      const projection = yield* ProjectionStore.ProjectionStoreV2;
+      const parent = yield* projection.getThreadProjection(f.parent.threadId);
+      const director = parent.subagents.find(
+        (s) => s.nativeWorker?.launch.instanceId === f.launch.instanceId,
+      )!;
+      const specialist = parent.subagents.find(
+        (s) => s.nativeWorker?.launch.instanceId === "specialist",
+      )!;
+      assert.equal(director.nativeWorker?.briefComplete, false);
+      assert.equal(specialist.nativeWorker?.mandate?.complete, false);
+      assert.equal(specialist.nativeWorker?.mandate?.text, "x".repeat(511));
+      assert.isAtMost(director.prompt.length, 512);
+      assert.isAtMost(specialist.prompt.length, 512);
+      const saved = (yield* f.sink.architectures(f.parent.threadId))[0]!;
+      assert.equal(saved.original?.text, mandate);
+      const record = saved.records.find(
+        (r) => r.kind === "member" && r.instanceId === "specialist",
+      );
+      assert.equal(record?.kind, "member");
+      if (record?.kind === "member" && record.mandate.source === "TeamAssignment.task")
+        assert.equal(record.mandate.text, mandate);
+    }),
+  );
+
+  it.effect(
+    "upgrades invocation fallback to the original WorkBrief without demoting it on partial captures",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* seedNativeWorker(false);
+        const a = architecture(f);
+        const capture = (
+          cut: number,
+          original: ProviderAdapter.ProviderArchitectureBatch["original"],
+        ) =>
+          f.ingestor.ingestArchitecture({
+            ...a.input,
+            batch: {
+              ...a.batch,
+              checkpoint: { ...a.batch.checkpoint, cut },
+              ...(original ? { original } : {}),
+            },
+          });
+        yield* capture(1, {
+          id: "original",
+          text: "fallback",
+          source: "invocation task",
+          complete: true,
+        });
+        yield* capture(2, a.batch.original);
+        yield* capture(3, {
+          id: "original",
+          text: "partial",
+          source: "original WorkBrief",
+          complete: false,
+        });
+        yield* capture(4, {
+          id: "original",
+          text: "fallback again",
+          source: "invocation task",
+          complete: true,
+        });
+        const saved = (yield* f.sink.architectures(f.parent.threadId))[0]!;
+        assert.deepEqual(saved.original, a.batch.original);
+      }),
+  );
+
+  it.effect(
+    "archives first-page capture loss without replacing confirmed content or rewinding its cut",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* seedNativeWorker(false);
+        const a = architecture(f);
+        const loss = {
+          ...a.input,
+          batch: {
+            roomId: a.batch.roomId,
+            records: [],
+            checkpoint: { ...a.batch.checkpoint, snapshotId: "", cut: 0 },
+            capture: "incomplete" as const,
+            gaps: ["unavailable"],
+          },
+        };
+        assert.isFalse(yield* f.ingestor.ingestArchitecture(loss));
+        assert.isEmpty(yield* f.sink.architectures(f.parent.threadId));
+        yield* f.ingestor.ingestArchitecture({
+          ...a.input,
+          batch: {
+            ...a.batch,
+            records: [
+              ...a.batch.records,
+              {
+                kind: "publication",
+                id: "decision",
+                message: {
+                  id: "decision",
+                  ordinal: 0,
+                  roomId: a.room.id,
+                  assignmentId: a.member.assignmentId,
+                  memberId: a.member.id,
+                  author: a.member.instanceId,
+                  stage: "decision",
+                  snapshotId: "settled-decision",
+                  round: 0,
+                  turnId: "turn",
+                  attemptId: "attempt",
+                  body: { kind: "decision", action: "continue", reason: "Confirmed decision" },
+                  native: {
+                    sessionId: "session",
+                    toolCallId: "submit",
+                    persistence: "unconfirmed",
+                  },
+                  doubts: [],
+                },
+              },
+            ],
+          },
+        });
+        const saved = (yield* f.sink.architectures(f.parent.threadId))[0]!;
+        assert.isAbove(saved.checkpoint.cut, 0);
+        let connectionChecks = 0;
+        assert.isFalse(
+          yield* f.ingestor.ingestArchitecture({
+            ...loss,
+            isConnected: Effect.sync(() => ++connectionChecks === 1),
+          }),
+        );
+        assert.deepEqual(yield* f.sink.architectures(f.parent.threadId), [saved]);
+        assert.isFalse(
+          yield* f.ingestor.ingestArchitecture({
+            ...loss,
+            isConnected: Effect.succeed(false),
+          }),
+        );
+        assert.isFalse(
+          yield* f.ingestor.ingestArchitecture({
+            ...loss,
+            batch: {
+              ...loss.batch,
+              checkpoint: { ...loss.batch.checkpoint, ownerGeneration: 0 },
+            },
+          }),
+        );
+        assert.isFalse(
+          yield* f.ingestor.ingestArchitecture({
+            ...loss,
+            batch: {
+              ...loss.batch,
+              checkpoint: {
+                ...loss.batch.checkpoint,
+                owner: { ...loss.batch.checkpoint.owner, epoch: "unconfirmed-owner" },
+              },
+            },
+          }),
+        );
+        assert.isTrue(yield* f.ingestor.ingestArchitecture(loss));
+        const archives = yield* f.sink.architectures(f.parent.threadId);
+        const partial = archives[0]!;
+        assert.deepEqual(partial.records, saved.records);
+        assert.deepEqual(partial.original, saved.original);
+        assert.deepEqual(partial.checkpoint, saved.checkpoint);
+        const result = yield* decodeArchitectureReadResult(
+          yield* queryArchitecture(
+            { threadId: f.parent.threadId, tableId: saved.summary.tableId, kind: "records" },
+            archives,
+            [],
+          ),
+        );
+        assert.equal(result.kind, "records");
+        if (result.kind !== "records") return;
+        assert.deepEqual(result.summary, {
+          ...saved.summary,
+          capture: "incomplete",
+          observation: "partial",
+          gaps: ["unavailable"],
+        });
+        assert.equal(result.items.length, saved.records.length);
+        const text = yield* queryArchitecture(
+          {
+            threadId: f.parent.threadId,
+            tableId: saved.summary.tableId,
+            kind: "text",
+            textId: "publication:decision",
+          },
+          archives,
+          [],
+        );
+        assert.equal(text.kind, "text");
+        if (text.kind === "text")
+          assert.equal(JSON.parse(text.text).body.reason, "Confirmed decision");
+        const original = yield* queryArchitecture(
+          {
+            threadId: f.parent.threadId,
+            tableId: saved.summary.tableId,
+            kind: "text",
+            textId: "original",
+          },
+          archives,
+          [],
+        );
+        assert.equal(original.kind, "text");
+        if (original.kind === "text") {
+          assert.isTrue(saved.original!.text.startsWith(original.text));
+          assert.isNotEmpty(original.text);
+          assert.equal(original.source, "original WorkBrief");
+          assert.isTrue(original.complete);
+        }
+        const projection = yield* ProjectionStore.ProjectionStoreV2;
+        const parent = yield* projection.getThreadProjection(f.parent.threadId);
+        assert.deepEqual(parent.thread.nativeTables, [result.summary]);
+        assert.equal(parent.subagents.length, 1);
+        const eventStore = yield* EventStore.EventStoreV2;
+        const sequence = yield* eventStore.latestSequence({ threadId: f.parent.threadId });
+        assert.isFalse(yield* f.ingestor.ingestArchitecture(loss));
+        assert.equal(yield* eventStore.latestSequence({ threadId: f.parent.threadId }), sequence);
+        assert.deepEqual(yield* f.sink.architectures(f.parent.threadId), archives);
+        const anotherLoss = {
+          ...loss,
+          batch: { ...loss.batch, gaps: ["record_oversized"] },
+        };
+        assert.isTrue(yield* f.ingestor.ingestArchitecture(anotherLoss));
+        assert.isFalse(yield* f.ingestor.ingestArchitecture(anotherLoss));
+        assert.deepEqual((yield* f.sink.architectures(f.parent.threadId))[0]?.summary.gaps, [
+          "unavailable",
+          "record_oversized",
+        ]);
+        assert.isTrue(
+          yield* f.ingestor.ingestArchitecture({
+            ...anotherLoss,
+            batch: {
+              ...anotherLoss.batch,
+              checkpoint: { ...anotherLoss.batch.checkpoint, ownerGeneration: 2 },
+            },
+          }),
+        );
+        assert.isFalse(yield* f.ingestor.ingestArchitecture(loss));
+        const latest = (yield* f.sink.architectures(f.parent.threadId))[0]!;
+        assert.deepEqual(latest.checkpoint, { ...saved.checkpoint, ownerGeneration: 2 });
+        assert.deepEqual(latest.records, saved.records);
+      }),
+  );
+
+  it.effect("queries structured failure attribution and ordered instruction provenance", () =>
+    Effect.gen(function* () {
+      const f = yield* seedNativeWorker(false);
+      const a = architecture(f);
+      const author = { coordinatorSessionId: f.launch.coordinatorSessionId, toolCallId: "steer" };
+      yield* f.ingestor.ingestArchitecture({
+        ...a.input,
+        batch: {
+          ...a.batch,
+          records: [
+            ...a.batch.records,
+            {
+              ...a.member,
+              id: "specialist",
+              instanceId: "specialist",
+              function: "specialist",
+              mandate: { source: "TeamAssignment.task", text: "An independent specialist mandate" },
+            },
+            {
+              kind: "failure",
+              id: "attributed",
+              phase: "preparation",
+              error: "Preparation failed",
+              memberId: a.member.id,
+              assignmentId: a.member.assignmentId,
+              stage: "preparation",
+              round: 0,
+            },
+            {
+              kind: "failure",
+              id: "unattributed",
+              phase: "admission",
+              error: "No member admitted",
+            },
+            {
+              kind: "control",
+              id: "instruction",
+              order: 0,
+              action: "priorities",
+              author,
+              text: "Keep the original mandate separate",
+              application: { state: "pending" },
+            },
+          ],
+        },
+      });
+      const archives = yield* f.sink.architectures(f.parent.threadId);
+      const input = { threadId: f.parent.threadId, tableId: archives[0]!.summary.tableId };
+      const result = yield* decodeArchitectureReadResult(
+        yield* queryArchitecture({ ...input, kind: "records" }, archives, []),
+      );
+      assert.equal(result.kind, "records");
+      if (result.kind !== "records") return;
+      assert.deepEqual(
+        result.items.filter((record) => record.kind === "failure" || record.kind === "control"),
+        [
+          {
+            kind: "failure",
+            id: "attributed",
+            phase: "preparation",
+            memberId: a.member.id,
+            assignmentId: a.member.assignmentId,
+            stage: "preparation",
+            round: 0,
+            textId: "failure:attributed",
+          },
+          {
+            kind: "failure",
+            id: "unattributed",
+            phase: "admission",
+            textId: "failure:unattributed",
+          },
+          {
+            kind: "control",
+            id: "instruction",
+            action: "priorities",
+            order: 0,
+            author,
+            textId: "control:instruction",
+          },
+        ],
+      );
+      const text = yield* queryArchitecture(
+        { ...input, kind: "text", textId: "control:instruction" },
+        archives,
+        [],
+      );
+      assert.equal(text.kind, "text");
+      if (text.kind === "text") {
+        assert.equal(text.source, "subsequent instruction");
+        assert.equal(JSON.parse(text.text).text, "Keep the original mandate separate");
+      }
+      const mandate = yield* queryArchitecture(
+        { ...input, kind: "text", textId: "member:specialist" },
+        archives,
+        [],
+      );
+      assert.equal(mandate.kind, "text");
+      if (mandate.kind === "text") {
+        assert.equal(mandate.source, "TeamAssignment.task");
+        assert.deepEqual(JSON.parse(mandate.text).mandate, {
+          source: "TeamAssignment.task",
+          text: "An independent specialist mandate",
+        });
+      }
+      assert.deepEqual(archives[0]!.original, a.batch.original);
+    }),
+  );
+
+  it.effect(
+    "fences disconnected/retired owners and retains confirmed data on incomplete capture",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* seedNativeWorker(false);
+        const a = architecture(f);
+        yield* f.ingestor.ingestArchitecture({ ...a.input, isConnected: Effect.succeed(false) });
+        assert.isEmpty(yield* f.sink.architectures(f.parent.threadId));
+        yield* f.ingestor.ingestArchitecture(a.input);
+        const saved = (yield* f.sink.architectures(f.parent.threadId))[0]!;
+        yield* f.ingestor.ingestArchitecture({
+          ...a.input,
+          batch: {
+            ...a.batch,
+            capture: "incomplete",
+            records: [a.room],
+            checkpoint: { ...a.batch.checkpoint, cut: 2 },
+            gaps: ["stale_cursor"],
+          },
+        });
+        const partial = (yield* f.sink.architectures(f.parent.threadId))[0]!;
+        assert.equal(partial.summary.participants, 1);
+        assert.deepEqual(partial.original, saved.original);
+        assert.equal(partial.summary.lifecycle.closure.state, "pending");
+        yield* f.sink.writeArchitecture({
+          threadId: f.parent.threadId,
+          tableId: saved.summary.tableId,
+          isConnected: Effect.succeed(true),
+          build: () => Effect.succeed({ archive: { ...partial, retired: true }, events: [] }),
+        });
+        assert.isFalse(
+          yield* f.ingestor.ingestArchitecture({
+            ...a.input,
+            batch: {
+              ...a.batch,
+              records: [],
+              checkpoint: { ...a.batch.checkpoint, snapshotId: "", cut: 0 },
+              capture: "incomplete",
+              gaps: ["unavailable"],
+            },
+          }),
+        );
+        yield* f.ingestor.ingestArchitecture({
+          ...a.input,
+          batch: { ...a.batch, checkpoint: { ...a.batch.checkpoint, cut: 3 } },
+        });
+        assert.equal((yield* f.sink.architectures(f.parent.threadId))[0]?.checkpoint.cut, 2);
+        const newOwner = { ...a.batch.checkpoint.owner, epoch: "new-owner" };
+        yield* f.ingestor.ingestArchitecture({
+          ...a.input,
+          batch: { ...a.batch, checkpoint: { ...a.batch.checkpoint, owner: newOwner } },
+        });
+        assert.equal(
+          (yield* f.sink.architectures(f.parent.threadId))[0]?.checkpoint.owner.epoch,
+          "new-owner",
+        );
+      }),
+  );
+
+  it.effect("queries paged literal text and rejects cross-section/stale cursors", () =>
+    Effect.gen(function* () {
+      const f = yield* seedNativeWorker(false);
+      const a = architecture(f);
+      yield* f.ingestor.ingestArchitecture(a.input);
+      const archives = yield* f.sink.architectures(f.parent.threadId);
+      const tableId = archives[0]!.summary.tableId;
+      const query = {
+        threadId: f.parent.threadId,
+        tableId,
+        kind: "text" as const,
+        textId: "original",
+      };
+      const initial = yield* queryArchitecture(query, archives, []);
+      assert.equal(initial.kind, "text");
+      if (initial.kind !== "text") return;
+      let result = initial;
+      let text = result.text;
+      const revision = result.revision;
+      assert.isTrue(result.complete);
+      while (result.nextOffset !== null) {
+        yield* f.ingestor.ingestArchitecture({
+          ...a.input,
+          batch: {
+            ...a.batch,
+            checkpoint: {
+              ...a.batch.checkpoint,
+              snapshotId: `recapture-at-${result.nextOffset}`,
+              cut: a.batch.checkpoint.cut + result.nextOffset,
+            },
+          },
+        });
+        const next = yield* queryArchitecture(
+          {
+            ...query,
+            revision,
+            offset: result.nextOffset,
+          },
+          yield* f.sink.architectures(f.parent.threadId),
+          [],
+        );
+        assert.equal(next.kind, "text");
+        if (next.kind !== "text") return;
+        result = next;
+        text += result.text;
+      }
+      assert.equal(text, a.batch.original!.text);
+      assert.isTrue(
+        (yield* queryArchitecture({ ...query, offset: 20 }, archives, []).pipe(Effect.exit))
+          ._tag === "Failure",
+      );
+      const changed = archives.map((archive) => ({
+        ...archive,
+        original: { ...archive.original!, complete: false },
+      }));
+      assert.isTrue(
+        (yield* queryArchitecture({ ...query, revision, offset: 20 }, changed, []).pipe(
+          Effect.exit,
+        ))._tag === "Failure",
+      );
+      const rows = yield* queryArchitecture(
+        { threadId: query.threadId, kind: "tables" },
+        archives,
+        [],
+      );
+      assert.isFalse(JSON.stringify(rows).includes(a.batch.original!.text));
+      assert.equal(rows.kind, "tables");
+      if (rows.kind === "tables") assert.equal(rows.items[0]?.observation, "stale");
+    }),
+  );
+
+  it.effect(
+    "rolls archive, checkpoints, events and child projections back on archive failure",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* seedNativeWorker(false);
+        const a = architecture(f);
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* EventStore.EventStoreV2;
+        const before = yield* store.latestSequence({ threadId: f.parent.threadId });
+        yield* sql`CREATE TEMP TRIGGER fail_architecture BEFORE INSERT ON orchestration_v2_architecture_archive
+        BEGIN SELECT RAISE(ABORT, 'fixture archive failure'); END`;
+        const result = yield* f.ingestor.ingestArchitecture(a.input).pipe(Effect.exit);
+        yield* sql`DROP TRIGGER fail_architecture`;
+        assert.equal(result._tag, "Failure");
+        assert.equal(yield* store.latestSequence({ threadId: f.parent.threadId }), before);
+        assert.isEmpty(yield* f.sink.nativeWorkers(f.launch.providerSessionId));
+        assert.isEmpty(yield* f.sink.architectures(f.parent.threadId));
+        yield* f.ingestor.ingestArchitecture(a.input);
+        assert.equal((yield* f.sink.nativeWorkers(f.launch.providerSessionId)).length, 1);
+        assert.equal((yield* f.sink.architectures(f.parent.threadId)).length, 1);
+      }),
+  );
 });
 
 layer("native worker persisted import", (it) => {

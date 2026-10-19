@@ -1246,14 +1246,20 @@ export const layer: Layer.Layer<
                   const isRootProviderThreadUpdate =
                     event.type === "provider_thread.updated" &&
                     event.providerThread.id === input.providerThread.id;
-                  const launch = deliveredEvent.type === "turn_item.updated"
-                    ? deliveredEvent.turnItem.nativeWorkerLaunch : undefined;
+                  const launch =
+                    deliveredEvent.type === "turn_item.updated"
+                      ? deliveredEvent.turnItem.nativeWorkerLaunch
+                      : undefined;
                   const port = input.session.nativeWorkers;
-                  const isNativeLaunch = launch !== undefined &&
+                  const isNativeLaunch =
+                    launch !== undefined &&
                     !rootTerminalAlreadySeen &&
                     deliveredEvent.type === "turn_item.updated" &&
                     deliveredEvent.turnItem.type === "dynamic_tool" &&
-                    deliveredEvent.turnItem.toolName === launch.source &&
+                    deliveredEvent.turnItem.toolName ===
+                      (launch.source === "team_assign"
+                        ? (launch.entrypoint ?? launch.source)
+                        : launch.source) &&
                     deliveredEvent.turnItem.status === "completed" &&
                     deliveredEvent.turnItem.nodeId === launch.toolNodeId &&
                     deliveredEvent.turnItem.threadId === launch.parentThreadId &&
@@ -1267,76 +1273,103 @@ export const layer: Layer.Layer<
                   const reconcileAdmission = Effect.gen(function* () {
                     const owner = port?.owner;
                     const ownerGeneration = port?.ownerGeneration;
-                    if (!isNativeLaunch || launch === undefined || port === undefined ||
-                      owner === undefined || ownerGeneration === undefined ||
-                      launch.coordinatorSessionId !== owner.coordinatorSessionId) return undefined;
-                    const summary = yield* port.reconcile(launch).pipe(Effect.mapError(
-                      (cause) => new RunExecutionIngestError({ runId: input.run.id, cause }),
-                    ));
-                    if (!NodeUtil.isDeepStrictEqual(summary.launch, launch) ||
+                    if (
+                      !isNativeLaunch ||
+                      launch === undefined ||
+                      port === undefined ||
+                      owner === undefined ||
+                      ownerGeneration === undefined ||
+                      launch.coordinatorSessionId !== owner.coordinatorSessionId
+                    )
+                      return undefined;
+                    const summary = yield* port
+                      .reconcile(launch)
+                      .pipe(
+                        Effect.mapError(
+                          (cause) => new RunExecutionIngestError({ runId: input.run.id, cause }),
+                        ),
+                      );
+                    if (
+                      !NodeUtil.isDeepStrictEqual(summary.launch, launch) ||
                       !NodeUtil.isDeepStrictEqual(port.owner, owner) ||
-                      port.ownerGeneration !== ownerGeneration) return undefined;
+                      port.ownerGeneration !== ownerGeneration
+                    )
+                      return undefined;
                     return {
                       summary,
                       checkpoint: {
-                        launch, owner, ownerGeneration,
-                        captureEpoch: null, bindings: [], bindingGeneration: null,
-                        bindingCursors: [], cursor: null, cut: 0, recovery: false,
-                        capture: "opening" as const, finalSequence: null, gaps: [],
+                        launch,
+                        owner,
+                        ownerGeneration,
+                        captureEpoch: null,
+                        bindings: [],
+                        bindingGeneration: null,
+                        bindingCursors: [],
+                        cursor: null,
+                        cut: 0,
+                        recovery: false,
+                        capture: "opening" as const,
+                        finalSequence: null,
+                        gaps: [],
                       },
-                      isConnected: Effect.sync(() =>
-                        NodeUtil.isDeepStrictEqual(port.owner, owner) &&
-                        port.ownerGeneration === ownerGeneration),
+                      isConnected: Effect.sync(
+                        () =>
+                          NodeUtil.isDeepStrictEqual(port.owner, owner) &&
+                          port.ownerGeneration === ownerGeneration,
+                      ),
                     };
                   });
                   const ingest = (
                     nativeWorkerAdmission: Effect.Success<typeof reconcileAdmission>,
-                  ) => providerEventIngestor.ingestNormalized({
-                    ...(nativeWorkerAdmission === undefined ? {} : { nativeWorkerAdmission }),
-                    analyticsContext: {
-                      modelSelection: input.modelSelection,
-                      runtimeMode: input.runtimePolicy.runtimeMode,
-                      interactionMode: input.runtimePolicy.interactionMode,
-                    },
-                    providerSessionId: input.providerSessionId,
-                    providerInstanceId: input.run.providerInstanceId,
-                    threadId: input.run.threadId,
-                    runId: input.run.id,
-                    nodeId: input.rootNode.id,
-                    event: deliveredEvent,
-                    ...(isNativeLaunch
-                      ? {
-                          writeIfRunCurrent: {
-                            runId: input.run.id, activeAttemptId: input.attempt.id,
-                            expectedStatus: "running" as const,
-                          },
-                        }
-                      : isRootProviderThreadUpdate
-                      ? rootTerminalAlreadySeen
+                  ) =>
+                    providerEventIngestor.ingestNormalized({
+                      ...(nativeWorkerAdmission === undefined ? {} : { nativeWorkerAdmission }),
+                      analyticsContext: {
+                        modelSelection: input.modelSelection,
+                        runtimeMode: input.runtimePolicy.runtimeMode,
+                        interactionMode: input.runtimePolicy.interactionMode,
+                      },
+                      providerSessionId: input.providerSessionId,
+                      providerInstanceId: input.run.providerInstanceId,
+                      threadId: input.run.threadId,
+                      runId: input.run.id,
+                      nodeId: input.rootNode.id,
+                      event: deliveredEvent,
+                      ...(isNativeLaunch
                         ? {
-                            writeIfProviderThreadOwner: {
-                              providerThreadId: input.providerThread.id,
-                              runId: input.run.id,
-                              activeAttemptId: input.attempt.id,
-                              expectedLastRunOrdinal: input.run.ordinal,
-                            },
-                          }
-                        : {
                             writeIfRunCurrent: {
                               runId: input.run.id,
                               activeAttemptId: input.attempt.id,
                               expectedStatus: "running" as const,
                             },
                           }
-                      : {}),
-                  });
+                        : isRootProviderThreadUpdate
+                          ? rootTerminalAlreadySeen
+                            ? {
+                                writeIfProviderThreadOwner: {
+                                  providerThreadId: input.providerThread.id,
+                                  runId: input.run.id,
+                                  activeAttemptId: input.attempt.id,
+                                  expectedLastRunOrdinal: input.run.ordinal,
+                                },
+                              }
+                            : {
+                                writeIfRunCurrent: {
+                                  runId: input.run.id,
+                                  activeAttemptId: input.attempt.id,
+                                  expectedStatus: "running" as const,
+                                },
+                              }
+                          : {}),
+                    });
                   const admission = yield* reconcileAdmission;
                   let storedEvents = yield* ingest(admission);
                   if (storedEvents.length === 0 && admission !== undefined) {
                     // A connection fence can reject the entire launch batch after
                     // reconciliation. Finish this event before advancing the stream.
                     const currentAdmission = yield* reconcileAdmission;
-                    if (currentAdmission !== undefined) storedEvents = yield* ingest(currentAdmission);
+                    if (currentAdmission !== undefined)
+                      storedEvents = yield* ingest(currentAdmission);
                     // A second owner race must not spin or discard the ordinary tool.
                     // Keep the original run/attempt fence, but do not fabricate a child.
                     if (storedEvents.length === 0) storedEvents = yield* ingest(undefined);

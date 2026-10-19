@@ -8,15 +8,16 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import {
   PiNativeWorkerRecord,
-  PiNativeWorkerLaunch,
+  PiNativeWorkerAdmission,
   type PiNativeWorkerSummary,
   type PiNativeWorkerCheckpoint,
   type PiNativeWorkerBinding,
 } from "@t3tools/contracts";
-import type {
-  ProviderNativeWorkersPort,
-  ProviderBackgroundPending,
-  ProviderNativeWorkerBatch,
+import {
+  ProviderArchitectureCatalogLoss,
+  type ProviderNativeWorkersPort,
+  type ProviderBackgroundPending,
+  type ProviderNativeWorkerBatch,
 } from "@t3tools/provider-core/server/ProviderAdapter";
 import {
   connect,
@@ -32,10 +33,12 @@ import type {
   WorkerReadReference,
 } from "./pitako/bridge/protocol.js";
 import { sameOwner, errors as nativeErrors } from "./pitako/bridge/protocol.js";
+import { readArchitectures } from "./architectureBridge.ts";
 
 const RECORD_LIMIT = 4 * 1024 * 1024;
+const isArchitectureCatalogLoss = Schema.is(ProviderArchitectureCatalogLoss);
 const decodeRecord = Schema.decodeUnknownSync(PiNativeWorkerRecord);
-const sameLaunch = Schema.toEquivalence(PiNativeWorkerLaunch);
+const sameLaunch = Schema.toEquivalence(PiNativeWorkerAdmission);
 const decodeJsonRecord = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeFragmentUpsert = Schema.decodeUnknownSync(
   Schema.Struct({
@@ -221,8 +224,19 @@ function normalizeRecord(
   });
 }
 
-function matches(launch: PiNativeWorkerLaunch, detail: PublicWorkerDetail) {
+function matches(launch: PiNativeWorkerAdmission, detail: PublicWorkerDetail) {
   const worker = detail.worker;
+  if (launch.source === "architecture_roster") {
+    return (
+      worker.source === "team_assign" &&
+      worker.instanceId === launch.instanceId &&
+      worker.coordinatorSessionId === launch.coordinatorSessionId &&
+      worker.assignmentId === launch.assignmentId &&
+      worker.roleId === launch.roleId &&
+      worker.teamId === launch.roomId &&
+      worker.memberId === launch.memberId
+    );
+  }
   return (
     worker.linkage === "tool" &&
     worker.source === launch.source &&
@@ -245,7 +259,7 @@ function sameReference(a: WorkerReadReference, b: WorkerReadReference) {
   );
 }
 const unavailableSummary = (
-  launch: PiNativeWorkerLaunch,
+  launch: PiNativeWorkerAdmission,
   gap: PiNativeWorkerSummary["gaps"][number],
 ): PiNativeWorkerSummary => ({
   launch,
@@ -429,26 +443,31 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
       })(),
     );
   }
-  private async detail(client: BridgeClient, launch: PiNativeWorkerLaunch) {
+  private async detail(client: BridgeClient, launch: PiNativeWorkerAdmission) {
     const detail = await client.publicDetail(launch.instanceId);
     if ("state" in detail) return undefined;
     if (
       !matches(launch, detail) ||
       !sameOwner(client.owner, detail.ref) ||
       detail.ref.instanceId !== launch.instanceId ||
-      detail.ref.source !== launch.source ||
+      detail.ref.source !==
+        (launch.source === "architecture_roster" ? "team_assign" : launch.source) ||
       (launch.source === "team_assign" && detail.ref.assignmentId !== launch.assignmentId)
     )
       throw new BridgeError("provenance_mismatch", "Native public launch provenance differs");
     return detail;
   }
-  private summary(launch: PiNativeWorkerLaunch, detail: PublicWorkerDetail): PiNativeWorkerSummary {
+  private summary(
+    launch: PiNativeWorkerAdmission,
+    detail: PublicWorkerDetail,
+  ): PiNativeWorkerSummary {
     return {
       launch,
       roleId: detail.worker.roleId,
       acceptedAt: detail.worker.acceptedAt,
       brief: detail.workbrief.text,
       briefComplete: detail.nextBrief === null,
+      briefSource: detail.workbrief.source,
       selected: detail.selected,
       activated: detail.activated,
       execution: detail.lifecycle.execution,
@@ -458,7 +477,13 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
       gaps: detail.captureGaps ?? [],
     };
   }
-  readonly reconcile = (launch: PiNativeWorkerLaunch) =>
+  readonly readArchitectures = () =>
+    Effect.tryPromise({
+      try: () => this.withClient((client) => readArchitectures(client, this.generation)),
+      catch: (cause) => (isArchitectureCatalogLoss(cause) ? cause : errorOf(cause)),
+    });
+
+  readonly reconcile = (launch: PiNativeWorkerAdmission) =>
     Effect.tryPromise({
       try: async () => {
         try {
@@ -482,7 +507,7 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
       catch: errorOf,
     });
 
-  readonly read = (launch: PiNativeWorkerLaunch, previous?: PiNativeWorkerCheckpoint) =>
+  readonly read = (launch: PiNativeWorkerAdmission, previous?: PiNativeWorkerCheckpoint) =>
     Effect.tryPromise({
       try: () =>
         this.withClient(async (client): Promise<ProviderNativeWorkerBatch> => {
@@ -497,7 +522,8 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
               if (
                 !sameOwner(ref, client.owner) ||
                 ref.instanceId !== launch.instanceId ||
-                ref.source !== launch.source ||
+                ref.source !==
+                  (launch.source === "architecture_roster" ? "team_assign" : launch.source) ||
                 ref.assignmentId !== detail.ref.assignmentId ||
                 ref.native?.generation !== binding.generation ||
                 ref.native.historyId !== binding.historyId ||
@@ -802,7 +828,9 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
         return {
           state: "unavailable",
           reason:
-            generation !== this.generation || this.closed || this.state === "stale_owner" ||
+            generation !== this.generation ||
+            this.closed ||
+            this.state === "stale_owner" ||
             (cause instanceof BridgeError && cause.code === "stale_owner")
               ? "stale_owner"
               : "source_unavailable",
@@ -811,7 +839,7 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
     });
 
   /** No roster admission: the server supplies its committed launch set. */
-  readonly hasPendingWork = (admitted: ReadonlyArray<PiNativeWorkerLaunch>) =>
+  readonly hasPendingWork = (admitted: ReadonlyArray<PiNativeWorkerAdmission>) =>
     Effect.tryPromise({
       try: () =>
         this.withClient(async (client) => {

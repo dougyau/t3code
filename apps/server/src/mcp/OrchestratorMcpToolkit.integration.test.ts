@@ -1278,6 +1278,20 @@ describe("orchestrator MCP toolkit", () => {
             expect(declaredFailure(missingThreadRead)).toMatchObject({
               _tag: "OrchestratorMcpFailure",
             });
+            const architectureWithoutNativeCapability = yield* invoke("t3_pi_architecture_read", {
+              query: { threadId: parentThreadId, kind: "tables" },
+            });
+            expect(architectureWithoutNativeCapability.structuredContent).toEqual({
+              kind: "tables",
+              items: [],
+              next: null,
+            });
+            const missingArchitecture = yield* invoke("t3_pi_architecture_read", {
+              query: { threadId: missingThreadId, kind: "tables" },
+            });
+            expect(declaredFailure(missingArchitecture)).toMatchObject({
+              _tag: "OrchestratorMcpFailure",
+            });
             const queueSecondPage = yield* invoke("t3_queue_list", { cursor: 1, limit: 1 });
             expect(queueSecondPage.structuredContent).toEqual({
               items: [{ queuedRunId: queuedUserRun.id, text: "🙂".repeat(1000), truncated: true }],

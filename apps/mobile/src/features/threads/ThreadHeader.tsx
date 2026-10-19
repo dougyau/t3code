@@ -112,7 +112,7 @@ export function ThreadHeader(
             />
           ) : null
         }
-        onBack={layout.usesSplitView ? undefined : returnToList}
+        onBack={props.onReturnToThread ?? (layout.usesSplitView ? undefined : returnToList)}
         actions={androidHeaderActions}
         hideBottomBorder
       />

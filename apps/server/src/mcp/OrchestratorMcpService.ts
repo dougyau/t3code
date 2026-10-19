@@ -48,6 +48,8 @@ import {
   type OrchestratorMcpThreadTimelineItem,
   type OrchestratorMcpThreadWaitInput,
   type OrchestratorMcpThreadWaitResult,
+  type PiArchitectureReadInput,
+  type PiArchitectureReadResult,
   type ProviderInteractionMode,
   type ProviderOptionDescriptor,
   type ProviderOptionSelection,
@@ -123,6 +125,10 @@ type TerminalTaskStatus = Extract<
 >;
 
 export interface OrchestratorMcpServiceShape {
+  readonly readPiArchitecture: (
+    scope: McpInvocationScope,
+    input: PiArchitectureReadInput,
+  ) => Effect.Effect<PiArchitectureReadResult, OrchestratorMcpFailure>;
   readonly capabilities: (
     scope: McpInvocationScope,
   ) => Effect.Effect<OrchestratorMcpCapabilitiesResult, OrchestratorMcpFailure>;
@@ -1611,6 +1617,13 @@ const make = Effect.gen(function* () {
     });
 
   return OrchestratorMcpService.of({
+    readPiArchitecture: (scope, input) =>
+      Effect.gen(function* () {
+        yield* loadReadableThread(scope, input.threadId);
+        return yield* threadManagement
+          .getPiArchitecture(input)
+          .pipe(Effect.mapError(threadManagementFailure));
+      }),
     scheduleTask: (scope, input) =>
       Effect.gen(function* () {
         const { parent, limits } = yield* loadCaller(scope);

@@ -61,8 +61,11 @@ import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { readArchitectures } from "../../../../packages/provider-pi/src/server/architectureBridge.ts";
+import * as ArchitectureQuery from "./ArchitectureQuery.ts";
 
 const layerTestDatabase = SqlitePersistence.layerMemory;
+const isArchitectureCatalogLoss = Schema.is(ProviderAdapter.ProviderArchitectureCatalogLoss);
 const layerTestStores = Layer.merge(EventStore.layer, ProjectionStore.layer).pipe(
   Layer.provide(layerTestDatabase),
 );
@@ -131,17 +134,26 @@ const layerFlakyReleaseEventSink = (flaky: FlakyReleaseWrites) =>
             yield* Queue.offer(flaky.failures, undefined);
             return yield* Effect.die(new Error("simulated commit failure"));
           }),
-        writeNativeWorker: (input) => Effect.gen(function* () {
-          if (input.retire === true && flaky.failNativeRetirement !== undefined &&
-            (yield* Ref.get(flaky.failNativeRetirement))) {
-            yield* Queue.offer(flaky.failures, undefined);
-            if (flaky.rejectNativeRetirement) return {
-              committed: false, sourceProgress: false, storedEvents: [],
-            };
-            return yield* Effect.fail(new EventSink.EventSinkWriteError({ eventCount: 0, cause: "retirement-commit" }));
-          }
-          return yield* delegate.writeNativeWorker(input);
-        }),
+        writeNativeWorker: (input) =>
+          Effect.gen(function* () {
+            if (
+              input.retire === true &&
+              flaky.failNativeRetirement !== undefined &&
+              (yield* Ref.get(flaky.failNativeRetirement))
+            ) {
+              yield* Queue.offer(flaky.failures, undefined);
+              if (flaky.rejectNativeRetirement)
+                return {
+                  committed: false,
+                  sourceProgress: false,
+                  storedEvents: [],
+                };
+              return yield* Effect.fail(
+                new EventSink.EventSinkWriteError({ eventCount: 0, cause: "retirement-commit" }),
+              );
+            }
+            return yield* delegate.writeNativeWorker(input);
+          }),
       });
     }),
   ).pipe(Layer.provide(layerTestEventSink));
@@ -348,7 +360,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly spawnBeforeOpen?: boolean;
     /** Completed when a hanging scope close reaches its wedged finalizer. */
     readonly scopeCloseReached?: Deferred.Deferred<void>;
-    readonly nativeWorkers?: (providerSessionId: ProviderSessionId) => ProviderAdapter.ProviderNativeWorkersPort;
+    readonly nativeWorkers?: (
+      providerSessionId: ProviderSessionId,
+    ) => ProviderAdapter.ProviderNativeWorkersPort;
     readonly onScopeClose?: Effect.Effect<void>;
     readonly providerEvents?: Queue.Queue<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>;
   } = {},
@@ -392,7 +406,8 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           yield* Ref.update(options.mcpConfigs, (configs) => [...configs, mcpConfig]);
         }
         const now = yield* DateTime.now;
-        const events = options.providerEvents ??
+        const events =
+          options.providerEvents ??
           (yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>());
         const session = makeProviderSession({
           providerSessionId: input.providerSessionId,
@@ -412,7 +427,8 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           yield* countClose;
           if (options.hangSessionScopeClose === true) yield* hangClose;
         }
-        if (options.onScopeClose !== undefined) yield* Effect.addFinalizer(() => options.onScopeClose!);
+        if (options.onScopeClose !== undefined)
+          yield* Effect.addFinalizer(() => options.onScopeClose!);
 
         return {
           instanceId: ProviderInstanceId.make("codex"),
@@ -428,7 +444,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
                 }),
               )
             : Stream.fromQueue(events),
-          ...(options.nativeWorkers === undefined ? {} : { nativeWorkers: options.nativeWorkers(input.providerSessionId) }),
+          ...(options.nativeWorkers === undefined
+            ? {}
+            : { nativeWorkers: options.nativeWorkers(input.providerSessionId) }),
           ...(options.hasPendingBackgroundWork === undefined
             ? {}
             : { hasPendingBackgroundWork: options.hasPendingBackgroundWork }),
@@ -502,28 +520,38 @@ function layerTest(input: {
   readonly beforeUnload?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
-  readonly nativeWorkers?: (providerSessionId: ProviderSessionId) => ProviderAdapter.ProviderNativeWorkersPort;
+  readonly nativeWorkers?: (
+    providerSessionId: ProviderSessionId,
+  ) => ProviderAdapter.ProviderNativeWorkersPort;
   readonly onScopeClose?: Effect.Effect<void>;
   readonly providerEvents?: Queue.Queue<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
 }) {
-  const testStores = input.residencyFailure === undefined && input.unreadableCheckpoint === undefined ? layerTestStores : Layer.effect(
-    ProjectionStore.ProjectionStoreV2,
-    Effect.gen(function* () {
-      const delegate = yield* ProjectionStore.ProjectionStoreV2;
-      return ProjectionStore.ProjectionStoreV2.of({
-        ...delegate,
-        getThreadRecords: (...args) => Effect.gen(function* () {
-          if ((input.residencyFailure !== undefined && (yield* Ref.get(input.residencyFailure)) === "checkpoint") ||
-            (input.unreadableCheckpoint !== undefined && (yield* Ref.get(input.unreadableCheckpoint)) === args[0])) {
-            return yield* Effect.die("checkpoint unreadable");
-          }
-          return yield* delegate.getThreadRecords(...args);
-        }),
-      });
-    }),
-  ).pipe(Layer.provideMerge(layerTestStores));
+  const testStores =
+    input.residencyFailure === undefined && input.unreadableCheckpoint === undefined
+      ? layerTestStores
+      : Layer.effect(
+          ProjectionStore.ProjectionStoreV2,
+          Effect.gen(function* () {
+            const delegate = yield* ProjectionStore.ProjectionStoreV2;
+            return ProjectionStore.ProjectionStoreV2.of({
+              ...delegate,
+              getThreadRecords: (...args) =>
+                Effect.gen(function* () {
+                  if (
+                    (input.residencyFailure !== undefined &&
+                      (yield* Ref.get(input.residencyFailure)) === "checkpoint") ||
+                    (input.unreadableCheckpoint !== undefined &&
+                      (yield* Ref.get(input.unreadableCheckpoint)) === args[0])
+                  ) {
+                    return yield* Effect.die("checkpoint unreadable");
+                  }
+                  return yield* delegate.getThreadRecords(...args);
+                }),
+            });
+          }),
+        ).pipe(Layer.provideMerge(layerTestStores));
   const baseEventSink =
     input.flakyReleaseWrites !== undefined
       ? layerFlakyReleaseEventSink(input.flakyReleaseWrites)
@@ -532,19 +560,27 @@ function layerTest(input: {
         : input.failReleaseEventWrites
           ? layerFailingReleaseEventSink
           : layerTestEventSink;
-  const layerConfiguredEventSink = input.residencyFailure === undefined && input.nativeMembership === undefined ? baseEventSink : Layer.effect(
-    EventSink.EventSinkV2,
-    Effect.gen(function* () {
-      const delegate = yield* EventSink.EventSinkV2;
-      return EventSink.EventSinkV2.of({
-        ...delegate,
-        nativeWorkers: (...args) => Effect.gen(function* () {
-          if (input.residencyFailure !== undefined && (yield* Ref.get(input.residencyFailure)) === "membership") return yield* Effect.die("membership unreadable");
-          return yield* (input.nativeMembership ?? delegate.nativeWorkers)(...args);
-        }),
-      });
-    }),
-  ).pipe(Layer.provide(baseEventSink));
+  const layerConfiguredEventSink =
+    input.residencyFailure === undefined && input.nativeMembership === undefined
+      ? baseEventSink
+      : Layer.effect(
+          EventSink.EventSinkV2,
+          Effect.gen(function* () {
+            const delegate = yield* EventSink.EventSinkV2;
+            return EventSink.EventSinkV2.of({
+              ...delegate,
+              nativeWorkers: (...args) =>
+                Effect.gen(function* () {
+                  if (
+                    input.residencyFailure !== undefined &&
+                    (yield* Ref.get(input.residencyFailure)) === "membership"
+                  )
+                    return yield* Effect.die("membership unreadable");
+                  return yield* (input.nativeMembership ?? delegate.nativeWorkers)(...args);
+                }),
+            });
+          }),
+        ).pipe(Layer.provide(baseEventSink));
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
@@ -617,13 +653,24 @@ const fakeHttpServer = HttpServer.HttpServer.of({
   serve: (() => Effect.void) as HttpServer.HttpServer["Service"]["serve"],
 });
 
-class NativeSourceUnavailable extends Schema.TaggedError<NativeSourceUnavailable>()("NativeSourceUnavailable", {}) {}
+class NativeSourceUnavailable extends Schema.TaggedError<NativeSourceUnavailable>()(
+  "NativeSourceUnavailable",
+  {},
+) {}
 
-const residencyOwner = { processId: "residency-process", coordinatorSessionId: "residency-owner", epoch: "epoch-1" };
+const residencyOwner = {
+  processId: "residency-process",
+  coordinatorSessionId: "residency-owner",
+  epoch: "epoch-1",
+};
 
-function residencyPort(readBackgroundPending: ProviderAdapter.ProviderNativeWorkersPort["readBackgroundPending"]) {
+function residencyPort(
+  readBackgroundPending: ProviderAdapter.ProviderNativeWorkersPort["readBackgroundPending"],
+) {
   return {
-    owner: residencyOwner, ownerGeneration: 1, hints: Stream.never,
+    owner: residencyOwner,
+    ownerGeneration: 1,
+    hints: Stream.never,
     readBackgroundPending,
     reconcile: () => Effect.die("No native membership admitted"),
     read: () => Effect.die("No native membership admitted"),
@@ -637,9 +684,19 @@ const openResidencySession = Effect.fnUntraced(function* () {
   const ids = yield* IdAllocator.IdAllocatorV2;
   const now = yield* DateTime.now;
   const threadId = ThreadId.make("residency-thread");
-  const providerSessionId = yield* ids.allocate.providerSession({ threadId, providerInstanceId: modelSelection.instanceId });
-  yield* sink.write({ events: [yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now })] });
-  const runtime = yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+  const providerSessionId = yield* ids.allocate.providerSession({
+    threadId,
+    providerInstanceId: modelSelection.instanceId,
+  });
+  yield* sink.write({
+    events: [yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now })],
+  });
+  const runtime = yield* manager.open({
+    threadId,
+    providerSessionId,
+    modelSelection,
+    runtimePolicy,
+  });
   const providerThread = makeProviderThread({ idAllocator: ids, threadId, providerSessionId, now });
   return { manager, sink, ids, now, threadId, providerSessionId, runtime, providerThread };
 });
@@ -652,10 +709,22 @@ const startResidencyTurn = Effect.fnUntraced(function* (
   const runId = ids.derive.run({ threadId, ordinal: 1 });
   yield* runtime.startTurn({
     appThread: (yield* projections.getThreadProjection(threadId)).thread,
-    threadId, providerThread, runId, runOrdinal: 1, providerTurnOrdinal: 1,
-    attemptId: ids.derive.runAttempt({ runId, attemptOrdinal: 1 }), rootNodeId: ids.derive.rootNode({ runId }),
-    message: { createdBy: "user", creationSource: "web", messageId: MessageId.make("residency-message"), text: "continue", attachments: [] },
-    modelSelection, runtimePolicy,
+    threadId,
+    providerThread,
+    runId,
+    runOrdinal: 1,
+    providerTurnOrdinal: 1,
+    attemptId: ids.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+    rootNodeId: ids.derive.rootNode({ runId }),
+    message: {
+      createdBy: "user",
+      creationSource: "web",
+      messageId: MessageId.make("residency-message"),
+      text: "continue",
+      attachments: [],
+    },
+    modelSelection,
+    runtimePolicy,
   });
 });
 
@@ -665,26 +734,48 @@ const terminalResidencyTurn = Effect.fnUntraced(function* (
 ) {
   const state = yield* fixture.runtime.subscribeEvents!;
   const terminal = yield* state.events.pipe(
-    Stream.filter((event) => event.type === "turn.terminal"), Stream.take(1), Stream.runDrain, Effect.forkScoped,
+    Stream.filter((event) => event.type === "turn.terminal"),
+    Stream.take(1),
+    Stream.runDrain,
+    Effect.forkScoped,
   );
   // The fixture provider sends through the same broadcast the manager consumes.
   const providerEvents = yield* Ref.get(runtimeState);
   yield* Queue.offer(providerEvents.eventQueues.get(String(fixture.providerSessionId))!, {
-    type: "turn.terminal", driver: CODEX_DRIVER, providerThreadId: fixture.providerThread.id,
-    providerTurnId: ProviderTurnId.make(`terminal-${fixture.threadId}`), runOrdinal: 1,
-    status: "completed", failure: null, threadDisposition: "reusable",
+    type: "turn.terminal",
+    driver: CODEX_DRIVER,
+    providerThreadId: fixture.providerThread.id,
+    providerTurnId: ProviderTurnId.make(`terminal-${fixture.threadId}`),
+    runOrdinal: 1,
+    status: "completed",
+    failure: null,
+    threadDisposition: "reusable",
   });
   yield* Fiber.join(terminal);
 });
 
 const attachResidencySibling = Effect.fnUntraced(function* (
-  fixture: Effect.Success<ReturnType<typeof openResidencySession>>, name: string,
+  fixture: Effect.Success<ReturnType<typeof openResidencySession>>,
+  name: string,
 ) {
   const { sink, ids, now, manager, providerSessionId } = fixture;
   const threadId = ThreadId.make(name);
-  yield* sink.write({ events: [yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now })] });
-  const runtime = yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
-  const providerThread = makeProviderThread({ idAllocator: ids, threadId, providerSessionId, now, nativeThreadId: name });
+  yield* sink.write({
+    events: [yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now })],
+  });
+  const runtime = yield* manager.open({
+    threadId,
+    providerSessionId,
+    modelSelection,
+    runtimePolicy,
+  });
+  const providerThread = makeProviderThread({
+    idAllocator: ids,
+    threadId,
+    providerSessionId,
+    now,
+    nativeThreadId: name,
+  });
   return { ...fixture, threadId, runtime, providerThread };
 });
 
@@ -697,36 +788,107 @@ const admitResidencyCapture = Effect.fnUntraced(function* (
   const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
   const runId = ids.derive.run({ threadId, ordinal: 1 });
   const runAttemptId = ids.derive.runAttempt({ runId, attemptOrdinal: 1 });
-  yield* sink.write({ events: [{
-    id: yield* ids.allocate.event({ threadId }), type: "run.created", threadId, occurredAt: now,
-    payload: { id: runId, threadId, ordinal: 1, providerInstanceId: modelSelection.instanceId, modelSelection,
-      providerThreadId: providerThread.id, userMessageId: MessageId.make("residency-user-message"),
-      rootNodeId: ids.derive.rootNode({ runId }), activeAttemptId: runAttemptId, status: "running",
-      requestedAt: now, startedAt: now, completedAt: null, checkpointId: null, contextHandoffId: null },
-  }] });
+  yield* sink.write({
+    events: [
+      {
+        id: yield* ids.allocate.event({ threadId }),
+        type: "run.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: runId,
+          threadId,
+          ordinal: 1,
+          providerInstanceId: modelSelection.instanceId,
+          modelSelection,
+          providerThreadId: providerThread.id,
+          userMessageId: MessageId.make("residency-user-message"),
+          rootNodeId: ids.derive.rootNode({ runId }),
+          activeAttemptId: runAttemptId,
+          status: "running",
+          requestedAt: now,
+          startedAt: now,
+          completedAt: null,
+          checkpointId: null,
+          contextHandoffId: null,
+        },
+      },
+    ],
+  });
   const launch: PiNativeWorkerLaunch = {
-    source: "agent_spawn", instanceId: name, providerInstanceId: modelSelection.instanceId, providerSessionId,
-    parentThreadId: threadId, parentProviderThreadId: providerThread.id,
-    parentProviderTurnId: ProviderTurnId.make("residency-parent-turn"), runId, runAttemptId,
-    toolNodeId: NodeId.make(`residency-tool-${name}`), coordinatorSessionId: residencyOwner.coordinatorSessionId,
+    source: "agent_spawn",
+    instanceId: name,
+    providerInstanceId: modelSelection.instanceId,
+    providerSessionId,
+    parentThreadId: threadId,
+    parentProviderThreadId: providerThread.id,
+    parentProviderTurnId: ProviderTurnId.make("residency-parent-turn"),
+    runId,
+    runAttemptId,
+    toolNodeId: NodeId.make(`residency-tool-${name}`),
+    coordinatorSessionId: residencyOwner.coordinatorSessionId,
     toolCallId: `spawn-${name}`,
   };
   const checkpoint: PiNativeWorkerCheckpoint = {
-    launch, owner: residencyOwner, ownerGeneration: 1, captureEpoch: null, bindings: [], bindingGeneration: null,
-    bindingCursors: [], cursor: null, cut: 0, recovery: false, capture: "opening", finalSequence: null, gaps: [], ...changes,
+    launch,
+    owner: residencyOwner,
+    ownerGeneration: 1,
+    captureEpoch: null,
+    bindings: [],
+    bindingGeneration: null,
+    bindingCursors: [],
+    cursor: null,
+    cut: 0,
+    recovery: false,
+    capture: "opening",
+    finalSequence: null,
+    gaps: [],
+    ...changes,
   };
   yield* ingestor.ingestNormalized({
-    providerSessionId, providerInstanceId: modelSelection.instanceId, threadId,
-    event: { type: "turn_item.updated", driver: CODEX_DRIVER, turnItem: {
-      id: TurnItemId.make(`residency-launch-${name}`), threadId, runId, nodeId: launch.toolNodeId,
-      providerThreadId: providerThread.id, providerTurnId: launch.parentProviderTurnId, nativeItemRef: null,
-      parentItemId: null, ordinal: 1, status: "completed", title: null, startedAt: now, completedAt: now, updatedAt: now,
-      type: "dynamic_tool", toolName: "agent_spawn", input: {}, output: {}, nativeWorkerLaunch: launch,
-    } }, nativeWorkerAdmission: { checkpoint, summary: {
-      launch, execution: "completed", result: "available", capture: checkpoint.capture, availability: "ready", gaps: checkpoint.gaps,
-    } },
+    providerSessionId,
+    providerInstanceId: modelSelection.instanceId,
+    threadId,
+    event: {
+      type: "turn_item.updated",
+      driver: CODEX_DRIVER,
+      turnItem: {
+        id: TurnItemId.make(`residency-launch-${name}`),
+        threadId,
+        runId,
+        nodeId: launch.toolNodeId,
+        providerThreadId: providerThread.id,
+        providerTurnId: launch.parentProviderTurnId,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "dynamic_tool",
+        toolName: "agent_spawn",
+        input: {},
+        output: {},
+        nativeWorkerLaunch: launch,
+      },
+    },
+    nativeWorkerAdmission: {
+      checkpoint,
+      summary: {
+        launch,
+        execution: "completed",
+        result: "available",
+        capture: checkpoint.capture,
+        availability: "ready",
+        gaps: checkpoint.gaps,
+      },
+    },
   });
-  return (yield* sink.nativeWorkers(providerSessionId)).find((member) => member.nativeWorker?.launch.instanceId === name)!;
+  return (yield* sink.nativeWorkers(providerSessionId)).find(
+    (member) => member.nativeWorker?.launch.instanceId === name,
+  )!;
 });
 
 const writeResidencyCheckpoint = Effect.fnUntraced(function* (
@@ -743,140 +905,636 @@ const writeResidencyCheckpoint = Effect.fnUntraced(function* (
   // boundary, including for the deliberately missing-checkpoint recovery fixture.
   const eventId = yield* fixture.ids.allocate.event({ threadId: member.childThreadId! });
   const receipt = yield* fixture.sink.writeNativeWorker({
-    launch: previous.launch, ownerGeneration: previous.ownerGeneration, expectedCheckpoint: previous, checkpoint,
-    build: () => Effect.succeed({ sourceProgress: false, events: [{
-      id: eventId, type: "provider-thread.updated",
-      threadId: member.childThreadId!, occurredAt: fixture.now,
-      payload: { ...row, nativeMetadata: capture === "missing" ? {} : { ...row.nativeMetadata, nativeWorkerCheckpoint: checkpoint } },
-    }] }),
+    launch: previous.launch,
+    ownerGeneration: previous.ownerGeneration,
+    expectedCheckpoint: previous,
+    checkpoint,
+    build: () =>
+      Effect.succeed({
+        sourceProgress: false,
+        events: [
+          {
+            id: eventId,
+            type: "provider-thread.updated",
+            threadId: member.childThreadId!,
+            occurredAt: fixture.now,
+            payload: {
+              ...row,
+              nativeMetadata:
+                capture === "missing"
+                  ? {}
+                  : { ...row.nativeMetadata, nativeWorkerCheckpoint: checkpoint },
+            },
+          },
+        ],
+      }),
   });
   assert.isTrue(receipt.committed);
 });
 
-it.effect.each(["opening", "open", "binding", "more", "fragment", "omitted", "terminal gap", "old owner"] as const)(
-  "native committed capture %s observes the current owner and actual capture obligations", (capture) => Effect.gen(function* () {
+it.effect(
+  "observes Architecture while foreground is idle and fences the retired owner on close",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const hints = yield* Queue.unbounded<void>();
+      const owner = { ...residencyOwner, coordinatorSessionId: "native-thread" };
+      let cut = 1;
+      const batch = (): ProviderAdapter.ProviderArchitectureBatch => ({
+        roomId: "idle-room",
+        checkpoint: { owner, ownerGeneration: 1, snapshotId: `cut-${cut}`, cut },
+        capture: "open",
+        gaps: [],
+        records: [
+          {
+            kind: "room",
+            id: "idle-room",
+            mode: "table",
+            origin: {
+              coordinatorSessionId: owner.coordinatorSessionId,
+              tool: "architecture_start",
+              toolCallId: "start",
+              memberId: "director",
+              instanceId: "director",
+              assignmentId: "director",
+            },
+            goalSource: { kind: "worker-workbrief", instanceId: "director" },
+            lifecycle: {
+              stage: "waiting",
+              round: cut,
+              protocolState: "waiting",
+              outcome: "pending",
+              closure: { state: "pending", members: "pending", director: "pending" },
+            },
+            pendingDoubtIds: [],
+          },
+        ],
+      });
+      yield* Effect.gen(function* () {
+        const fixture = yield* openResidencySession();
+        yield* fixture.sink.write({
+          events: [
+            {
+              id: yield* fixture.ids.allocate.event({ threadId: fixture.threadId }),
+              threadId: fixture.threadId,
+              type: "provider-thread.updated",
+              occurredAt: fixture.now,
+              payload: { ...fixture.providerThread, ownerNodeId: NodeId.make("root") },
+            },
+          ],
+        });
+        yield* startResidencyTurn(fixture);
+        yield* terminalResidencyTurn(fixture, state);
+        const imported = yield* fixture.sink.stream({ eventType: "thread.metadata-updated" }).pipe(
+          Stream.filter(
+            (stored) =>
+              stored.event.type === "thread.metadata-updated" &&
+              stored.event.payload.nativeTables?.some(
+                (table) => table.roomId === "idle-room" && table.lifecycle.round === 2,
+              ) === true,
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        cut = 2;
+        yield* Queue.offer(hints, undefined);
+        yield* Fiber.join(imported);
+        const saved = (yield* fixture.sink.architectures(fixture.threadId))[0]!;
+        assert.equal(saved.checkpoint.cut, 2);
+        yield* fixture.manager.close(fixture.providerSessionId);
+        const retired = (yield* fixture.sink.architectures(fixture.threadId))[0]!;
+        assert.isTrue(retired.retired);
+        assert.equal(retired.summary.observation, "stale");
+        assert.equal(retired.summary.capture, "incomplete");
+        assert.equal(retired.summary.lifecycle.closure.state, "pending");
+        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+        cut = 3;
+        yield* ingestor.ingestArchitecture({
+          threadId: fixture.threadId,
+          providerInstanceId: modelSelection.instanceId,
+          providerSessionId: fixture.providerSessionId,
+          parentProviderThreadId: fixture.providerThread.id,
+          parentNodeId: NodeId.make("root"),
+          batch: batch(),
+          isConnected: Effect.succeed(true),
+        });
+        assert.equal((yield* fixture.sink.architectures(fixture.threadId))[0]?.checkpoint.cut, 2);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            nativeWorkers: () => ({
+              ...residencyPort(() => Effect.succeed({ state: "pending" })),
+              owner,
+              hints: Stream.fromQueue(hints),
+              readArchitectures: () => Effect.sync(() => [batch()]),
+            }),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["first-page", "later-page"] as const)(
+  "retains confirmed Architecture on %s catalog loss while admitted workers progress",
+  (failurePage) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const hints = yield* Queue.unbounded<void>();
+      const owner = { ...residencyOwner, coordinatorSessionId: "native-thread" };
+      let failing = false;
+      let throwCatalog = false;
+      let workerCut = 0;
+      const source: Parameters<typeof readArchitectures>[0] = {
+        owner,
+        capabilities: ["architecture.list", "architecture.read", "architecture.public-v1"],
+        listArchitectures: async (cursor) => {
+          if (throwCatalog) throw Error("controlled catalog transport failure");
+          if (failing && (failurePage === "first-page" || cursor))
+            return { state: "unavailable", reason: "snapshot_oversized" };
+          return {
+            state: "ready",
+            format: "architecture-public-v1",
+            owner,
+            snapshotId: "catalog",
+            cut: 5,
+            next: failing ? "next-catalog-page" : null,
+            items: failing
+              ? [
+                  {
+                    ref: { ...owner, kind: "architecture", roomId: "unconfirmed-room" },
+                    mode: "table",
+                    director: {
+                      instanceId: "unknown",
+                      memberId: "unknown",
+                      assignmentId: "unknown",
+                    },
+                    lifecycle: {
+                      stage: null,
+                      round: 0,
+                      protocolState: "running",
+                      outcome: "pending",
+                      closure: { state: "pending", members: "pending", director: "pending" },
+                    },
+                  },
+                ]
+              : [],
+          };
+        },
+        readArchitecture: async () => {
+          throw Error("Must finish the catalog before reading any discovered room");
+        },
+        publicDetail: async () => {
+          throw Error("No original may be discovered through an incomplete catalog");
+        },
+      };
+      const batch: ProviderAdapter.ProviderArchitectureBatch = {
+        roomId: "confirmed-room",
+        checkpoint: { owner, ownerGeneration: 1, snapshotId: "confirmed-cut", cut: 4 },
+        capture: "open",
+        gaps: [],
+        original: {
+          id: "original",
+          text: "  # Original 🧭\r\nLiteral unchanged goal",
+          source: "original WorkBrief",
+          complete: true,
+        },
+        records: [
+          {
+            kind: "room",
+            id: "confirmed-room",
+            mode: "table",
+            origin: {
+              coordinatorSessionId: owner.coordinatorSessionId,
+              tool: "architecture_start",
+              toolCallId: "confirmed-start",
+              memberId: "director",
+              instanceId: "director",
+              assignmentId: "director-assignment",
+            },
+            goalSource: { kind: "worker-workbrief", instanceId: "director" },
+            lifecycle: {
+              stage: "preparation",
+              round: 1,
+              protocolState: "running",
+              outcome: "pending",
+              closure: { state: "pending", members: "pending", director: "pending" },
+            },
+            pendingDoubtIds: [],
+          },
+          {
+            kind: "member",
+            id: "director",
+            assignmentId: "director-assignment",
+            instanceId: "director",
+            roleId: "architect",
+            function: "director",
+            ordinal: 0,
+            admittedAt: 1,
+            mandate: { source: "root-workbrief", instanceId: "director" },
+            execution: "running",
+            conversationRefs: [],
+          },
+        ],
+      };
+      yield* Effect.gen(function* () {
+        const fixture = yield* openResidencySession();
+        yield* fixture.sink.write({
+          events: [
+            {
+              id: yield* fixture.ids.allocate.event({ threadId: fixture.threadId }),
+              threadId: fixture.threadId,
+              type: "provider-thread.updated",
+              occurredAt: fixture.now,
+              payload: { ...fixture.providerThread, ownerNodeId: NodeId.make("root") },
+            },
+          ],
+        });
+        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+        const input = {
+          threadId: fixture.threadId,
+          providerInstanceId: modelSelection.instanceId,
+          providerSessionId: fixture.providerSessionId,
+          parentProviderThreadId: fixture.providerThread.id,
+          parentNodeId: NodeId.make("root"),
+          isConnected: Effect.succeed(true),
+        };
+        yield* ingestor.ingestArchitecture({ ...input, batch });
+        const room = batch.records.find((record) => record.kind === "room")!;
+        for (const fence of ["owner", "generation"] as const) {
+          yield* ingestor.ingestArchitecture({
+            ...input,
+            batch: {
+              ...batch,
+              roomId: fence,
+              records: [{ ...room, id: fence }],
+              checkpoint: {
+                ...batch.checkpoint,
+                ...(fence === "owner"
+                  ? { owner: { ...owner, epoch: "different-owner" } }
+                  : { ownerGeneration: 2 }),
+              },
+            },
+          });
+        }
+        const before = yield* fixture.sink.architectures(fixture.threadId);
+        const saved = before.find((archive) => archive.summary.roomId === batch.roomId)!;
+        const worker = (yield* fixture.sink.nativeWorkers(fixture.providerSessionId))[0]!;
+        assert.isDefined(worker.childThreadId);
+        const advance = Effect.fnUntraced(function* () {
+          workerCut++;
+          const committed = yield* fixture.sink
+            .stream({ eventType: "provider-thread.updated" })
+            .pipe(
+              Stream.filter(
+                (stored) =>
+                  stored.event.type === "provider-thread.updated" &&
+                  stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.cut === workerCut,
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped,
+            );
+          yield* Queue.offer(hints, undefined);
+          yield* Fiber.join(committed);
+        });
+        failing = true;
+        yield* advance();
+        const archives = yield* fixture.sink.architectures(fixture.threadId);
+        assert.equal(archives.length, 3);
+        const partial = archives.find((archive) => archive.summary.roomId === batch.roomId)!;
+        for (const archive of archives.filter((archive) => archive !== partial))
+          assert.deepEqual(
+            archive,
+            before.find((previous) => previous.summary.tableId === archive.summary.tableId),
+          );
+        assert.deepEqual(partial.records, saved.records);
+        assert.deepEqual(partial.original, saved.original);
+        assert.deepEqual(partial.checkpoint, saved.checkpoint);
+        assert.deepEqual(partial.summary.lifecycle, saved.summary.lifecycle);
+        assert.equal(partial.summary.participants, 1);
+        assert.equal(partial.summary.capture, "incomplete");
+        assert.equal(partial.summary.observation, "partial");
+        const gaps = ["catalog_unavailable:snapshot_oversized"];
+        const tables = yield* ArchitectureQuery.read(
+          { kind: "tables", threadId: fixture.threadId },
+          archives,
+          [],
+        );
+        if (tables.kind !== "tables") throw Error("Expected tables");
+        assert.deepEqual(tables.items.find((table) => table.roomId === batch.roomId)?.gaps, gaps);
+        const records = yield* ArchitectureQuery.read(
+          { kind: "records", threadId: fixture.threadId, tableId: partial.summary.tableId },
+          archives,
+          [],
+        );
+        if (records.kind !== "records") throw Error("Expected records");
+        assert.equal(records.items.length, saved.records.length);
+        assert.deepEqual(records.summary.gaps, gaps);
+        const original = yield* ArchitectureQuery.read(
+          {
+            kind: "text",
+            threadId: fixture.threadId,
+            tableId: partial.summary.tableId,
+            textId: "original",
+          },
+          archives,
+          [],
+        );
+        if (original.kind !== "text") throw Error("Expected original");
+        assert.equal(original.text, batch.original?.text);
+        assert.isTrue(original.complete);
+        yield* advance();
+        assert.deepEqual(yield* fixture.sink.architectures(fixture.threadId), archives);
+        // Unexpected optional-source failures must not gate a still-valid worker source either.
+        throwCatalog = true;
+        yield* advance();
+        assert.deepEqual(yield* fixture.sink.architectures(fixture.threadId), archives);
+        const latest = (yield* fixture.sink.nativeWorkers(fixture.providerSessionId))[0]!;
+        assert.equal(latest.result, "worker result 3");
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const child = yield* projections.getThreadRecords(worker.childThreadId!, [
+          "providerThreads",
+        ]);
+        assert.equal(child.providerThreads[0]?.nativeMetadata?.nativeWorkerCheckpoint?.cut, 3);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            nativeWorkers: () => ({
+              ...residencyPort(() => Effect.succeed({ state: "pending" })),
+              owner,
+              hints: Stream.fromQueue(hints),
+              readArchitectures: () =>
+                Effect.tryPromise(() => readArchitectures(source, 1)).pipe(
+                  Effect.mapError((error) =>
+                    isArchitectureCatalogLoss(error.cause) ? error.cause : error,
+                  ),
+                ),
+              read: (launch, expected) =>
+                Effect.succeed({
+                  launch,
+                  expectedCheckpoint: expected,
+                  checkpoint: { ...expected!, cursor: `worker-${workerCut}`, cut: workerCut },
+                  records: [],
+                  bindings: [],
+                  more: false,
+                  summary: {
+                    launch,
+                    execution: "completed",
+                    result: "available",
+                    capture: "open",
+                    availability: "ready",
+                    gaps: [],
+                  },
+                  result: {
+                    status: "completed",
+                    text: `worker result ${workerCut}`,
+                    complete: true,
+                  },
+                }),
+            }),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each([
+  "opening",
+  "open",
+  "binding",
+  "more",
+  "fragment",
+  "omitted",
+  "terminal gap",
+  "old owner",
+] as const)(
+  "native committed capture %s observes the current owner and actual capture obligations",
+  (capture) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const fixture = yield* openResidencySession();
+        const binding: PiNativeWorkerCheckpoint["bindings"][number] = {
+          generation: 1,
+          historyId: "history",
+          sessionId: "session",
+          state: "historical",
+          headEntryId: null,
+          capture: "closed",
+          attemptIds: [],
+          attempts: [],
+          gaps: [],
+        };
+        yield* admitResidencyCapture(fixture, "local-worker", {
+          capture: capture === "opening" || capture === "open" ? capture : "incomplete",
+          ...(capture === "old owner"
+            ? { capture: "open", owner: { ...residencyOwner, epoch: "old-epoch" } }
+            : {}),
+          bindings: ["binding", "more", "fragment", "omitted"].includes(capture) ? [binding] : [],
+          bindingCursors: ["more", "fragment", "omitted"].includes(capture)
+            ? [
+                {
+                  generation: 1,
+                  cursor: "cursor",
+                  cut: 1,
+                  recovery: false,
+                  more: capture !== "fragment",
+                  ...(capture === "omitted" ? { omission: "invalid_record" } : {}),
+                  ...(capture === "fragment"
+                    ? {
+                        fragment: {
+                          id: "fragment",
+                          binding: 1,
+                          revision: 1,
+                          epoch: "capture",
+                          sequence: 1,
+                          totalBytes: 10,
+                          cursor: "cursor",
+                        },
+                      }
+                    : {}),
+                },
+              ]
+            : [],
+          gaps: capture === "terminal gap" ? ["unavailable"] : [],
+        });
+        yield* TestClock.adjust("30 minutes");
+        yield* TestClock.adjust("5 hours");
+        const protects = !["omitted", "terminal gap", "old owner"].includes(capture);
+        assert.equal(
+          Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)),
+          protects,
+        );
+        if (protects) yield* fixture.manager.close(fixture.providerSessionId);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            hasPendingBackgroundWork: Effect.die("ordinary unreadable"),
+            // A terminal gap/old owner alone must not protect; those cases need all
+            // applicable sources absent, not an unrelated ordinary-read failure.
+            ...(["omitted", "terminal gap", "old owner"].includes(capture)
+              ? { hasPendingBackgroundWork: Effect.succeed(false) }
+              : {}),
+            nativeWorkers: () => residencyPort(() => Effect.succeed({ state: "none" })),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect("native failed checkpoint does not hide a later committed positive", () =>
+  Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
+    const unreadableCheckpoint = yield* Ref.make<ThreadId | null>(null);
     yield* Effect.gen(function* () {
       const fixture = yield* openResidencySession();
-      const binding: PiNativeWorkerCheckpoint["bindings"][number] = {
-        generation: 1, historyId: "history", sessionId: "session", state: "historical", headEntryId: null,
-        capture: "closed", attemptIds: [], attempts: [], gaps: [],
-      };
-      yield* admitResidencyCapture(fixture, "local-worker", {
-        capture: capture === "opening" || capture === "open" ? capture : "incomplete",
-        ...(capture === "old owner" ? { capture: "open", owner: { ...residencyOwner, epoch: "old-epoch" } } : {}),
-        bindings: ["binding", "more", "fragment", "omitted"].includes(capture) ? [binding] : [],
-        bindingCursors: ["more", "fragment", "omitted"].includes(capture) ? [{
-          generation: 1, cursor: "cursor", cut: 1, recovery: false, more: capture !== "fragment",
-          ...(capture === "omitted" ? { omission: "invalid_record" } : {}),
-          ...(capture === "fragment" ? { fragment: {
-            id: "fragment", binding: 1, revision: 1, epoch: "capture", sequence: 1, totalBytes: 10, cursor: "cursor",
-          } } : {}),
-        }] : [], gaps: capture === "terminal gap" ? ["unavailable"] : [],
-      });
+      yield* admitResidencyCapture(fixture, "first-worker");
+      yield* admitResidencyCapture(fixture, "positive-worker");
+      const first = (yield* fixture.sink.nativeWorkers(fixture.providerSessionId))[0]!;
+      yield* Ref.set(unreadableCheckpoint, first.childThreadId);
       yield* TestClock.adjust("30 minutes");
       yield* TestClock.adjust("5 hours");
-      const protects = !["omitted", "terminal gap", "old owner"].includes(capture);
-      assert.equal(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)), protects);
-      if (protects) yield* fixture.manager.close(fixture.providerSessionId);
-    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000,
-      hasPendingBackgroundWork: Effect.die("ordinary unreadable"),
-      // A terminal gap/old owner alone must not protect; those cases need all
-      // applicable sources absent, not an unrelated ordinary-read failure.
-      ...(["omitted", "terminal gap", "old owner"].includes(capture) ? { hasPendingBackgroundWork: Effect.succeed(false) } : {}),
-      nativeWorkers: () => residencyPort(() => Effect.succeed({ state: "none" })),
-    })));
+      assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
+      yield* Ref.set(unreadableCheckpoint, null);
+      yield* fixture.manager.close(fixture.providerSessionId);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 30 * 60_000,
+          unreadableCheckpoint,
+          nativeWorkers: () =>
+            residencyPort(() => Effect.succeed({ state: "unavailable", reason: "unsupported" })),
+        }),
+      ),
+    );
   }),
 );
 
-it.effect("native failed checkpoint does not hide a later committed positive", () => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const unreadableCheckpoint = yield* Ref.make<ThreadId | null>(null);
-  yield* Effect.gen(function* () {
-    const fixture = yield* openResidencySession();
-    yield* admitResidencyCapture(fixture, "first-worker");
-    yield* admitResidencyCapture(fixture, "positive-worker");
-    const first = (yield* fixture.sink.nativeWorkers(fixture.providerSessionId))[0]!;
-    yield* Ref.set(unreadableCheckpoint, first.childThreadId);
-    yield* TestClock.adjust("30 minutes");
-    yield* TestClock.adjust("5 hours");
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    yield* Ref.set(unreadableCheckpoint, null);
-    yield* fixture.manager.close(fixture.providerSessionId);
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, unreadableCheckpoint,
-    nativeWorkers: () => residencyPort(() => Effect.succeed({ state: "unavailable", reason: "unsupported" })),
-  })));
-}));
+it.effect("native unreadable required checkpoint consumes bounded uncertainty, not absence", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const failure = yield* Ref.make<"none" | "membership" | "checkpoint">("none");
+    yield* Effect.gen(function* () {
+      const fixture = yield* openResidencySession();
+      yield* admitResidencyCapture(fixture, "unreadable-worker");
+      yield* Ref.set(failure, "checkpoint");
+      yield* TestClock.adjust("30 minutes");
+      yield* TestClock.adjust("64 minutes");
+      assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
+      yield* TestClock.adjust("1 minute");
+      assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
+      yield* Ref.set(failure, "none");
+      yield* TestClock.adjust("1 second"); // Existing record-write retry, not a residency retry.
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 30 * 60_000,
+          maxIdlePinMs: 65 * 60_000,
+          residencyFailure: failure,
+          nativeWorkers: () => residencyPort(() => Effect.succeed({ state: "none" })),
+        }),
+      ),
+    );
+  }),
+);
 
-it.effect("native unreadable required checkpoint consumes bounded uncertainty, not absence", () => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const failure = yield* Ref.make<"none" | "membership" | "checkpoint">("none");
-  yield* Effect.gen(function* () {
-    const fixture = yield* openResidencySession();
-    yield* admitResidencyCapture(fixture, "unreadable-worker");
-    yield* Ref.set(failure, "checkpoint");
-    yield* TestClock.adjust("30 minutes");
-    yield* TestClock.adjust("64 minutes");
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    yield* TestClock.adjust("1 minute");
-    assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    yield* Ref.set(failure, "none");
-    yield* TestClock.adjust("1 second"); // Existing record-write retry, not a residency retry.
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000, residencyFailure: failure,
-    nativeWorkers: () => residencyPort(() => Effect.succeed({ state: "none" })),
-  })));
-}));
+it.effect("native expired final round rereads newly committed local capture", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let calls = 0;
+    yield* Effect.gen(function* () {
+      const fixture = yield* openResidencySession();
+      yield* TestClock.adjust("30 minutes");
+      yield* TestClock.adjust("65 minutes");
+      yield* Deferred.await(entered);
+      yield* admitResidencyCapture(fixture, "late-worker");
+      yield* Deferred.succeed(resume, undefined);
+      yield* TestClock.adjust("5 hours");
+      assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
+      yield* fixture.manager.close(fixture.providerSessionId);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 30 * 60_000,
+          maxIdlePinMs: 65 * 60_000,
+          nativeWorkers: () =>
+            residencyPort(() =>
+              Effect.gen(function* () {
+                calls += 1;
+                if (calls === 4) {
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(resume);
+                }
+                return { state: "unavailable", reason: "source_unavailable" } as const;
+              }),
+            ),
+        }),
+      ),
+    );
+  }),
+);
 
-it.effect("native expired final round rereads newly committed local capture", () => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const entered = yield* Deferred.make<void>();
-  const resume = yield* Deferred.make<void>();
-  let calls = 0;
-  yield* Effect.gen(function* () {
-    const fixture = yield* openResidencySession();
-    yield* TestClock.adjust("30 minutes");
-    yield* TestClock.adjust("65 minutes");
-    yield* Deferred.await(entered);
-    yield* admitResidencyCapture(fixture, "late-worker");
-    yield* Deferred.succeed(resume, undefined);
-    yield* TestClock.adjust("5 hours");
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    yield* fixture.manager.close(fixture.providerSessionId);
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-    nativeWorkers: () => residencyPort(() => Effect.gen(function* () {
-      calls += 1;
-      if (calls === 4) { yield* Deferred.succeed(entered, undefined); yield* Deferred.await(resume); }
-      return { state: "unavailable", reason: "source_unavailable" } as const;
-    })),
-  })));
-}));
+it.effect("native missing committed checkpoint is unknown until the bounded deadline", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const fixture = yield* openResidencySession();
+      const member = yield* admitResidencyCapture(fixture, "missing-checkpoint");
+      yield* writeResidencyCheckpoint(fixture, member, "missing");
+      yield* TestClock.adjust("30 minutes");
+      yield* TestClock.adjust("64 minutes");
+      assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
+      yield* TestClock.adjust("1 minute");
+      assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 30 * 60_000,
+          maxIdlePinMs: 65 * 60_000,
+          nativeWorkers: () => residencyPort(() => Effect.succeed({ state: "none" })),
+        }),
+      ),
+    );
+  }),
+);
 
-it.effect("native missing committed checkpoint is unknown until the bounded deadline", () => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  yield* Effect.gen(function* () {
-    const fixture = yield* openResidencySession();
-    const member = yield* admitResidencyCapture(fixture, "missing-checkpoint");
-    yield* writeResidencyCheckpoint(fixture, member, "missing");
-    yield* TestClock.adjust("30 minutes");
-    yield* TestClock.adjust("64 minutes");
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    yield* TestClock.adjust("1 minute");
-    assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-    nativeWorkers: () => residencyPort(() => Effect.succeed({ state: "none" })),
-  })));
-}));
-
-it.effect.each(["native", "ordinary", "ordinary unknown", "ordinary failure", "membership failure"] as const)(
-  "native residency retains known %s work beyond four hours without Lineage", (source) => Effect.gen(function* () {
+it.effect.each([
+  "native",
+  "ordinary",
+  "ordinary unknown",
+  "ordinary failure",
+  "membership failure",
+] as const)("native residency retains known %s work beyond four hours without Lineage", (source) =>
+  Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
     const pending = yield* Ref.make(true);
-    const failure = yield* Ref.make<"none" | "membership" | "checkpoint">(source === "membership failure" ? "membership" : "none");
-    const ordinary = Ref.get(pending).pipe(Effect.flatMap((value) => source === "ordinary failure" && value
-      ? Effect.die("ordinary unavailable") : Effect.succeed(value && source.startsWith("ordinary") && source !== "ordinary failure")));
+    const failure = yield* Ref.make<"none" | "membership" | "checkpoint">(
+      source === "membership failure" ? "membership" : "none",
+    );
+    const ordinary = Ref.get(pending).pipe(
+      Effect.flatMap((value) =>
+        source === "ordinary failure" && value
+          ? Effect.die("ordinary unavailable")
+          : Effect.succeed(value && source.startsWith("ordinary") && source !== "ordinary failure"),
+      ),
+    );
     yield* Effect.gen(function* () {
       const { manager, providerSessionId, sink } = yield* openResidencySession();
-      if (source !== "membership failure") assert.lengthOf(yield* sink.nativeWorkers(providerSessionId), 0);
+      if (source !== "membership failure")
+        assert.lengthOf(yield* sink.nativeWorkers(providerSessionId), 0);
       yield* TestClock.adjust("30 minutes");
       assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
       yield* TestClock.adjust("5 hours");
@@ -886,20 +1544,42 @@ it.effect.each(["native", "ordinary", "ordinary unknown", "ordinary failure", "m
       yield* Ref.set(failure, "none");
       yield* TestClock.adjust("30 minutes");
       assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
-    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, residencyFailure: failure,
-      hasPendingBackgroundWork: ordinary,
-      nativeWorkers: () => residencyPort(() => Ref.get(pending).pipe(Effect.map((value) =>
-        value && source === "ordinary unknown" ? { state: "unavailable", reason: "source_unavailable" } as const :
-        { state: value && source !== "ordinary" ? "pending" : "none" }))),
-    })));
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 30 * 60_000,
+          residencyFailure: failure,
+          hasPendingBackgroundWork: ordinary,
+          nativeWorkers: () =>
+            residencyPort(() =>
+              Ref.get(pending).pipe(
+                Effect.map((value) =>
+                  value && source === "ordinary unknown"
+                    ? ({ state: "unavailable", reason: "source_unavailable" } as const)
+                    : { state: value && source !== "ordinary" ? "pending" : "none" },
+                ),
+              ),
+            ),
+        }),
+      ),
+    );
   }),
 );
 
-it.effect.each(["unsupported", "stale_owner", "source_unavailable", "error", "membership failure"] as const)(
-  "native unknown-only %s uses one bounded episode and one final round", (source) => Effect.gen(function* () {
+it.effect.each([
+  "unsupported",
+  "stale_owner",
+  "source_unavailable",
+  "error",
+  "membership failure",
+] as const)("native unknown-only %s uses one bounded episode and one final round", (source) =>
+  Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
     const calls = yield* Ref.make(0);
-    const failure = yield* Ref.make<"none" | "membership" | "checkpoint">(source === "membership failure" ? "membership" : "none");
+    const failure = yield* Ref.make<"none" | "membership" | "checkpoint">(
+      source === "membership failure" ? "membership" : "none",
+    );
     yield* Effect.gen(function* () {
       const { manager, providerSessionId } = yield* openResidencySession();
       yield* TestClock.adjust("30 minutes");
@@ -908,573 +1588,966 @@ it.effect.each(["unsupported", "stale_owner", "source_unavailable", "error", "me
       assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
       yield* TestClock.adjust("1 minute");
       assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
-      assert.equal(yield* Ref.get(calls), 4, "expiry reuses the current round and rearm respects remaining budget");
-    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-      residencyFailure: failure,
-      nativeWorkers: () => residencyPort(() => Effect.gen(function* () {
-        yield* Ref.update(calls, (n) => n + 1);
-        if (source === "error") return yield* Effect.die("native read unavailable");
-        return source === "membership failure" ? { state: "none" } as const : { state: "unavailable", reason: source } as const;
-      })),
-    })));
+      assert.equal(
+        yield* Ref.get(calls),
+        4,
+        "expiry reuses the current round and rearm respects remaining budget",
+      );
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 30 * 60_000,
+          maxIdlePinMs: 65 * 60_000,
+          residencyFailure: failure,
+          nativeWorkers: () =>
+            residencyPort(() =>
+              Effect.gen(function* () {
+                yield* Ref.update(calls, (n) => n + 1);
+                if (source === "error") return yield* Effect.die("native read unavailable");
+                return source === "membership failure"
+                  ? ({ state: "none" } as const)
+                  : ({ state: "unavailable", reason: source } as const);
+              }),
+            ),
+        }),
+      ),
+    );
   }),
 );
 
-it.effect("native unknown/pending/unknown and long pending start fresh uncertainty episodes", () => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const observation = yield* Ref.make<ProviderAdapter.ProviderBackgroundPending>({ state: "unavailable", reason: "unsupported" });
-  yield* Effect.gen(function* () {
-    const { manager, providerSessionId } = yield* openResidencySession();
-    yield* TestClock.adjust("30 minutes");
-    yield* Ref.set(observation, { state: "pending" });
-    yield* TestClock.adjust("30 minutes");
-    yield* TestClock.adjust("5 hours");
-    assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
-    yield* Ref.set(observation, { state: "unavailable", reason: "source_unavailable" });
-    yield* TestClock.adjust("30 minutes");
-    yield* TestClock.adjust("64 minutes");
-    assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
-    yield* TestClock.adjust("1 minute");
-    assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-    nativeWorkers: () => residencyPort(() => Ref.get(observation)),
-  })));
-}));
-
-it.effect.each(["pending", "none", "unavailable"] as const)(
-  "native late %s reobserves a changed owner without renewing uncertainty", (late) => Effect.gen(function* () {
+it.effect("native unknown/pending/unknown and long pending start fresh uncertainty episodes", () =>
+  Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
-    const entered = yield* Deferred.make<void>();
-    const resume = yield* Deferred.make<void>();
-    let owner = residencyOwner;
-    let calls = 0;
+    const observation = yield* Ref.make<ProviderAdapter.ProviderBackgroundPending>({
+      state: "unavailable",
+      reason: "unsupported",
+    });
     yield* Effect.gen(function* () {
       const { manager, providerSessionId } = yield* openResidencySession();
       yield* TestClock.adjust("30 minutes");
-      yield* TestClock.adjust("60 minutes");
-      yield* TestClock.adjust("5 minutes");
-      yield* Deferred.await(entered);
-      owner = { ...residencyOwner, epoch: "successor-epoch" };
-      yield* Deferred.succeed(resume, undefined);
-      yield* TestClock.adjust("0 millis");
-      assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
-      assert.equal(calls, 5, "changed same-runtime owner gets a responsible current round, not a fresh budget");
-    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-      nativeWorkers: () => ({ ...residencyPort(() => Effect.gen(function* () {
-        calls += 1;
-        if (calls === 4) {
-          yield* Deferred.succeed(entered, undefined);
-          yield* Deferred.await(resume);
-          return late === "unavailable" ? { state: late, reason: "source_unavailable" } as const : { state: late };
-        }
-        return { state: "unavailable", reason: "unsupported" } as const;
-      })), get owner() { return owner; } }),
-    })));
-  }),
-);
-
-it.effect("native final round rechecks pendingWake after waiting, then releases after continuation terminal", () => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const pendingWake = yield* Ref.make(false);
-  const entered = yield* Deferred.make<void>();
-  const resume = yield* Deferred.make<void>();
-  let calls = 0;
-  yield* Effect.gen(function* () {
-    const fixture = yield* openResidencySession();
-    const { manager, providerSessionId } = fixture;
-    yield* TestClock.adjust("30 minutes");
-    yield* TestClock.adjust("65 minutes");
-    yield* Deferred.await(entered);
-    yield* Ref.set(pendingWake, true);
-    yield* Deferred.succeed(resume, undefined);
-    yield* TestClock.adjust("5 hours");
-    assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
-    yield* startResidencyTurn(fixture);
-    yield* Ref.set(pendingWake, false);
-    const subscription = yield* fixture.runtime.subscribeEvents!;
-    const terminal = yield* subscription.events.pipe(Stream.take(1), Stream.runDrain, Effect.forkScoped);
-    yield* Queue.offer((yield* Ref.get(state)).eventQueues.get(String(providerSessionId))!, {
-      type: "turn.terminal", driver: CODEX_DRIVER, providerThreadId: fixture.providerThread.id,
-      providerTurnId: ProviderTurnId.make("continuation-terminal"), runOrdinal: 1,
-      status: "completed", failure: null, threadDisposition: "reusable",
-    });
-    yield* Fiber.join(terminal);
-    yield* TestClock.adjust("30 minutes");
-    assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-    hasPendingBackgroundWork: Ref.get(pendingWake),
-    nativeWorkers: () => residencyPort(() => Effect.gen(function* () {
-      calls += 1;
-      if (calls === 4) { yield* Deferred.succeed(entered, undefined); yield* Deferred.await(resume); }
-      return calls <= 4 ? { state: "unavailable", reason: "source_unavailable" } as const : { state: "none" } as const;
-    })),
-  })));
-}));
-
-it.effect("native interrupted observation neither expires nor pins, and explicit detach stays authoritative", () => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const entered = yield* Deferred.make<void>();
-  const interrupted = yield* Deferred.make<void>();
-  yield* Effect.gen(function* () {
-    const { manager, providerSessionId, threadId } = yield* openResidencySession();
-    yield* TestClock.adjust("30 minutes");
-    yield* Deferred.await(entered);
-    yield* manager.detach({ providerSessionId, threadId });
-    yield* Deferred.await(interrupted);
-    assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
-    assert.equal((yield* Ref.get(state)).closeCount, 1);
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, capabilities: ExclusiveCapabilities,
-    nativeWorkers: () => residencyPort(() => Deferred.succeed(entered, undefined).pipe(
-      Effect.andThen(Effect.never), Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
-    )),
-  })));
-}));
-
-it.effect.each(["pending", "none", "unavailable"] as const)(
-  "native late %s cannot mutate or destroy a replaced runtime", (late) => Effect.gen(function* () {
-    const state = yield* Ref.make(emptyState);
-    const entered = yield* Deferred.make<void>();
-    const resume = yield* Deferred.make<void>();
-    let opens = 0;
-    yield* Effect.gen(function* () {
-      const fixture = yield* openResidencySession();
-      const { manager, providerSessionId, threadId } = fixture;
+      yield* Ref.set(observation, { state: "pending" });
       yield* TestClock.adjust("30 minutes");
-      yield* TestClock.adjust("65 minutes");
-      yield* Deferred.await(entered);
-      const close = yield* manager.close(providerSessionId).pipe(Effect.forkChild);
-      yield* TestClock.adjust("0 millis");
-      assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)), "old removal precedes waiting for its probe");
-      yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
-      assert.equal((yield* Ref.get(state)).openCount, 2);
-      yield* Deferred.succeed(resume, undefined);
-      yield* Fiber.join(close);
-      assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
-      yield* TestClock.adjust("30 minutes");
-      assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
-      assert.equal((yield* Ref.get(state)).closeCount, 2);
-    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-      nativeWorkers: () => {
-        const generation = ++opens;
-        let calls = 0;
-        return residencyPort(() => generation === 1 ? Effect.uninterruptible(Effect.gen(function* () {
-          calls += 1;
-          if (calls !== 4) return { state: "unavailable", reason: "unsupported" } as const;
-          yield* Deferred.succeed(entered, undefined);
-          yield* Deferred.await(resume);
-          return late === "unavailable" ? { state: late, reason: "unsupported" } as const : { state: late };
-        })) : Effect.succeed({ state: "none" }));
-      },
-    })));
-  }),
-);
-
-it.effect.each(["pending", "none", "unavailable"] as const)(
-  "native late %s cannot expire or pin a busy turn", (late) => Effect.gen(function* () {
-    const state = yield* Ref.make(emptyState);
-    const entered = yield* Deferred.make<void>();
-    const resume = yield* Deferred.make<void>();
-    let calls = 0;
-    yield* Effect.gen(function* () {
-      const fixture = yield* openResidencySession();
-      yield* TestClock.adjust("30 minutes");
-      yield* TestClock.adjust("65 minutes");
-      yield* Deferred.await(entered);
-      const starting = yield* startResidencyTurn(fixture).pipe(Effect.forkChild);
-      yield* TestClock.adjust("0 millis");
-      yield* Deferred.succeed(resume, undefined);
-      yield* Fiber.join(starting);
       yield* TestClock.adjust("5 hours");
-      assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-      yield* terminalResidencyTurn(fixture, state);
+      assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
+      yield* Ref.set(observation, { state: "unavailable", reason: "source_unavailable" });
       yield* TestClock.adjust("30 minutes");
-      assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-      nativeWorkers: () => residencyPort(() => Effect.uninterruptible(Effect.gen(function* () {
-        calls += 1;
-        if (calls < 4) return { state: "unavailable", reason: "unsupported" } as const;
-        if (calls > 4) return { state: "none" } as const;
-        yield* Deferred.succeed(entered, undefined);
-        yield* Deferred.await(resume);
-        return late === "unavailable" ? { state: late, reason: "unsupported" } as const : { state: late };
-      }))),
-    })));
+      yield* TestClock.adjust("64 minutes");
+      assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
+      yield* TestClock.adjust("1 minute");
+      assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 30 * 60_000,
+          maxIdlePinMs: 65 * 60_000,
+          nativeWorkers: () => residencyPort(() => Ref.get(observation)),
+        }),
+      ),
+    );
   }),
 );
 
-it.effect.each(["none", "turn", "source progress"] as const)("native sibling unloads share one uncertainty episode; activity reset=%s", (activity) => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const hints = yield* Queue.unbounded<void>();
-  let resultText = "initial result";
-  yield* Effect.gen(function* () {
-    const a = yield* openResidencySession();
-    const b = yield* attachResidencySibling(a, "sibling-b");
-    const busy = yield* attachResidencySibling(a, "busy-sibling");
-    if (activity === "source progress") {
-      const initial = yield* a.sink.stream({ eventType: "subagent.updated" }).pipe(
-        Stream.filter((stored) => stored.event.type === "subagent.updated" && stored.event.payload.result === resultText),
-        Stream.take(1), Stream.runDrain, Effect.forkScoped,
+it.effect.each(["pending", "none", "unavailable"] as const)(
+  "native late %s reobserves a changed owner without renewing uncertainty",
+  (late) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let owner = residencyOwner;
+      let calls = 0;
+      yield* Effect.gen(function* () {
+        const { manager, providerSessionId } = yield* openResidencySession();
+        yield* TestClock.adjust("30 minutes");
+        yield* TestClock.adjust("60 minutes");
+        yield* TestClock.adjust("5 minutes");
+        yield* Deferred.await(entered);
+        owner = { ...residencyOwner, epoch: "successor-epoch" };
+        yield* Deferred.succeed(resume, undefined);
+        yield* TestClock.adjust("0 millis");
+        assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
+        assert.equal(
+          calls,
+          5,
+          "changed same-runtime owner gets a responsible current round, not a fresh budget",
+        );
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            maxIdlePinMs: 65 * 60_000,
+            nativeWorkers: () => ({
+              ...residencyPort(() =>
+                Effect.gen(function* () {
+                  calls += 1;
+                  if (calls === 4) {
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(resume);
+                    return late === "unavailable"
+                      ? ({ state: late, reason: "source_unavailable" } as const)
+                      : { state: late };
+                  }
+                  return { state: "unavailable", reason: "unsupported" } as const;
+                }),
+              ),
+              get owner() {
+                return owner;
+              },
+            }),
+          }),
+        ),
       );
-      yield* admitResidencyCapture(a, "closed-progress-worker", { capture: "closed", finalSequence: 1 });
-      yield* Fiber.join(initial);
-    }
-    yield* startResidencyTurn(a);
-    yield* startResidencyTurn(b);
-    yield* startResidencyTurn(busy);
-    yield* terminalResidencyTurn(a, state);
-    yield* TestClock.adjust("20 minutes");
-    yield* terminalResidencyTurn(b, state);
-    yield* TestClock.adjust("50 minutes"); // First unknown at 30m, sibling's at 50m.
-    if (activity === "turn") yield* startResidencyTurn(busy);
-    if (activity === "source progress") {
-      const progressed = yield* a.sink.stream({ eventType: "subagent.updated" }).pipe(
-        Stream.filter((stored) => stored.event.type === "subagent.updated" && stored.event.payload.result === "new result"),
-        Stream.take(1), Stream.runDrain, Effect.forkScoped,
+    }),
+);
+
+it.effect(
+  "native final round rechecks pendingWake after waiting, then releases after continuation terminal",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const pendingWake = yield* Ref.make(false);
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let calls = 0;
+      yield* Effect.gen(function* () {
+        const fixture = yield* openResidencySession();
+        const { manager, providerSessionId } = fixture;
+        yield* TestClock.adjust("30 minutes");
+        yield* TestClock.adjust("65 minutes");
+        yield* Deferred.await(entered);
+        yield* Ref.set(pendingWake, true);
+        yield* Deferred.succeed(resume, undefined);
+        yield* TestClock.adjust("5 hours");
+        assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
+        yield* startResidencyTurn(fixture);
+        yield* Ref.set(pendingWake, false);
+        const subscription = yield* fixture.runtime.subscribeEvents!;
+        const terminal = yield* subscription.events.pipe(
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* Queue.offer((yield* Ref.get(state)).eventQueues.get(String(providerSessionId))!, {
+          type: "turn.terminal",
+          driver: CODEX_DRIVER,
+          providerThreadId: fixture.providerThread.id,
+          providerTurnId: ProviderTurnId.make("continuation-terminal"),
+          runOrdinal: 1,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        yield* Fiber.join(terminal);
+        yield* TestClock.adjust("30 minutes");
+        assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            maxIdlePinMs: 65 * 60_000,
+            hasPendingBackgroundWork: Ref.get(pendingWake),
+            nativeWorkers: () =>
+              residencyPort(() =>
+                Effect.gen(function* () {
+                  calls += 1;
+                  if (calls === 4) {
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(resume);
+                  }
+                  return calls <= 4
+                    ? ({ state: "unavailable", reason: "source_unavailable" } as const)
+                    : ({ state: "none" } as const);
+                }),
+              ),
+          }),
+        ),
       );
-      resultText = "new result";
+    }),
+);
+
+it.effect(
+  "native interrupted observation neither expires nor pins, and explicit detach stays authoritative",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const entered = yield* Deferred.make<void>();
+      const interrupted = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const { manager, providerSessionId, threadId } = yield* openResidencySession();
+        yield* TestClock.adjust("30 minutes");
+        yield* Deferred.await(entered);
+        yield* manager.detach({ providerSessionId, threadId });
+        yield* Deferred.await(interrupted);
+        assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            capabilities: ExclusiveCapabilities,
+            nativeWorkers: () =>
+              residencyPort(() =>
+                Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Effect.never),
+                  Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+                ),
+              ),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["pending", "none", "unavailable"] as const)(
+  "native late %s cannot mutate or destroy a replaced runtime",
+  (late) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let opens = 0;
+      yield* Effect.gen(function* () {
+        const fixture = yield* openResidencySession();
+        const { manager, providerSessionId, threadId } = fixture;
+        yield* TestClock.adjust("30 minutes");
+        yield* TestClock.adjust("65 minutes");
+        yield* Deferred.await(entered);
+        const close = yield* manager.close(providerSessionId).pipe(Effect.forkChild);
+        yield* TestClock.adjust("0 millis");
+        assert.isTrue(
+          Option.isNone(yield* manager.getResident(providerSessionId)),
+          "old removal precedes waiting for its probe",
+        );
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        assert.equal((yield* Ref.get(state)).openCount, 2);
+        yield* Deferred.succeed(resume, undefined);
+        yield* Fiber.join(close);
+        assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
+        yield* TestClock.adjust("30 minutes");
+        assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 2);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            maxIdlePinMs: 65 * 60_000,
+            nativeWorkers: () => {
+              const generation = ++opens;
+              let calls = 0;
+              return residencyPort(() =>
+                generation === 1
+                  ? Effect.uninterruptible(
+                      Effect.gen(function* () {
+                        calls += 1;
+                        if (calls !== 4)
+                          return { state: "unavailable", reason: "unsupported" } as const;
+                        yield* Deferred.succeed(entered, undefined);
+                        yield* Deferred.await(resume);
+                        return late === "unavailable"
+                          ? ({ state: late, reason: "unsupported" } as const)
+                          : { state: late };
+                      }),
+                    )
+                  : Effect.succeed({ state: "none" }),
+              );
+            },
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["pending", "none", "unavailable"] as const)(
+  "native late %s cannot expire or pin a busy turn",
+  (late) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let calls = 0;
+      yield* Effect.gen(function* () {
+        const fixture = yield* openResidencySession();
+        yield* TestClock.adjust("30 minutes");
+        yield* TestClock.adjust("65 minutes");
+        yield* Deferred.await(entered);
+        const starting = yield* startResidencyTurn(fixture).pipe(Effect.forkChild);
+        yield* TestClock.adjust("0 millis");
+        yield* Deferred.succeed(resume, undefined);
+        yield* Fiber.join(starting);
+        yield* TestClock.adjust("5 hours");
+        assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
+        yield* terminalResidencyTurn(fixture, state);
+        yield* TestClock.adjust("30 minutes");
+        assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            maxIdlePinMs: 65 * 60_000,
+            nativeWorkers: () =>
+              residencyPort(() =>
+                Effect.uninterruptible(
+                  Effect.gen(function* () {
+                    calls += 1;
+                    if (calls < 4) return { state: "unavailable", reason: "unsupported" } as const;
+                    if (calls > 4) return { state: "none" } as const;
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(resume);
+                    return late === "unavailable"
+                      ? ({ state: late, reason: "unsupported" } as const)
+                      : { state: late };
+                  }),
+                ),
+              ),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["none", "turn", "source progress"] as const)(
+  "native sibling unloads share one uncertainty episode; activity reset=%s",
+  (activity) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const hints = yield* Queue.unbounded<void>();
+      let resultText = "initial result";
+      yield* Effect.gen(function* () {
+        const a = yield* openResidencySession();
+        const b = yield* attachResidencySibling(a, "sibling-b");
+        const busy = yield* attachResidencySibling(a, "busy-sibling");
+        if (activity === "source progress") {
+          const initial = yield* a.sink.stream({ eventType: "subagent.updated" }).pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.type === "subagent.updated" &&
+                stored.event.payload.result === resultText,
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* admitResidencyCapture(a, "closed-progress-worker", {
+            capture: "closed",
+            finalSequence: 1,
+          });
+          yield* Fiber.join(initial);
+        }
+        yield* startResidencyTurn(a);
+        yield* startResidencyTurn(b);
+        yield* startResidencyTurn(busy);
+        yield* terminalResidencyTurn(a, state);
+        yield* TestClock.adjust("20 minutes");
+        yield* terminalResidencyTurn(b, state);
+        yield* TestClock.adjust("50 minutes"); // First unknown at 30m, sibling's at 50m.
+        if (activity === "turn") yield* startResidencyTurn(busy);
+        if (activity === "source progress") {
+          const progressed = yield* a.sink.stream({ eventType: "subagent.updated" }).pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.type === "subagent.updated" &&
+                stored.event.payload.result === "new result",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          resultText = "new result";
+          yield* Queue.offer(hints, undefined);
+          yield* Fiber.join(progressed);
+        }
+        yield* TestClock.adjust("24 minutes");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        yield* TestClock.adjust("1 minute");
+        if (activity !== "none") {
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+          yield* TestClock.adjust("49 minutes");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+          yield* TestClock.adjust("1 minute");
+        }
+        assert.sameMembers(
+          [...(yield* Ref.get(state)).unloadedNativeThreadIds],
+          ["native-thread", "sibling-b"],
+        );
+        assert.isTrue(
+          Option.isSome(yield* a.manager.getResident(a.providerSessionId)),
+          "busy sibling remains independent",
+        );
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            maxIdlePinMs: 65 * 60_000,
+            nativeWorkers: () => ({
+              ...residencyPort(() =>
+                Effect.succeed({ state: "unavailable", reason: "source_unavailable" }),
+              ),
+              hints: Stream.fromQueue(hints),
+              read: (launch, expected) =>
+                Effect.succeed({
+                  launch,
+                  expectedCheckpoint: expected,
+                  checkpoint: expected!,
+                  records: [],
+                  bindings: [],
+                  more: false,
+                  result: { status: "completed", text: resultText, complete: true },
+                  summary: {
+                    launch,
+                    execution: "completed",
+                    result: "available",
+                    capture: "closed",
+                    availability: "ready",
+                    gaps: [],
+                  },
+                }),
+            }),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["native", "ordinary", "capture"] as const)(
+  "native %s work protects unrelated sibling unloads without a progress deadline",
+  (source) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const pending = yield* Ref.make(true);
+      yield* Effect.gen(function* () {
+        const a = yield* openResidencySession();
+        const b = yield* attachResidencySibling(a, "sibling-b");
+        const busy = yield* attachResidencySibling(a, "busy-sibling");
+        yield* startResidencyTurn(a);
+        yield* startResidencyTurn(b);
+        yield* startResidencyTurn(busy);
+        yield* terminalResidencyTurn(a, state);
+        yield* terminalResidencyTurn(b, state);
+        const member =
+          source === "capture" ? yield* admitResidencyCapture(a, "sibling-capture") : undefined;
+        yield* TestClock.adjust("6 hours");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        yield* Ref.set(pending, false);
+        if (member !== undefined) yield* writeResidencyCheckpoint(a, member, "closed");
+        yield* TestClock.adjust("30 minutes");
+        assert.sameMembers(
+          [...(yield* Ref.get(state)).unloadedNativeThreadIds],
+          ["native-thread", "sibling-b"],
+        );
+        assert.isTrue(Option.isSome(yield* a.manager.getResident(a.providerSessionId)));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            hasPendingBackgroundWorkForThread: Effect.succeed(false),
+            hasPendingBackgroundWork: Ref.get(pending).pipe(
+              Effect.map((value) => value && source === "ordinary"),
+            ),
+            nativeWorkers: () =>
+              residencyPort(() =>
+                Ref.get(pending).pipe(
+                  Effect.map((value) =>
+                    source === "native" || !value
+                      ? { state: value ? "pending" : "none" }
+                      : { state: "unavailable", reason: "unsupported" },
+                  ),
+                ),
+              ),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "native release and unload compare the live pin episode after a concurrent certainty reset",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const entered = yield* Deferred.make<void>();
+      const reset = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let finalRound = false;
+      let waiting = false;
+      let cleared = false;
+      yield* Effect.gen(function* () {
+        const fixture = yield* openResidencySession();
+        yield* startResidencyTurn(fixture);
+        yield* terminalResidencyTurn(fixture, state); // Both destructive timers now run for this same owner.
+        yield* TestClock.adjust("90 minutes");
+        finalRound = true;
+        yield* TestClock.adjust("5 minutes");
+        yield* Deferred.await(entered);
+        yield* Deferred.await(reset);
+        yield* Deferred.succeed(resume, undefined);
+        yield* TestClock.adjust("0 millis");
+        assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        yield* TestClock.adjust("64 minutes");
+        assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
+        yield* TestClock.adjust("1 minute");
+        assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            maxIdlePinMs: 65 * 60_000,
+            nativeWorkers: () =>
+              residencyPort(() =>
+                Effect.gen(function* () {
+                  if (finalRound && !waiting) {
+                    waiting = true;
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(resume);
+                  } else if (finalRound && !cleared) {
+                    cleared = true;
+                    // Signal only after the pending observer has had a chance to commit its
+                    // decision, using the next scheduled clock boundary in the test.
+                    yield* Deferred.succeed(reset, undefined);
+                    return { state: "pending" } as const;
+                  }
+                  return { state: "unavailable", reason: "unsupported" } as const;
+                }),
+              ),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect("native cursor commits, hints and provider-session replay do not renew uncertainty", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const hints = yield* Queue.unbounded<void>();
+    let cursor = 1;
+    let imported = false;
+    yield* Effect.gen(function* () {
+      const fixture = yield* openResidencySession();
+      yield* admitResidencyCapture(fixture, "terminal-worker", {
+        capture: "closed",
+        finalSequence: 1,
+        cut: 1,
+      });
+      imported = true;
+      yield* TestClock.adjust("30 minutes");
+      yield* TestClock.adjust("30 minutes");
+      const committed = yield* fixture.sink.stream({ eventType: "provider-thread.updated" }).pipe(
+        Stream.filter(
+          (stored) =>
+            stored.event.type === "provider-thread.updated" &&
+            stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.cut === 2,
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      cursor = 2;
       yield* Queue.offer(hints, undefined);
-      yield* Fiber.join(progressed);
-    }
-    yield* TestClock.adjust("24 minutes");
-    assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
-    yield* TestClock.adjust("1 minute");
-    if (activity !== "none") {
-      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
-      yield* TestClock.adjust("49 minutes");
-      assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+      yield* Fiber.join(committed);
+      const subscription = yield* fixture.runtime.subscribeEvents!;
+      const replayed = yield* subscription.events.pipe(
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
+      );
+      yield* Queue.offer(
+        (yield* Ref.get(state)).eventQueues.get(String(fixture.providerSessionId))!,
+        {
+          type: "provider_session.updated",
+          driver: CODEX_DRIVER,
+          providerSession: fixture.runtime.providerSession,
+        },
+      );
+      yield* Fiber.join(replayed);
+      yield* TestClock.adjust("34 minutes");
+      assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
       yield* TestClock.adjust("1 minute");
-    }
-    assert.sameMembers([...(yield* Ref.get(state)).unloadedNativeThreadIds], ["native-thread", "sibling-b"]);
-    assert.isTrue(Option.isSome(yield* a.manager.getResident(a.providerSessionId)), "busy sibling remains independent");
-    assert.equal((yield* Ref.get(state)).closeCount, 0);
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-    nativeWorkers: () => ({ ...residencyPort(() => Effect.succeed({ state: "unavailable", reason: "source_unavailable" })),
-      hints: Stream.fromQueue(hints),
-      read: (launch, expected) => Effect.succeed({ launch, expectedCheckpoint: expected, checkpoint: expected!,
-        records: [], bindings: [], more: false, result: { status: "completed", text: resultText, complete: true },
-        summary: { launch, execution: "completed", result: "available", capture: "closed", availability: "ready", gaps: [] },
-      }),
-    }),
-  })));
-}));
-
-it.effect.each(["native", "ordinary", "capture"] as const)("native %s work protects unrelated sibling unloads without a progress deadline", (source) => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const pending = yield* Ref.make(true);
-  yield* Effect.gen(function* () {
-    const a = yield* openResidencySession();
-    const b = yield* attachResidencySibling(a, "sibling-b");
-    const busy = yield* attachResidencySibling(a, "busy-sibling");
-    yield* startResidencyTurn(a);
-    yield* startResidencyTurn(b);
-    yield* startResidencyTurn(busy);
-    yield* terminalResidencyTurn(a, state);
-    yield* terminalResidencyTurn(b, state);
-    const member = source === "capture" ? yield* admitResidencyCapture(a, "sibling-capture") : undefined;
-    yield* TestClock.adjust("6 hours");
-    assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
-    yield* Ref.set(pending, false);
-    if (member !== undefined) yield* writeResidencyCheckpoint(a, member, "closed");
-    yield* TestClock.adjust("30 minutes");
-    assert.sameMembers([...(yield* Ref.get(state)).unloadedNativeThreadIds], ["native-thread", "sibling-b"]);
-    assert.isTrue(Option.isSome(yield* a.manager.getResident(a.providerSessionId)));
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000,
-    hasPendingBackgroundWorkForThread: Effect.succeed(false),
-    hasPendingBackgroundWork: Ref.get(pending).pipe(Effect.map((value) => value && source === "ordinary")),
-    nativeWorkers: () => residencyPort(() => Ref.get(pending).pipe(Effect.map((value) =>
-      source === "native" || !value ? { state: value ? "pending" : "none" } : { state: "unavailable", reason: "unsupported" }))),
-  })));
-}));
-
-it.effect("native release and unload compare the live pin episode after a concurrent certainty reset", () => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const entered = yield* Deferred.make<void>();
-  const reset = yield* Deferred.make<void>();
-  const resume = yield* Deferred.make<void>();
-  let finalRound = false;
-  let waiting = false;
-  let cleared = false;
-  yield* Effect.gen(function* () {
-    const fixture = yield* openResidencySession();
-    yield* startResidencyTurn(fixture);
-    yield* terminalResidencyTurn(fixture, state); // Both destructive timers now run for this same owner.
-    yield* TestClock.adjust("90 minutes");
-    finalRound = true;
-    yield* TestClock.adjust("5 minutes");
-    yield* Deferred.await(entered);
-    yield* Deferred.await(reset);
-    yield* Deferred.succeed(resume, undefined);
-    yield* TestClock.adjust("0 millis");
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
-    yield* TestClock.adjust("64 minutes");
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    yield* TestClock.adjust("1 minute");
-    assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-    nativeWorkers: () => residencyPort(() => Effect.gen(function* () {
-      if (finalRound && !waiting) {
-        waiting = true;
-        yield* Deferred.succeed(entered, undefined);
-        yield* Deferred.await(resume);
-      } else if (finalRound && !cleared) {
-        cleared = true;
-        // Signal only after the pending observer has had a chance to commit its
-        // decision, using the next scheduled clock boundary in the test.
-        yield* Deferred.succeed(reset, undefined);
-        return { state: "pending" } as const;
-      }
-      return { state: "unavailable", reason: "unsupported" } as const;
-    })),
-  })));
-}));
-
-it.effect("native cursor commits, hints and provider-session replay do not renew uncertainty", () => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const hints = yield* Queue.unbounded<void>();
-  let cursor = 1;
-  let imported = false;
-  yield* Effect.gen(function* () {
-    const fixture = yield* openResidencySession();
-    yield* admitResidencyCapture(fixture, "terminal-worker", { capture: "closed", finalSequence: 1, cut: 1 });
-    imported = true;
-    yield* TestClock.adjust("30 minutes");
-    yield* TestClock.adjust("30 minutes");
-    const committed = yield* fixture.sink.stream({ eventType: "provider-thread.updated" }).pipe(
-      Stream.filter((stored) => stored.event.type === "provider-thread.updated" &&
-        stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.cut === 2),
-      Stream.take(1), Stream.runDrain, Effect.forkScoped,
+      assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 30 * 60_000,
+          maxIdlePinMs: 65 * 60_000,
+          nativeWorkers: () => ({
+            ...residencyPort(() => Effect.succeed({ state: "unavailable", reason: "unsupported" })),
+            hints: Stream.fromQueue(hints),
+            read: (launch, expected) =>
+              imported
+                ? Effect.succeed({
+                    launch,
+                    expectedCheckpoint: expected,
+                    checkpoint: { ...expected!, cursor: `cursor-${cursor}`, cut: cursor },
+                    records: [],
+                    bindings: [],
+                    more: false,
+                    summary: {
+                      launch,
+                      execution: "completed",
+                      result: "available",
+                      capture: "closed",
+                      availability: "ready",
+                      gaps: [],
+                    },
+                  })
+                : Effect.die("not ready to replay"),
+          }),
+        }),
+      ),
     );
-    cursor = 2;
-    yield* Queue.offer(hints, undefined);
-    yield* Fiber.join(committed);
-    const subscription = yield* fixture.runtime.subscribeEvents!;
-    const replayed = yield* subscription.events.pipe(Stream.take(1), Stream.runDrain, Effect.forkScoped);
-    yield* Queue.offer((yield* Ref.get(state)).eventQueues.get(String(fixture.providerSessionId))!, {
-      type: "provider_session.updated", driver: CODEX_DRIVER, providerSession: fixture.runtime.providerSession,
-    });
-    yield* Fiber.join(replayed);
-    yield* TestClock.adjust("34 minutes");
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    yield* TestClock.adjust("1 minute");
-    assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-    nativeWorkers: () => ({ ...residencyPort(() => Effect.succeed({ state: "unavailable", reason: "unsupported" })),
-      hints: Stream.fromQueue(hints),
-      read: (launch, expected) => imported ? Effect.succeed({
-        launch, expectedCheckpoint: expected,
-        checkpoint: { ...expected!, cursor: `cursor-${cursor}`, cut: cursor }, records: [], bindings: [], more: false,
-        summary: { launch, execution: "completed", result: "available", capture: "closed", availability: "ready", gaps: [] },
-      }) : Effect.die("not ready to replay"),
-    }),
-  })));
-}));
+  }),
+);
 
-it.effect.each(["owner", "busy"] as const)("native idle removal revalidates %s after the request permit wait", (change) => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const pause = { paused: yield* Deferred.make<void>(), resume: yield* Deferred.make<void>() };
-  const flaky: FlakyReleaseWrites = { failing: yield* Ref.make<"none" | "session" | "session-and-requests">("none"), failures: yield* Queue.unbounded<void>(), pauseRequestWrites: pause };
-  let owner = residencyOwner;
-  let pending = false;
-  yield* Effect.gen(function* () {
-    const fixture = yield* openResidencySession();
-    const request = yield* makePendingRuntimeRequestEvents({
-      idAllocator: fixture.ids, threadId: fixture.threadId, providerSessionId: fixture.providerSessionId,
-      providerThread: fixture.providerThread, now: fixture.now,
-    });
-    yield* Queue.offerAll((yield* Ref.get(state)).eventQueues.get(String(fixture.providerSessionId))!, request.providerEvents);
-    yield* Deferred.await(pause.paused);
-    yield* TestClock.adjust("30 minutes"); // Native none has returned; removal is blocked on the permit.
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    if (change === "owner") {
-      owner = { ...owner, epoch: "changed-during-permit" };
-      pending = true;
-      yield* Deferred.succeed(pause.resume, undefined);
-    } else {
-      const starting = yield* startResidencyTurn(fixture).pipe(Effect.forkChild);
-      yield* TestClock.adjust("0 millis");
-      yield* Deferred.succeed(pause.resume, undefined);
-      yield* Fiber.join(starting);
-    }
-    yield* TestClock.adjust("5 hours");
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    assert.equal((yield* Ref.get(state)).closeCount, 0);
-    pending = false;
-    if (change === "busy") yield* terminalResidencyTurn(fixture, state);
-    yield* TestClock.adjust("30 minutes");
-    assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, flakyReleaseWrites: flaky,
-    nativeWorkers: () => ({ ...residencyPort(() => Effect.sync(() => ({ state: pending ? "pending" : "none" }))),
-      get owner() { return owner; } }),
-  })));
-}));
+it.effect.each(["owner", "busy"] as const)(
+  "native idle removal revalidates %s after the request permit wait",
+  (change) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const pause = { paused: yield* Deferred.make<void>(), resume: yield* Deferred.make<void>() };
+      const flaky: FlakyReleaseWrites = {
+        failing: yield* Ref.make<"none" | "session" | "session-and-requests">("none"),
+        failures: yield* Queue.unbounded<void>(),
+        pauseRequestWrites: pause,
+      };
+      let owner = residencyOwner;
+      let pending = false;
+      yield* Effect.gen(function* () {
+        const fixture = yield* openResidencySession();
+        const request = yield* makePendingRuntimeRequestEvents({
+          idAllocator: fixture.ids,
+          threadId: fixture.threadId,
+          providerSessionId: fixture.providerSessionId,
+          providerThread: fixture.providerThread,
+          now: fixture.now,
+        });
+        yield* Queue.offerAll(
+          (yield* Ref.get(state)).eventQueues.get(String(fixture.providerSessionId))!,
+          request.providerEvents,
+        );
+        yield* Deferred.await(pause.paused);
+        yield* TestClock.adjust("30 minutes"); // Native none has returned; removal is blocked on the permit.
+        assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
+        if (change === "owner") {
+          owner = { ...owner, epoch: "changed-during-permit" };
+          pending = true;
+          yield* Deferred.succeed(pause.resume, undefined);
+        } else {
+          const starting = yield* startResidencyTurn(fixture).pipe(Effect.forkChild);
+          yield* TestClock.adjust("0 millis");
+          yield* Deferred.succeed(pause.resume, undefined);
+          yield* Fiber.join(starting);
+        }
+        yield* TestClock.adjust("5 hours");
+        assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+        pending = false;
+        if (change === "busy") yield* terminalResidencyTurn(fixture, state);
+        yield* TestClock.adjust("30 minutes");
+        assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            flakyReleaseWrites: flaky,
+            nativeWorkers: () => ({
+              ...residencyPort(() => Effect.sync(() => ({ state: pending ? "pending" : "none" }))),
+              get owner() {
+                return owner;
+              },
+            }),
+          }),
+        ),
+      );
+    }),
+);
 
 it.effect.each(["sync", "async held followup"] as const)(
-  "native idle activity cancels permit-wait release without %s reobservation", (reader) => Effect.gen(function* () {
+  "native idle activity cancels permit-wait release without %s reobservation",
+  (reader) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const pause = { paused: yield* Deferred.make<void>(), resume: yield* Deferred.make<void>() };
+      const flaky: FlakyReleaseWrites = {
+        failing: yield* Ref.make<"none" | "session" | "session-and-requests">("none"),
+        failures: yield* Queue.unbounded<void>(),
+        pauseRequestWrites: pause,
+      };
+      let calls = 0;
+      let successorArmed = false;
+      yield* Effect.gen(function* () {
+        const fixture = yield* openResidencySession();
+        const { manager, providerSessionId } = fixture;
+        const request = yield* makePendingRuntimeRequestEvents({
+          idAllocator: fixture.ids,
+          threadId: fixture.threadId,
+          providerSessionId,
+          providerThread: fixture.providerThread,
+          now: fixture.now,
+        });
+        // Only enqueue the request: later item events would trigger another cancellation.
+        yield* Queue.offer(
+          (yield* Ref.get(state)).eventQueues.get(String(providerSessionId))!,
+          request.providerEvents[0]!,
+        );
+        yield* Deferred.await(pause.paused);
+        yield* TestClock.adjust("30 minutes");
+        assert.equal(
+          calls,
+          1,
+          "native none has completed and removal is waiting for the request permit",
+        );
+        // get is idle activity, not markBusy: it must join the interrupted cycle
+        // before publishing its successor. Let that join start while the permit is held.
+        const activity = yield* manager
+          .get(providerSessionId)
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* TestClock.adjust("0 millis");
+        yield* Deferred.succeed(pause.resume, undefined);
+        assert.isTrue(
+          Option.isSome(yield* Fiber.join(activity)),
+          "idle activity must finish its cancellation join",
+        );
+        assert.equal(calls, 1, "the cancelled cycle must not read again or change the native pin");
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+        assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
+        successorArmed = true;
+        yield* TestClock.adjust("29 minutes");
+        assert.equal(calls, 1);
+        yield* TestClock.adjust("1 minute");
+        assert.equal(calls, 2, "the successor idle cycle still owns its evaluation");
+        assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            flakyReleaseWrites: flaky,
+            // Keep the empty committed-membership source synchronous so it cannot
+            // accidentally terminate the interrupted fiber before the native reader.
+            nativeMembership: () => Effect.succeed([]),
+            nativeWorkers: () =>
+              residencyPort(() =>
+                Effect.suspend(() => {
+                  calls += 1;
+                  return reader === "async held followup" && calls > 1 && !successorArmed
+                    ? Effect.promise(
+                        () => new Promise<ProviderAdapter.ProviderBackgroundPending>(() => {}),
+                      )
+                    : Effect.succeed({ state: "none" } as const);
+                }),
+              ),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["pending", "none", "unavailable"] as const)(
+  "native unload discards late %s across owner change",
+  (late) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let owner = residencyOwner;
+      let pending = true;
+      let first = true;
+      yield* Effect.gen(function* () {
+        const a = yield* openResidencySession();
+        const busy = yield* attachResidencySibling(a, "busy-sibling");
+        yield* startResidencyTurn(a);
+        yield* startResidencyTurn(busy);
+        yield* terminalResidencyTurn(a, state);
+        yield* TestClock.adjust("30 minutes");
+        yield* Deferred.await(entered);
+        owner = { ...owner, coordinatorSessionId: "changed-coordinator" };
+        yield* Deferred.succeed(resume, undefined);
+        yield* TestClock.adjust("5 hours");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        pending = false;
+        yield* TestClock.adjust("30 minutes");
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-thread"]);
+        assert.isTrue(Option.isSome(yield* a.manager.getResident(a.providerSessionId)));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            nativeWorkers: () => ({
+              ...residencyPort(() =>
+                Effect.gen(function* () {
+                  if (!first) return { state: pending ? "pending" : "none" } as const;
+                  first = false;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(resume);
+                  return late === "unavailable"
+                    ? ({ state: late, reason: "unsupported" } as const)
+                    : { state: late };
+                }),
+              ),
+              get owner() {
+                return owner;
+              },
+            }),
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["pending", "none", "unavailable"] as const)(
+  "native unload ignores late %s from a replaced runtime",
+  (late) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let opens = 0;
+      yield* Effect.gen(function* () {
+        const a = yield* openResidencySession();
+        const busy = yield* attachResidencySibling(a, "busy-sibling");
+        yield* startResidencyTurn(a);
+        yield* startResidencyTurn(busy);
+        yield* terminalResidencyTurn(a, state);
+        yield* TestClock.adjust("30 minutes");
+        yield* Deferred.await(entered);
+        const closing = yield* a.manager.close(a.providerSessionId).pipe(Effect.forkChild);
+        yield* TestClock.adjust("0 millis");
+        assert.isTrue(Option.isNone(yield* a.manager.getResident(a.providerSessionId)));
+        yield* a.manager.open({
+          threadId: a.threadId,
+          providerSessionId: a.providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* Deferred.succeed(resume, undefined);
+        yield* Fiber.join(closing);
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+        assert.isTrue(Option.isSome(yield* a.manager.getResident(a.providerSessionId)));
+        yield* TestClock.adjust("30 minutes");
+        assert.isTrue(Option.isNone(yield* a.manager.getResident(a.providerSessionId)));
+        assert.equal((yield* Ref.get(state)).closeCount, 2);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 30 * 60_000,
+            nativeWorkers: () => {
+              const generation = ++opens;
+              return residencyPort(() =>
+                generation === 1
+                  ? Effect.uninterruptible(
+                      Effect.gen(function* () {
+                        yield* Deferred.succeed(entered, undefined);
+                        yield* Deferred.await(resume);
+                        return late === "unavailable"
+                          ? ({ state: late, reason: "unsupported" } as const)
+                          : { state: late };
+                      }),
+                    )
+                  : Effect.succeed({ state: "none" }),
+              );
+            },
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect("native source interruption is cancellation, not a successful unknown pin", () =>
+  Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
-    const pause = { paused: yield* Deferred.make<void>(), resume: yield* Deferred.make<void>() };
-    const flaky: FlakyReleaseWrites = {
-      failing: yield* Ref.make<"none" | "session" | "session-and-requests">("none"),
-      failures: yield* Queue.unbounded<void>(), pauseRequestWrites: pause,
-    };
+    const interrupted = yield* Deferred.make<void>();
     let calls = 0;
-    let successorArmed = false;
     yield* Effect.gen(function* () {
       const fixture = yield* openResidencySession();
-      const { manager, providerSessionId } = fixture;
-      const request = yield* makePendingRuntimeRequestEvents({
-        idAllocator: fixture.ids, threadId: fixture.threadId, providerSessionId,
-        providerThread: fixture.providerThread, now: fixture.now,
-      });
-      // Only enqueue the request: later item events would trigger another cancellation.
-      yield* Queue.offer((yield* Ref.get(state)).eventQueues.get(String(providerSessionId))!, request.providerEvents[0]!);
-      yield* Deferred.await(pause.paused);
       yield* TestClock.adjust("30 minutes");
-      assert.equal(calls, 1, "native none has completed and removal is waiting for the request permit");
-      // get is idle activity, not markBusy: it must join the interrupted cycle
-      // before publishing its successor. Let that join start while the permit is held.
-      const activity = yield* manager.get(providerSessionId).pipe(Effect.forkChild({ startImmediately: true }));
-      yield* TestClock.adjust("0 millis");
-      yield* Deferred.succeed(pause.resume, undefined);
-      assert.isTrue(Option.isSome(yield* Fiber.join(activity)), "idle activity must finish its cancellation join");
-      assert.equal(calls, 1, "the cancelled cycle must not read again or change the native pin");
-      assert.equal((yield* Ref.get(state)).closeCount, 0);
-      assert.isTrue(Option.isSome(yield* manager.getResident(providerSessionId)));
-      successorArmed = true;
-      yield* TestClock.adjust("29 minutes");
-      assert.equal(calls, 1);
+      yield* Deferred.await(interrupted);
+      yield* TestClock.adjust("5 hours");
+      assert.equal(
+        calls,
+        1,
+        "interruption cancels the evaluation rather than rearming uncertainty",
+      );
+      assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
+      yield* startResidencyTurn(fixture);
+      yield* terminalResidencyTurn(fixture, state);
+      yield* TestClock.adjust("30 minutes");
+      yield* TestClock.adjust("64 minutes");
+      assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
       yield* TestClock.adjust("1 minute");
-      assert.equal(calls, 2, "the successor idle cycle still owns its evaluation");
-      assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
-      assert.equal((yield* Ref.get(state)).closeCount, 1);
-    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, flakyReleaseWrites: flaky,
-      // Keep the empty committed-membership source synchronous so it cannot
-      // accidentally terminate the interrupted fiber before the native reader.
-      nativeMembership: () => Effect.succeed([]),
-      nativeWorkers: () => residencyPort(() => Effect.suspend(() => {
-        calls += 1;
-        return reader === "async held followup" && calls > 1 && !successorArmed
-          ? Effect.promise(() => new Promise<ProviderAdapter.ProviderBackgroundPending>(() => {}))
-          : Effect.succeed({ state: "none" } as const);
-      })),
-    })));
+      assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 30 * 60_000,
+          maxIdlePinMs: 65 * 60_000,
+          nativeWorkers: () =>
+            residencyPort(() =>
+              Effect.gen(function* () {
+                calls += 1;
+                if (calls === 1) {
+                  yield* Deferred.succeed(interrupted, undefined);
+                  return yield* Effect.interrupt;
+                }
+                return { state: "unavailable", reason: "unsupported" } as const;
+              }),
+            ),
+        }),
+      ),
+    );
   }),
 );
 
-it.effect.each(["pending", "none", "unavailable"] as const)("native unload discards late %s across owner change", (late) => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const entered = yield* Deferred.make<void>();
-  const resume = yield* Deferred.make<void>();
-  let owner = residencyOwner;
-  let pending = true;
-  let first = true;
-  yield* Effect.gen(function* () {
-    const a = yield* openResidencySession();
-    const busy = yield* attachResidencySibling(a, "busy-sibling");
-    yield* startResidencyTurn(a);
-    yield* startResidencyTurn(busy);
-    yield* terminalResidencyTurn(a, state);
-    yield* TestClock.adjust("30 minutes");
-    yield* Deferred.await(entered);
-    owner = { ...owner, coordinatorSessionId: "changed-coordinator" };
-    yield* Deferred.succeed(resume, undefined);
-    yield* TestClock.adjust("5 hours");
-    assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
-    pending = false;
-    yield* TestClock.adjust("30 minutes");
-    assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-thread"]);
-    assert.isTrue(Option.isSome(yield* a.manager.getResident(a.providerSessionId)));
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000,
-    nativeWorkers: () => ({ ...residencyPort(() => Effect.gen(function* () {
-      if (!first) return { state: pending ? "pending" : "none" } as const;
-      first = false;
-      yield* Deferred.succeed(entered, undefined);
-      yield* Deferred.await(resume);
-      return late === "unavailable" ? { state: late, reason: "unsupported" } as const : { state: late };
-    })), get owner() { return owner; } }),
-  })));
-}));
-
-it.effect.each(["pending", "none", "unavailable"] as const)("native unload ignores late %s from a replaced runtime", (late) => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const entered = yield* Deferred.make<void>();
-  const resume = yield* Deferred.make<void>();
-  let opens = 0;
-  yield* Effect.gen(function* () {
-    const a = yield* openResidencySession();
-    const busy = yield* attachResidencySibling(a, "busy-sibling");
-    yield* startResidencyTurn(a);
-    yield* startResidencyTurn(busy);
-    yield* terminalResidencyTurn(a, state);
-    yield* TestClock.adjust("30 minutes");
-    yield* Deferred.await(entered);
-    const closing = yield* a.manager.close(a.providerSessionId).pipe(Effect.forkChild);
-    yield* TestClock.adjust("0 millis");
-    assert.isTrue(Option.isNone(yield* a.manager.getResident(a.providerSessionId)));
-    yield* a.manager.open({ threadId: a.threadId, providerSessionId: a.providerSessionId, modelSelection, runtimePolicy });
-    yield* Deferred.succeed(resume, undefined);
-    yield* Fiber.join(closing);
-    assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
-    assert.isTrue(Option.isSome(yield* a.manager.getResident(a.providerSessionId)));
-    yield* TestClock.adjust("30 minutes");
-    assert.isTrue(Option.isNone(yield* a.manager.getResident(a.providerSessionId)));
-    assert.equal((yield* Ref.get(state)).closeCount, 2);
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000,
-    nativeWorkers: () => {
-      const generation = ++opens;
-      return residencyPort(() => generation === 1 ? Effect.uninterruptible(Effect.gen(function* () {
-        yield* Deferred.succeed(entered, undefined);
-        yield* Deferred.await(resume);
-        return late === "unavailable" ? { state: late, reason: "unsupported" } as const : { state: late };
-      })) : Effect.succeed({ state: "none" }));
-    },
-  })));
-}));
-
-it.effect("native source interruption is cancellation, not a successful unknown pin", () => Effect.gen(function* () {
-  const state = yield* Ref.make(emptyState);
-  const interrupted = yield* Deferred.make<void>();
-  let calls = 0;
-  yield* Effect.gen(function* () {
-    const fixture = yield* openResidencySession();
-    yield* TestClock.adjust("30 minutes");
-    yield* Deferred.await(interrupted);
-    yield* TestClock.adjust("5 hours");
-    assert.equal(calls, 1, "interruption cancels the evaluation rather than rearming uncertainty");
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    yield* startResidencyTurn(fixture);
-    yield* terminalResidencyTurn(fixture, state);
-    yield* TestClock.adjust("30 minutes");
-    yield* TestClock.adjust("64 minutes");
-    assert.isTrue(Option.isSome(yield* fixture.manager.getResident(fixture.providerSessionId)));
-    yield* TestClock.adjust("1 minute");
-    assert.isTrue(Option.isNone(yield* fixture.manager.getResident(fixture.providerSessionId)));
-  }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 65 * 60_000,
-    nativeWorkers: () => residencyPort(() => Effect.gen(function* () {
-      calls += 1;
-      if (calls === 1) { yield* Deferred.succeed(interrupted, undefined); return yield* Effect.interrupt; }
-      return { state: "unavailable", reason: "unsupported" } as const;
-    })),
-  })));
-}));
-
-it.effect.each(["silent", "ordinary replay", "result renewal", "retirement retry", "retirement CAS", "closed capture",
-  "timed-out close", "replacement owner", "unavailable peer"] as const)(
-  "imports committed membership: %s", (scenario) =>
+it.effect.each([
+  "silent",
+  "ordinary replay",
+  "result renewal",
+  "retirement retry",
+  "retirement CAS",
+  "closed capture",
+  "timed-out close",
+  "replacement owner",
+  "unavailable peer",
+] as const)("imports committed membership: %s", (scenario) =>
   Effect.gen(function* () {
     const renew = scenario === "result renewal";
     const replacementOwner = scenario === "replacement owner";
-    const failRetirement = scenario === "retirement retry" || scenario === "retirement CAS" || replacementOwner;
+    const failRetirement =
+      scenario === "retirement retry" || scenario === "retirement CAS" || replacementOwner;
     const closeCapture = scenario === "closed capture";
     const hangClose = scenario === "timed-out close";
     const state = yield* Ref.make(emptyState);
     const hints = yield* Queue.unbounded<void>();
-    const providerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
+    const providerEvents = yield* Queue.unbounded<
+      ProviderAdapter.ProviderAdapterV2Event,
+      Cause.Done
+    >();
     const reads = yield* Ref.make(0);
     const ordinaryPending = yield* Ref.make(false);
     const residencyFailure = yield* Ref.make<"none" | "membership" | "checkpoint">("none");
-    const backgroundPending = yield* Ref.make<ProviderAdapter.ProviderBackgroundPending>({ state: "none" });
-    const owner = { processId: "native-process", coordinatorSessionId: "native-coordinator", epoch: "epoch-1" };
+    const backgroundPending = yield* Ref.make<ProviderAdapter.ProviderBackgroundPending>({
+      state: "none",
+    });
+    const owner = {
+      processId: "native-process",
+      coordinatorSessionId: "native-coordinator",
+      epoch: "epoch-1",
+    };
     let currentOwner = owner;
     let ready = true;
     let resultText = "public result only";
@@ -1487,36 +2560,86 @@ it.effect.each(["silent", "ordinary replay", "result renewal", "retirement retry
     const nativeWorkers = (): ProviderAdapter.ProviderNativeWorkersPort => {
       const sessionOwner = currentOwner;
       return {
-      get owner() { return ready ? sessionOwner : undefined; }, ownerGeneration: 1, hints: Stream.fromQueue(hints),
-      reconcile: (launch) => Effect.succeed({
-        launch, execution: "accepted", result: "pending", capture: "opening", availability: "ready", gaps: [],
-      }),
-      readBackgroundPending: () => Ref.get(backgroundPending),
-      hasPendingWork: (launches) => Ref.get(cut).pipe(
-        Effect.map((sequence) => launches.length > 0 && !(closeCapture && sequence >= 2))),
-      read: (launch, expected) => Effect.gen(function* () {
-        if (launch.instanceId === failedWorker) return yield* new NativeSourceUnavailable();
-        assert.isDefined(expected);
-        yield* Ref.update(reads, (count) => count + 1);
-        const sequence = yield* Ref.get(cut);
-        const capture = closeCapture && sequence >= 2 ? "closed" as const : "open" as const;
-        const bindings: PiNativeWorkerCheckpoint["bindings"] = [{
-          generation: 1, historyId: "history", sessionId: "worker-session", state: "active",
-          headEntryId: null, capture, attemptIds: [], attempts: [], gaps: [],
-        }];
-        return {
-          launch, expectedCheckpoint: expected,
-          checkpoint: { ...expected!, launch, owner: sessionOwner, ownerGeneration: 1,
-            captureEpoch: "capture-epoch", bindings, bindingGeneration: 1,
-            bindingCursors: closeCapture ? [{ generation: 1, cursor: `cursor-${sequence}`, cut: sequence, recovery: false, more: false }] : [],
-            cursor: `cursor-${sequence}`, cut: sequence, capture,
-            finalSequence: capture === "closed" ? sequence : null },
-          summary: { launch, execution: "completed" as const, result: "available" as const,
-            capture, availability: "ready" as const, gaps: [] },
-          records: [], bindings, more: false,
-          result: { status: "completed", text: resultText, complete: true },
-        };
-      }),
+        get owner() {
+          return ready ? sessionOwner : undefined;
+        },
+        ownerGeneration: 1,
+        hints: Stream.fromQueue(hints),
+        reconcile: (launch) =>
+          Effect.succeed({
+            launch,
+            execution: "accepted",
+            result: "pending",
+            capture: "opening",
+            availability: "ready",
+            gaps: [],
+          }),
+        readBackgroundPending: () => Ref.get(backgroundPending),
+        hasPendingWork: (launches) =>
+          Ref.get(cut).pipe(
+            Effect.map((sequence) => launches.length > 0 && !(closeCapture && sequence >= 2)),
+          ),
+        read: (launch, expected) =>
+          Effect.gen(function* () {
+            if (launch.instanceId === failedWorker) return yield* new NativeSourceUnavailable();
+            assert.isDefined(expected);
+            yield* Ref.update(reads, (count) => count + 1);
+            const sequence = yield* Ref.get(cut);
+            const capture = closeCapture && sequence >= 2 ? ("closed" as const) : ("open" as const);
+            const bindings: PiNativeWorkerCheckpoint["bindings"] = [
+              {
+                generation: 1,
+                historyId: "history",
+                sessionId: "worker-session",
+                state: "active",
+                headEntryId: null,
+                capture,
+                attemptIds: [],
+                attempts: [],
+                gaps: [],
+              },
+            ];
+            return {
+              launch,
+              expectedCheckpoint: expected,
+              checkpoint: {
+                ...expected!,
+                launch,
+                owner: sessionOwner,
+                ownerGeneration: 1,
+                captureEpoch: "capture-epoch",
+                bindings,
+                bindingGeneration: 1,
+                bindingCursors: closeCapture
+                  ? [
+                      {
+                        generation: 1,
+                        cursor: `cursor-${sequence}`,
+                        cut: sequence,
+                        recovery: false,
+                        more: false,
+                      },
+                    ]
+                  : [],
+                cursor: `cursor-${sequence}`,
+                cut: sequence,
+                capture,
+                finalSequence: capture === "closed" ? sequence : null,
+              },
+              summary: {
+                launch,
+                execution: "completed" as const,
+                result: "available" as const,
+                capture,
+                availability: "ready" as const,
+                gaps: [],
+              },
+              records: [],
+              bindings,
+              more: false,
+              result: { status: "completed", text: resultText, complete: true },
+            };
+          }),
       };
     };
     yield* Effect.gen(function* () {
@@ -1528,79 +2651,191 @@ it.effect.each(["silent", "ordinary replay", "result renewal", "retirement retry
       const now = yield* DateTime.now;
       const threadId = ThreadId.make("native-manager-parent");
       const providerSessionId = yield* ids.allocate.providerSession({
-        threadId, providerInstanceId: modelSelection.instanceId,
+        threadId,
+        providerInstanceId: modelSelection.instanceId,
       });
-      yield* sink.write({ events: [yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now })] });
-      const runtime = yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+      yield* sink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now })],
+      });
+      const runtime = yield* manager.open({
+        threadId,
+        providerSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
       assert.equal(yield* Ref.get(reads), 0);
       assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
-      const providerThread = makeProviderThread({ idAllocator: ids, threadId, providerSessionId, now });
+      const providerThread = makeProviderThread({
+        idAllocator: ids,
+        threadId,
+        providerSessionId,
+        now,
+      });
       yield* Ref.set(ordinaryPending, true);
       assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
       assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(providerThread));
       yield* Ref.set(ordinaryPending, false);
       const launch: PiNativeWorkerLaunch = {
-        source: "agent_spawn", instanceId: "worker", providerInstanceId: modelSelection.instanceId,
-        providerSessionId, parentThreadId: threadId, parentProviderThreadId: providerThread.id,
+        source: "agent_spawn",
+        instanceId: "worker",
+        providerInstanceId: modelSelection.instanceId,
+        providerSessionId,
+        parentThreadId: threadId,
+        parentProviderThreadId: providerThread.id,
         parentProviderTurnId: ProviderTurnId.make("native-manager-turn"),
-        runId: RunId.make("native-manager-run"), runAttemptId: RunAttemptId.make("native-manager-attempt"),
-        toolNodeId: NodeId.make("native-manager-tool"), coordinatorSessionId: owner.coordinatorSessionId,
+        runId: RunId.make("native-manager-run"),
+        runAttemptId: RunAttemptId.make("native-manager-attempt"),
+        toolNodeId: NodeId.make("native-manager-tool"),
+        coordinatorSessionId: owner.coordinatorSessionId,
         toolCallId: "spawn-call",
       };
-      yield* sink.write({ events: [{
-        id: yield* ids.allocate.event({ threadId }), type: "run.created", threadId, occurredAt: now,
-        payload: { id: launch.runId, threadId, ordinal: 1, providerInstanceId: modelSelection.instanceId,
-          modelSelection, providerThreadId: providerThread.id,
-          userMessageId: MessageId.make("native-manager-message"), rootNodeId: NodeId.make("native-manager-root"),
-          activeAttemptId: launch.runAttemptId, status: "running", requestedAt: now, startedAt: now,
-          completedAt: null, checkpointId: null, contextHandoffId: null },
-      }] });
+      yield* sink.write({
+        events: [
+          {
+            id: yield* ids.allocate.event({ threadId }),
+            type: "run.created",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: launch.runId,
+              threadId,
+              ordinal: 1,
+              providerInstanceId: modelSelection.instanceId,
+              modelSelection,
+              providerThreadId: providerThread.id,
+              userMessageId: MessageId.make("native-manager-message"),
+              rootNodeId: NodeId.make("native-manager-root"),
+              activeAttemptId: launch.runAttemptId,
+              status: "running",
+              requestedAt: now,
+              startedAt: now,
+              completedAt: null,
+              checkpointId: null,
+              contextHandoffId: null,
+            },
+          },
+        ],
+      });
       const checkpoint: PiNativeWorkerCheckpoint = {
-        launch, owner, ownerGeneration: 1, captureEpoch: null, bindings: [], bindingGeneration: null,
-        bindingCursors: [], cursor: null, cut: 0, recovery: false, capture: "opening", finalSequence: null, gaps: [],
+        launch,
+        owner,
+        ownerGeneration: 1,
+        captureEpoch: null,
+        bindings: [],
+        bindingGeneration: null,
+        bindingCursors: [],
+        cursor: null,
+        cut: 0,
+        recovery: false,
+        capture: "opening",
+        finalSequence: null,
+        gaps: [],
       };
       const summary: PiNativeWorkerSummary = {
-        launch, execution: "accepted", result: "pending", capture: "opening", availability: "ready", gaps: [],
+        launch,
+        execution: "accepted",
+        result: "pending",
+        capture: "opening",
+        availability: "ready",
+        gaps: [],
       };
       const imported = yield* sink.stream({ eventType: "provider-thread.updated" }).pipe(
-        Stream.filter((stored) => stored.event.type === "provider-thread.updated" &&
-          stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.cut === 1),
-        Stream.take(1), Stream.runDrain, Effect.forkScoped,
+        Stream.filter(
+          (stored) =>
+            stored.event.type === "provider-thread.updated" &&
+            stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.cut === 1,
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
       );
       yield* ingestor.ingestNormalized({
-        providerSessionId, providerInstanceId: modelSelection.instanceId, threadId,
-        event: { type: "turn_item.updated", driver: ProviderDriverKind.make("pi"), turnItem: {
-          id: TurnItemId.make("native-manager-launch"), threadId, runId: launch.runId, nodeId: launch.toolNodeId,
-          providerThreadId: providerThread.id, providerTurnId: launch.parentProviderTurnId, nativeItemRef: null,
-          parentItemId: null, ordinal: 1, status: "completed", title: null, startedAt: now,
-          completedAt: now, updatedAt: now, type: "dynamic_tool", toolName: "agent_spawn",
-          input: {}, output: {}, nativeWorkerLaunch: launch,
-        } }, nativeWorkerAdmission: { summary, checkpoint },
+        providerSessionId,
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+        event: {
+          type: "turn_item.updated",
+          driver: ProviderDriverKind.make("pi"),
+          turnItem: {
+            id: TurnItemId.make("native-manager-launch"),
+            threadId,
+            runId: launch.runId,
+            nodeId: launch.toolNodeId,
+            providerThreadId: providerThread.id,
+            providerTurnId: launch.parentProviderTurnId,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "completed",
+            title: null,
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "dynamic_tool",
+            toolName: "agent_spawn",
+            input: {},
+            output: {},
+            nativeWorkerLaunch: launch,
+          },
+        },
+        nativeWorkerAdmission: { summary, checkpoint },
       });
       yield* Fiber.join(imported);
       let member = (yield* sink.nativeWorkers(providerSessionId))[0]!;
       const child = yield* projections.getThreadProjection(member.childThreadId!);
       assert.equal(child.messages.length, 0); // Public result never fabricates transcript text.
-      assert.equal(child.providerThreads[0]?.nativeMetadata?.nativeWorkerCheckpoint?.capture, "open");
+      assert.equal(
+        child.providerThreads[0]?.nativeMetadata?.nativeWorkerCheckpoint?.capture,
+        "open",
+      );
       assert.equal((yield* sink.nativeWorkers(providerSessionId))[0]?.result, "public result only");
       assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
-      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!({
-        ...providerThread, id: ids.derive.providerThread({ driver: CODEX_DRIVER, nativeThreadId: "unrelated" }),
-      }));
+      assert.isFalse(
+        yield* runtime.hasPendingBackgroundWorkForThread!({
+          ...providerThread,
+          id: ids.derive.providerThread({ driver: CODEX_DRIVER, nativeThreadId: "unrelated" }),
+        }),
+      );
       if (scenario === "unavailable peer") {
-        const peerLaunch = { ...launch, instanceId: "peer-worker", toolNodeId: NodeId.make("peer-tool"),
-          toolCallId: "peer-spawn-call" };
+        const peerLaunch = {
+          ...launch,
+          instanceId: "peer-worker",
+          toolNodeId: NodeId.make("peer-tool"),
+          toolCallId: "peer-spawn-call",
+        };
         yield* ingestor.ingestNormalized({
-          providerSessionId, providerInstanceId: modelSelection.instanceId, threadId,
-          event: { type: "turn_item.updated", driver: ProviderDriverKind.make("pi"), turnItem: {
-            id: TurnItemId.make("peer-launch"), threadId, runId: launch.runId, nodeId: peerLaunch.toolNodeId,
-            providerThreadId: providerThread.id, providerTurnId: launch.parentProviderTurnId,
-            nativeItemRef: null, parentItemId: null, ordinal: 2, status: "completed",
-            title: null, startedAt: now, completedAt: now, updatedAt: now,
-            type: "dynamic_tool", toolName: "agent_spawn", input: {}, output: {},
-            nativeWorkerLaunch: peerLaunch,
-          } }, nativeWorkerAdmission: { summary: { ...summary, launch: peerLaunch },
-            checkpoint: { ...checkpoint, launch: peerLaunch } },
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+          event: {
+            type: "turn_item.updated",
+            driver: ProviderDriverKind.make("pi"),
+            turnItem: {
+              id: TurnItemId.make("peer-launch"),
+              threadId,
+              runId: launch.runId,
+              nodeId: peerLaunch.toolNodeId,
+              providerThreadId: providerThread.id,
+              providerTurnId: launch.parentProviderTurnId,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 2,
+              status: "completed",
+              title: null,
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              type: "dynamic_tool",
+              toolName: "agent_spawn",
+              input: {},
+              output: {},
+              nativeWorkerLaunch: peerLaunch,
+            },
+          },
+          nativeWorkerAdmission: {
+            summary: { ...summary, launch: peerLaunch },
+            checkpoint: { ...checkpoint, launch: peerLaunch },
+          },
         });
         const members = yield* sink.nativeWorkers(providerSessionId);
         assert.lengthOf(members, 2);
@@ -1609,16 +2844,26 @@ it.effect.each(["silent", "ordinary replay", "result renewal", "retirement retry
         member = members[1]!;
       }
       const released = yield* sink.stream({ eventType: "provider-thread.updated" }).pipe(
-        Stream.filter((stored) => stored.event.type === "provider-thread.updated" &&
-          stored.event.threadId === member.childThreadId &&
-          stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.ownerGeneration === 2),
-        Stream.take(1), Stream.runDrain, Effect.forkScoped,
+        Stream.filter(
+          (stored) =>
+            stored.event.type === "provider-thread.updated" &&
+            stored.event.threadId === member.childThreadId &&
+            stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.ownerGeneration === 2,
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
       );
       yield* TestClock.adjust("30 minutes"); // Open committed capture protects residency.
       const cursorCommitted = yield* sink.stream({ eventType: "provider-thread.updated" }).pipe(
-        Stream.filter((stored) => stored.event.type === "provider-thread.updated" &&
-          stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.cut === 2),
-        Stream.take(1), Stream.runDrain, Effect.forkScoped,
+        Stream.filter(
+          (stored) =>
+            stored.event.type === "provider-thread.updated" &&
+            stored.event.payload.nativeMetadata?.nativeWorkerCheckpoint?.cut === 2,
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+        Effect.forkScoped,
       );
       yield* Ref.set(cut, 2);
       yield* Queue.offer(hints, undefined); // Cursor-only progress must not renew.
@@ -1628,10 +2873,14 @@ it.effect.each(["silent", "ordinary replay", "result renewal", "retirement retry
         const subscription = yield* runtime.subscribeEvents!;
         const replayed = yield* subscription.events.pipe(
           Stream.filter((event) => event.type === "provider_session.updated"),
-          Stream.take(1), Stream.runDrain, Effect.forkScoped,
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
         );
         yield* Queue.offer(providerEvents, {
-          type: "provider_session.updated", driver: CODEX_DRIVER, providerSession: runtime.providerSession,
+          type: "provider_session.updated",
+          driver: CODEX_DRIVER,
+          providerSession: runtime.providerSession,
         });
         yield* Fiber.join(replayed);
       }
@@ -1646,9 +2895,14 @@ it.effect.each(["silent", "ordinary replay", "result renewal", "retirement retry
         yield* TestClock.adjust("2 hours");
         yield* Ref.set(residencyFailure, "none");
         const resultCommitted = yield* sink.stream({ eventType: "subagent.updated" }).pipe(
-          Stream.filter((stored) => stored.event.type === "subagent.updated" &&
-            stored.event.payload.result === "new committed result"),
-          Stream.take(1), Stream.runDrain, Effect.forkScoped,
+          Stream.filter(
+            (stored) =>
+              stored.event.type === "subagent.updated" &&
+              stored.event.payload.result === "new committed result",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
         );
         resultText = "new committed result";
         yield* Ref.set(cut, 3);
@@ -1677,27 +2931,55 @@ it.effect.each(["silent", "ordinary replay", "result renewal", "retirement retry
           currentOwner = { ...owner, epoch: "epoch-replacement" };
           ready = true;
           yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
-          const newLaunch = { ...launch, instanceId: "new-worker", toolNodeId: NodeId.make("new-tool"),
-            toolCallId: "new-spawn-call" };
+          const newLaunch = {
+            ...launch,
+            instanceId: "new-worker",
+            toolNodeId: NodeId.make("new-tool"),
+            toolCallId: "new-spawn-call",
+          };
           yield* ingestor.ingestNormalized({
-            providerSessionId, providerInstanceId: modelSelection.instanceId, threadId,
-            event: { type: "turn_item.updated", driver: ProviderDriverKind.make("pi"), turnItem: {
-              id: TurnItemId.make("replacement-launch"), threadId, runId: launch.runId,
-              nodeId: newLaunch.toolNodeId, providerThreadId: providerThread.id,
-              providerTurnId: launch.parentProviderTurnId, nativeItemRef: null, parentItemId: null,
-              ordinal: 2, status: "completed", title: null, startedAt: now, completedAt: now, updatedAt: now,
-              type: "dynamic_tool", toolName: "agent_spawn", input: {}, output: {},
-              nativeWorkerLaunch: newLaunch,
-            } },
-            nativeWorkerAdmission: { summary: { ...summary, launch: newLaunch },
-              checkpoint: { ...checkpoint, launch: newLaunch, owner: currentOwner } },
+            providerSessionId,
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+            event: {
+              type: "turn_item.updated",
+              driver: ProviderDriverKind.make("pi"),
+              turnItem: {
+                id: TurnItemId.make("replacement-launch"),
+                threadId,
+                runId: launch.runId,
+                nodeId: newLaunch.toolNodeId,
+                providerThreadId: providerThread.id,
+                providerTurnId: launch.parentProviderTurnId,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 2,
+                status: "completed",
+                title: null,
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                type: "dynamic_tool",
+                toolName: "agent_spawn",
+                input: {},
+                output: {},
+                nativeWorkerLaunch: newLaunch,
+              },
+            },
+            nativeWorkerAdmission: {
+              summary: { ...summary, launch: newLaunch },
+              checkpoint: { ...checkpoint, launch: newLaunch, owner: currentOwner },
+            },
           });
         }
         yield* TestClock.adjust("1 second");
       }
       yield* Fiber.join(released);
       assert.isUndefined(runtime.nativeWorkers?.owner);
-      assert.equal((yield* manager.getResident(providerSessionId))._tag, replacementOwner ? "Some" : "None");
+      assert.equal(
+        (yield* manager.getResident(providerSessionId))._tag,
+        replacementOwner ? "Some" : "None",
+      );
       const retired = yield* projections.getThreadProjection(member.childThreadId!);
       const finalCheckpoint = retired.providerThreads[0]!.nativeMetadata!.nativeWorkerCheckpoint!;
       assert.equal(finalCheckpoint.ownerGeneration, 2);
@@ -1706,23 +2988,47 @@ it.effect.each(["silent", "ordinary replay", "result renewal", "retirement retry
       assert.deepEqual(finalCheckpoint.gaps, closeCapture ? [] : ["stale_owner"]);
       assert.equal((yield* Ref.get(state)).closeCount, hangClose ? 0 : 1);
       if (replacementOwner) {
-        const newMember = (yield* sink.nativeWorkers(providerSessionId))
-          .find((candidate) => candidate.nativeWorker?.launch.instanceId === "new-worker")!;
+        const newMember = (yield* sink.nativeWorkers(providerSessionId)).find(
+          (candidate) => candidate.nativeWorker?.launch.instanceId === "new-worker",
+        )!;
         const newer = yield* projections.getThreadProjection(newMember.childThreadId!);
         const newerCheckpoint = newer.providerThreads[0]!.nativeMetadata!.nativeWorkerCheckpoint!;
         assert.equal(newerCheckpoint.owner.epoch, "epoch-replacement");
         assert.equal(newerCheckpoint.ownerGeneration, 1);
         assert.notEqual(newerCheckpoint.capture, "incomplete");
-        assert.equal((yield* projections.getThreadProjection(threadId)).providerSessions.at(-1)?.status, "ready");
+        assert.equal(
+          (yield* projections.getThreadProjection(threadId)).providerSessions.at(-1)?.status,
+          "ready",
+        );
       }
     }).pipe(
-      Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, maxIdlePinMs: 4 * 60 * 60_000,
-        hasPendingBackgroundWork: Ref.get(ordinaryPending), residencyFailure,
-        hasPendingBackgroundWorkForThread: Ref.get(ordinaryPending),
-        nativeWorkers, providerEvents, onScopeClose: Effect.sync(() => { ready = false; }),
-        hangSessionScopeClose: hangClose, scopeCloseReached,
-        ...(failRetirement ? { flakyReleaseWrites: { failing, failures, failNativeRetirement,
-          rejectNativeRetirement: scenario === "retirement CAS" } } : {}) })),
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 30 * 60_000,
+          maxIdlePinMs: 4 * 60 * 60_000,
+          hasPendingBackgroundWork: Ref.get(ordinaryPending),
+          residencyFailure,
+          hasPendingBackgroundWorkForThread: Ref.get(ordinaryPending),
+          nativeWorkers,
+          providerEvents,
+          onScopeClose: Effect.sync(() => {
+            ready = false;
+          }),
+          hangSessionScopeClose: hangClose,
+          scopeCloseReached,
+          ...(failRetirement
+            ? {
+                flakyReleaseWrites: {
+                  failing,
+                  failures,
+                  failNativeRetirement,
+                  rejectNativeRetirement: scenario === "retirement CAS",
+                },
+              }
+            : {}),
+        }),
+      ),
       Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
     );
   }),

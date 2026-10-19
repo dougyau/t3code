@@ -1,4 +1,9 @@
 import { OrchestrationMessageContext } from "./composerContext.ts";
+import {
+  PiArchitectureSummary,
+  PiArchitectureReadInput,
+  PiArchitectureReadResult,
+} from "./piArchitecture.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaAST from "effect/SchemaAST";
@@ -362,6 +367,7 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
 export type OrchestrationV2LimitRecoveryUpdate = typeof OrchestrationV2LimitRecoveryUpdate.Type;
 
 export const OrchestrationV2AppThread = Schema.Struct({
+  nativeTables: Schema.optional(Schema.Array(PiArchitectureSummary)),
   ...OrchestrationV2CreationFields,
   id: ThreadId,
   projectId: ProjectId,
@@ -768,12 +774,34 @@ export const PiNativeWorkerLaunch = Schema.Union([
   Schema.Struct({
     ...PiNativeWorkerToolContext.fields,
     source: Schema.Literal("team_assign"),
+    entrypoint: Schema.optional(Schema.Literal("architecture_start")),
     instanceId: TrimmedNonEmptyString,
     assignmentId: TrimmedNonEmptyString,
     roleId: TrimmedNonEmptyString,
   }),
 ]);
 export type PiNativeWorkerLaunch = typeof PiNativeWorkerLaunch.Type;
+
+/** Validated passive roster admission; never a simulated foreground tool call. */
+export const PiNativeWorkerRosterAdmission = Schema.Struct({
+  source: Schema.Literal("architecture_roster"),
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: ProviderSessionId,
+  parentThreadId: ThreadId,
+  parentProviderThreadId: ProviderThreadId,
+  parentNodeId: NodeId,
+  coordinatorSessionId: TrimmedNonEmptyString,
+  roomId: TrimmedNonEmptyString,
+  memberId: TrimmedNonEmptyString,
+  assignmentId: TrimmedNonEmptyString,
+  instanceId: TrimmedNonEmptyString,
+  roleId: TrimmedNonEmptyString,
+});
+export const PiNativeWorkerAdmission = Schema.Union([
+  PiNativeWorkerLaunch,
+  PiNativeWorkerRosterAdmission,
+]);
+export type PiNativeWorkerAdmission = typeof PiNativeWorkerAdmission.Type;
 
 export const PiNativeWorkerOwner = Schema.Struct({
   processId: TrimmedNonEmptyString,
@@ -782,9 +810,19 @@ export const PiNativeWorkerOwner = Schema.Struct({
 });
 export type PiNativeWorkerOwner = typeof PiNativeWorkerOwner.Type;
 export const PiNativeWorkerGap = Schema.Literals([
-  "pending", "not_captured", "not_persisted", "pruned", "evicted",
-  "unsupported_content", "capture_failed", "stale_owner", "resync_required",
-  "invalid_record", "record_oversized", "provenance_mismatch", "unavailable",
+  "pending",
+  "not_captured",
+  "not_persisted",
+  "pruned",
+  "evicted",
+  "unsupported_content",
+  "capture_failed",
+  "stale_owner",
+  "resync_required",
+  "invalid_record",
+  "record_oversized",
+  "provenance_mismatch",
+  "unavailable",
 ]);
 export const PiNativeWorkerTodoHead = Schema.Union([
   Schema.Struct({ state: Schema.Literal("ready"), sourceEntryId: Schema.NullOr(Schema.String) }),
@@ -796,7 +834,9 @@ export const PiNativeWorkerSelectedModel = Schema.Struct({
   reasoning: Schema.optional(Schema.String),
 });
 export const PiNativeWorkerActivatedModel = Schema.Struct({
-  attemptId: Schema.String, model: Schema.String, reasoning: Schema.String,
+  attemptId: Schema.String,
+  model: Schema.String,
+  reasoning: Schema.String,
 });
 export const PiNativeWorkerBinding = Schema.Struct({
   generation: NonNegativeInt,
@@ -806,25 +846,37 @@ export const PiNativeWorkerBinding = Schema.Struct({
   headEntryId: Schema.NullOr(Schema.String),
   capture: Schema.Literals(["open", "closed", "incomplete"]),
   attemptIds: Schema.Array(Schema.String),
-  attempts: Schema.Array(Schema.Struct({
-    attemptId: Schema.String,
-    activated: Schema.optional(Schema.Struct({ model: Schema.String, reasoning: Schema.String })),
-    selected: Schema.optional(PiNativeWorkerSelectedModel),
-  })),
+  attempts: Schema.Array(
+    Schema.Struct({
+      attemptId: Schema.String,
+      activated: Schema.optional(Schema.Struct({ model: Schema.String, reasoning: Schema.String })),
+      selected: Schema.optional(PiNativeWorkerSelectedModel),
+    }),
+  ),
   gaps: Schema.Array(PiNativeWorkerGap),
   todoHead: Schema.optional(PiNativeWorkerTodoHead),
 });
 export type PiNativeWorkerBinding = typeof PiNativeWorkerBinding.Type;
 
 export const PiNativeWorkerSummary = Schema.Struct({
-  launch: PiNativeWorkerLaunch,
+  launch: PiNativeWorkerAdmission,
   roleId: Schema.optional(Schema.String),
   acceptedAt: Schema.optional(Schema.Number),
   brief: Schema.optional(Schema.String),
   briefComplete: Schema.optional(Schema.Boolean),
+  briefSource: Schema.optional(Schema.Literals(["original WorkBrief", "invocation task"])),
+  mandate: Schema.optional(
+    Schema.Struct({
+      source: Schema.Literal("TeamAssignment.task"),
+      text: Schema.String,
+      complete: Schema.Boolean,
+    }),
+  ),
   selected: Schema.optional(PiNativeWorkerSelectedModel),
   activated: Schema.optional(Schema.NullOr(PiNativeWorkerActivatedModel)),
-  execution: Schema.optional(Schema.Literals(["accepted", "running", "completed", "failed", "cancelled"])),
+  execution: Schema.optional(
+    Schema.Literals(["accepted", "running", "completed", "failed", "cancelled"]),
+  ),
   result: Schema.optional(Schema.Literals(["pending", "available", "unavailable"])),
   capture: Schema.Literals(["opening", "open", "closed", "incomplete"]),
   availability: Schema.Literals(["ready", "unavailable", "incompatible"]),
@@ -834,26 +886,32 @@ export type PiNativeWorkerSummary = typeof PiNativeWorkerSummary.Type;
 
 /** Restart an incomplete record from its first page; never persist fragment bytes. */
 export const PiNativeWorkerFragmentRestart = Schema.Struct({
-  id: Schema.String, binding: NonNegativeInt, revision: PositiveInt,
-  epoch: Schema.String, sequence: Schema.NullOr(NonNegativeInt),
-  totalBytes: PositiveInt, cursor: Schema.NullOr(Schema.String),
+  id: Schema.String,
+  binding: NonNegativeInt,
+  revision: PositiveInt,
+  epoch: Schema.String,
+  sequence: Schema.NullOr(NonNegativeInt),
+  totalBytes: PositiveInt,
+  cursor: Schema.NullOr(Schema.String),
 });
 export const PiNativeWorkerCheckpoint = Schema.Struct({
-  launch: PiNativeWorkerLaunch,
+  launch: PiNativeWorkerAdmission,
   owner: PiNativeWorkerOwner,
   ownerGeneration: NonNegativeInt,
   captureEpoch: Schema.NullOr(Schema.String),
   bindings: Schema.Array(PiNativeWorkerBinding),
   bindingGeneration: Schema.NullOr(NonNegativeInt),
-  bindingCursors: Schema.Array(Schema.Struct({
-    generation: NonNegativeInt,
-    cursor: Schema.NullOr(Schema.String),
-    cut: NonNegativeInt,
-    recovery: Schema.Boolean,
-    more: Schema.Boolean,
-    omission: Schema.optional(Schema.Literals(["invalid_record", "record_oversized"])),
-    fragment: Schema.optional(PiNativeWorkerFragmentRestart),
-  })),
+  bindingCursors: Schema.Array(
+    Schema.Struct({
+      generation: NonNegativeInt,
+      cursor: Schema.NullOr(Schema.String),
+      cut: NonNegativeInt,
+      recovery: Schema.Boolean,
+      more: Schema.Boolean,
+      omission: Schema.optional(Schema.Literals(["invalid_record", "record_oversized"])),
+      fragment: Schema.optional(PiNativeWorkerFragmentRestart),
+    }),
+  ),
   cursor: Schema.NullOr(Schema.String),
   cut: NonNegativeInt,
   recovery: Schema.Boolean,
@@ -868,53 +926,77 @@ export const PiNativeWorkerRecordProvenance = Schema.Struct({
   instanceId: Schema.String,
   owner: PiNativeWorkerOwner,
   captureEpoch: Schema.String,
-  id: Schema.String, binding: NonNegativeInt, revision: PositiveInt,
+  id: Schema.String,
+  binding: NonNegativeInt,
+  revision: PositiveInt,
   sequence: Schema.NullOr(NonNegativeInt),
-  order: NonNegativeInt, nativeOrder: Schema.NullOr(NonNegativeInt),
-  occurredAt: Schema.NullOr(Schema.Number), observedAt: Schema.Number,
+  order: NonNegativeInt,
+  nativeOrder: Schema.NullOr(NonNegativeInt),
+  occurredAt: Schema.NullOr(Schema.Number),
+  observedAt: Schema.Number,
   nativeTime: Schema.NullOr(Schema.String),
-  nativeEntryId: Schema.NullOr(Schema.String), parentEntryId: Schema.NullOr(Schema.String),
-  toolCallId: Schema.NullOr(Schema.String), recovered: Schema.optional(Schema.Literal(true)),
+  nativeEntryId: Schema.NullOr(Schema.String),
+  parentEntryId: Schema.NullOr(Schema.String),
+  toolCallId: Schema.NullOr(Schema.String),
+  recovered: Schema.optional(Schema.Literal(true)),
 });
 export type PiNativeWorkerRecordProvenance = typeof PiNativeWorkerRecordProvenance.Type;
 
 export const PiNativeWorkerContent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("text"), text: Schema.String }),
   Schema.Struct({
-    type: Schema.Literal("toolCall"), toolCallId: Schema.String, name: Schema.String,
+    type: Schema.Literal("toolCall"),
+    toolCallId: Schema.String,
+    name: Schema.String,
     arguments: Schema.optional(Schema.Unknown),
   }),
   Schema.Struct({ type: Schema.Literal("omitted"), reason: Schema.Literal("unsupported_content") }),
 ]);
 export const PiNativeWorkerRecord = Schema.Union([
   Schema.Struct({
-    provenance: PiNativeWorkerRecordProvenance, kind: Schema.Literal("message"),
+    provenance: PiNativeWorkerRecordProvenance,
+    kind: Schema.Literal("message"),
     payload: Schema.Struct({
-      role: Schema.Literals(["user", "assistant"]), blocks: Schema.Array(PiNativeWorkerContent),
-      stopReason: Schema.optional(Schema.Literals(["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"])),
+      role: Schema.Literals(["user", "assistant"]),
+      blocks: Schema.Array(PiNativeWorkerContent),
+      stopReason: Schema.optional(
+        Schema.Literals(["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"]),
+      ),
       errorMessage: Schema.optional(Schema.String),
     }),
   }),
   Schema.Struct({
-    provenance: PiNativeWorkerRecordProvenance, kind: Schema.Literal("tool"),
+    provenance: PiNativeWorkerRecordProvenance,
+    kind: Schema.Literal("tool"),
     parentToolCallId: Schema.optional(Schema.String),
     payload: Schema.Struct({
-      status: Schema.Literals(["started", "updated", "completed", "error"]), name: Schema.String,
-      args: Schema.optional(Schema.Unknown), argsState: Schema.Literals(["available", "not_captured"]),
-      result: Schema.NullOr(Schema.Array(PiNativeWorkerContent)), isError: Schema.NullOr(Schema.Boolean),
-      todoSnapshot: Schema.optional(Schema.Struct({
-        format: Schema.Literal("rpiv-todo-v1"),
-        tasks: Schema.Array(Schema.Struct({
-          id: PositiveInt, identityEntryId: TrimmedNonEmptyString, subject: TrimmedNonEmptyString,
-          status: Schema.Literals(["pending", "in_progress", "completed", "deleted"]),
-        })),
-      })),
+      status: Schema.Literals(["started", "updated", "completed", "error"]),
+      name: Schema.String,
+      args: Schema.optional(Schema.Unknown),
+      argsState: Schema.Literals(["available", "not_captured"]),
+      result: Schema.NullOr(Schema.Array(PiNativeWorkerContent)),
+      isError: Schema.NullOr(Schema.Boolean),
+      todoSnapshot: Schema.optional(
+        Schema.Struct({
+          format: Schema.Literal("rpiv-todo-v1"),
+          tasks: Schema.Array(
+            Schema.Struct({
+              id: PositiveInt,
+              identityEntryId: TrimmedNonEmptyString,
+              subject: TrimmedNonEmptyString,
+              status: Schema.Literals(["pending", "in_progress", "completed", "deleted"]),
+            }),
+          ),
+        }),
+      ),
     }),
   }),
   Schema.Struct({
-    provenance: PiNativeWorkerRecordProvenance, kind: Schema.Literal("branch_changed"),
+    provenance: PiNativeWorkerRecordProvenance,
+    kind: Schema.Literal("branch_changed"),
     payload: Schema.Struct({
-      headEntryId: Schema.NullOr(Schema.String), previousHeadEntryId: Schema.String,
+      headEntryId: Schema.NullOr(Schema.String),
+      previousHeadEntryId: Schema.String,
     }),
   }),
 ]);
@@ -3627,6 +3709,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   searchThreadStream: "orchestration.searchThreadStream",
   getArchivedShellSnapshot: "orchestration.getArchivedShellSnapshot",
   getThreadProjection: "orchestration.getThreadProjection",
+  getPiArchitecture: "orchestration.getPiArchitecture",
   getWorkflowScript: "orchestration.getWorkflowScript",
   stopWorkflow: "orchestration.stopWorkflow",
   getTurnItem: "orchestration.getTurnItem",
@@ -4135,6 +4218,7 @@ export const OrchestrationV2RpcSchemas = {
     input: OrchestrationV2GetThreadProjectionInput,
     output: OrchestrationV2ThreadProjection,
   },
+  getPiArchitecture: { input: PiArchitectureReadInput, output: PiArchitectureReadResult },
   stopWorkflow: {
     input: OrchestrationV2StopWorkflowInput,
     output: Schema.Void,

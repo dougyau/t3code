@@ -15,6 +15,7 @@ import { ProviderInstanceMutation } from "./providerInstance.ts";
 
 /** Incremental client enforcement; the server still authorizes every request. */
 export const CLIENT_GUARDED_RPC_SCOPES = {
+  [ORCHESTRATION_V2_WS_METHODS.getPiArchitecture]: AuthOrchestrationReadScope,
   [WS_METHODS.serverUpdateSettings]: AuthSettingsWriteScope,
   [WS_METHODS.serverRunStorageCleanup]: AuthSettingsWriteScope,
   [WS_METHODS.serverRemoveDeletedThreadWorktree]: AuthSourceControlWriteScope,

@@ -331,6 +331,7 @@ export interface ThreadManagementServiceShape {
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2GetTurnItemResult, Orchestrator.OrchestratorV2Error>;
   readonly getThreadRecords: Orchestrator.OrchestratorV2["Service"]["getThreadRecords"];
+  readonly getPiArchitecture: Orchestrator.OrchestratorV2["Service"]["getPiArchitecture"];
   readonly getThreadProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadProjection, Orchestrator.OrchestratorV2Error>;
@@ -1134,6 +1135,7 @@ const make = Effect.gen(function* () {
         Effect.andThen(orchestrator.getThreadRecords(threadId, fields, filter)),
       ),
     getThreadProjection,
+    getPiArchitecture: orchestrator.getPiArchitecture,
     getCheckpointContext,
     getThreadSnapshot,
     getThreadSnapshotWindow,

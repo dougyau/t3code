@@ -25,6 +25,8 @@ import {
   TurnItemId,
   type PiNativeWorkerCheckpoint,
   type PiNativeWorkerSummary,
+  type PiArchitectureSummary,
+  ProviderDriverKind,
   type PiChecklistCapture,
   type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
@@ -299,7 +301,19 @@ export interface ProviderEventIngestInput {
   };
 }
 
+// Full Architecture text is paged from the archive, never copied into shell summaries.
+const architecturePreview = (text: string) => text.slice(0, 512).replace(/[\uD800-\uDBFF]$/u, "");
+
 export interface ProviderEventIngestorV2Shape {
+  readonly ingestArchitecture: (input: {
+    readonly threadId: ThreadId;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly providerSessionId: ProviderSessionId;
+    readonly parentProviderThreadId: ProviderThreadId;
+    readonly parentNodeId: NodeId;
+    readonly batch: ProviderAdapter.ProviderArchitectureBatch;
+    readonly isConnected: Effect.Effect<boolean>;
+  }) => ReturnType<EventSink.EventSinkV2Shape["writeArchitecture"]>;
   readonly ingestNativeWorker: (
     batch: ProviderAdapter.ProviderNativeWorkerBatch,
     isConnected?: Effect.Effect<boolean>,
@@ -362,7 +376,9 @@ export const layer: Layer.Layer<
     const completedTurnAnalytics = new Set<string>();
 
     const makeDomainEvent = (
-      input: ProviderEventIngestInput,
+      input: Omit<ProviderEventIngestInput, "event"> & {
+        readonly event: Pick<ProviderAdapter.ProviderAdapterV2Event, "driver">;
+      },
       payloadInput: {
         readonly type: OrchestrationV2DomainEvent["type"];
         readonly payload: OrchestrationV2DomainEvent["payload"];
@@ -771,20 +787,21 @@ export const layer: Layer.Layer<
         ),
       );
 
-    const nativeAdmissionEvents = Effect.fnUntraced(function* (input: ProviderEventIngestInput) {
+    const nativeAdmissionEvents = Effect.fnUntraced(function* (
+      input: Omit<ProviderEventIngestInput, "event"> & {
+        readonly event: Pick<ProviderAdapter.ProviderAdapterV2Event, "driver">;
+      },
+    ) {
       const admission = input.nativeWorkerAdmission;
-      if (admission === undefined || input.event.type !== "turn_item.updated") return [];
+      if (admission === undefined) return [];
       if (
         admission.summary.gaps.some((gap) => gap === "provenance_mismatch" || gap === "stale_owner")
       ) {
         return [];
       }
       const launch = admission.summary.launch;
-      const existing = yield* eventSink.nativeWorkers(input.providerSessionId);
-      if (
-        existing.some((member) => NodeUtil.isDeepStrictEqual(member.nativeWorker?.launch, launch))
-      )
-        return [];
+      const existing = (yield* projections.getThreadRecords(input.threadId, ["subagents"]))
+        .subagents;
       const now = yield* DateTime.now;
       const parent = yield* projections.getThread(input.threadId);
       const identity = Hex.encode(
@@ -800,7 +817,77 @@ export const layer: Layer.Layer<
         ),
       );
       const id = NodeId.make(`pi-worker:${identity}`);
-      if (existing.some((member) => member.id === id)) return [];
+      const prior = existing.find((member) => member.id === id);
+      if (prior) {
+        if (
+          launch.source !== "architecture_roster" ||
+          !prior.childThreadId ||
+          !prior.providerThreadId
+        )
+          return [];
+        const child = (yield* projections.getThreadRecords(prior.childThreadId, [
+          "providerThreads",
+        ])).providerThreads.find((thread) => thread.id === prior.providerThreadId);
+        const previous = child?.nativeMetadata?.nativeWorkerCheckpoint;
+        if (!child || !previous) return [];
+        if (
+          NodeUtil.isDeepStrictEqual(previous.owner, admission.checkpoint.owner) &&
+          previous.ownerGeneration > admission.checkpoint.ownerGeneration
+        )
+          return [];
+        const sameOwner =
+          NodeUtil.isDeepStrictEqual(previous.owner, admission.checkpoint.owner) &&
+          previous.ownerGeneration === admission.checkpoint.ownerGeneration;
+        const nativeWorker = sameOwner
+          ? {
+              ...(prior.nativeWorker ?? admission.summary),
+              launch,
+              roleId: admission.summary.roleId,
+              execution: admission.summary.execution,
+              ...(admission.summary.mandate ? { mandate: admission.summary.mandate } : {}),
+              ...(admission.summary.brief !== undefined &&
+              (admission.summary.briefComplete ||
+                admission.summary.briefSource === "original WorkBrief" ||
+                !prior.nativeWorker?.briefComplete)
+                ? {
+                    brief: admission.summary.brief,
+                    briefComplete: admission.summary.briefComplete === true,
+                    ...(admission.summary.briefSource
+                      ? { briefSource: admission.summary.briefSource }
+                      : {}),
+                  }
+                : {}),
+            }
+          : { ...prior.nativeWorker, ...admission.summary };
+        if (sameOwner && NodeUtil.isDeepStrictEqual(prior.nativeWorker, nativeWorker)) return [];
+        const checkpoint = {
+          ...(sameOwner ? previous : admission.checkpoint),
+          launch,
+        };
+        return [
+          yield* makeDomainEvent(input, {
+            type: "subagent.updated",
+            nodeId: id,
+            payload: {
+              ...prior,
+              nativeWorker,
+              runId: null,
+              parentNodeId: launch.parentNodeId,
+              prompt: nativeWorker.mandate?.text ?? nativeWorker.brief ?? prior.prompt,
+              updatedAt: now,
+            },
+          }),
+          yield* makeDomainEvent(input, {
+            type: "provider-thread.updated",
+            threadId: prior.childThreadId,
+            payload: {
+              ...child,
+              providerSessionId: input.providerSessionId,
+              nativeMetadata: { ...child.nativeMetadata, nativeWorkerCheckpoint: checkpoint },
+            },
+          }),
+        ];
+      }
       const childThreadId = ThreadId.make(`pi-worker:${identity}`);
       const providerThreadId = ProviderThreadId.make(`pi-worker:${identity}`);
       const selection: ModelSelection =
@@ -824,8 +911,9 @@ export const layer: Layer.Layer<
       const subagent: OrchestrationV2Subagent = {
         id,
         threadId: input.threadId,
-        runId: launch.runId,
-        parentNodeId: launch.toolNodeId,
+        runId: launch.source === "architecture_roster" ? null : launch.runId,
+        parentNodeId:
+          launch.source === "architecture_roster" ? launch.parentNodeId : launch.toolNodeId,
         origin: "provider_native",
         createdBy: "agent",
         driver: input.event.driver,
@@ -833,7 +921,7 @@ export const layer: Layer.Layer<
         providerThreadId,
         childThreadId,
         nativeTaskRef: null,
-        prompt: admission.summary.brief ?? "",
+        prompt: admission.summary.mandate?.text ?? admission.summary.brief ?? "",
         title: admission.summary.roleId ?? launch.instanceId,
         model: selection.model,
         modelSelection: selection,
@@ -891,6 +979,204 @@ export const layer: Layer.Layer<
     });
 
     return ProviderEventIngestorV2.of({
+      ingestArchitecture: (input) => {
+        const coordinatorSessionId = input.batch.checkpoint.owner.coordinatorSessionId;
+        const tableId = encodeNativeWorkerIdentity([
+          input.providerInstanceId,
+          coordinatorSessionId,
+          input.batch.roomId,
+        ]);
+        return eventSink.writeArchitecture({
+          threadId: input.threadId,
+          tableId,
+          isConnected: input.isConnected,
+          build: (previous) =>
+            Effect.gen(function* () {
+              const room = input.batch.records.find((record) => record.kind === "room");
+              const sameOwner =
+                previous &&
+                NodeUtil.isDeepStrictEqual(previous.checkpoint.owner, input.batch.checkpoint.owner);
+              const captureLoss =
+                !room &&
+                input.batch.records.length === 0 &&
+                input.batch.capture === "incomplete" &&
+                input.batch.gaps.length > 0 &&
+                sameOwner;
+              if (
+                (!room && !captureLoss) ||
+                (room &&
+                  (room.id !== input.batch.roomId ||
+                    room.origin.coordinatorSessionId !== coordinatorSessionId))
+              )
+                return undefined;
+              if (
+                sameOwner &&
+                (previous.retired ||
+                  previous.checkpoint.ownerGeneration > input.batch.checkpoint.ownerGeneration)
+              )
+                return undefined;
+              const confirmedRoom =
+                room ?? previous?.records.find((record) => record.kind === "room");
+              if (!confirmedRoom) return undefined;
+              // A failed first page observes loss, not a new source cut.
+              const checkpoint =
+                captureLoss && previous
+                  ? {
+                      ...previous.checkpoint,
+                      ownerGeneration: input.batch.checkpoint.ownerGeneration,
+                    }
+                  : input.batch.checkpoint;
+              const gaps =
+                captureLoss && previous
+                  ? [...new Set([...previous.summary.gaps, ...input.batch.gaps])]
+                  : input.batch.gaps;
+              if (
+                previous &&
+                NodeUtil.isDeepStrictEqual(previous.checkpoint.owner, checkpoint.owner) &&
+                previous.checkpoint.cut > checkpoint.cut
+              )
+                return undefined;
+              const records = new Map(
+                previous?.records.map((record) => [`${record.kind}:${record.id}`, record]),
+              );
+              for (const record of input.batch.records)
+                records.set(`${record.kind}:${record.id}`, record);
+              const members = [...records.values()].filter((record) => record.kind === "member");
+              const knownOriginal = previous?.original;
+              const receivedOriginal = input.batch.original;
+              const original =
+                knownOriginal &&
+                (!receivedOriginal ||
+                  receivedOriginal.source === "unavailable" ||
+                  (knownOriginal.source === "original WorkBrief" &&
+                    receivedOriginal.source !== "original WorkBrief") ||
+                  (knownOriginal.complete && knownOriginal.source === receivedOriginal.source))
+                  ? knownOriginal
+                  : receivedOriginal;
+              if (
+                previous &&
+                NodeUtil.isDeepStrictEqual(previous.checkpoint, checkpoint) &&
+                previous.summary.capture === input.batch.capture &&
+                NodeUtil.isDeepStrictEqual(previous.summary.gaps, gaps) &&
+                NodeUtil.isDeepStrictEqual(previous.original, original)
+              )
+                return undefined;
+              const summary: PiArchitectureSummary = {
+                tableId,
+                threadId: input.threadId,
+                providerInstanceId: input.providerInstanceId,
+                coordinatorSessionId,
+                roomId: input.batch.roomId,
+                mode: confirmedRoom.mode,
+                participants: members.length,
+                lifecycle: confirmedRoom.lifecycle,
+                capture: input.batch.capture,
+                observation: input.batch.capture === "incomplete" ? "partial" : "stale",
+                gaps,
+              };
+              const current = yield* projections.getThread(input.threadId);
+              const events: OrchestrationV2DomainEvent[] = [];
+              const context = {
+                threadId: input.threadId,
+                providerInstanceId: input.providerInstanceId,
+                providerSessionId: input.providerSessionId,
+                event: { driver: ProviderDriverKind.make("pi") },
+              };
+              for (const member of room ? members : []) {
+                if (
+                  !member.instanceId.trim() ||
+                  (member.workerRef && member.workerRef.instanceId !== member.instanceId) ||
+                  member.conversationRefs.some((ref) => ref.instanceId !== member.instanceId)
+                )
+                  continue;
+                const launch = {
+                  source: "architecture_roster" as const,
+                  providerInstanceId: input.providerInstanceId,
+                  providerSessionId: input.providerSessionId,
+                  parentThreadId: input.threadId,
+                  parentProviderThreadId: input.parentProviderThreadId,
+                  parentNodeId: input.parentNodeId,
+                  coordinatorSessionId,
+                  roomId: input.batch.roomId,
+                  memberId: member.id,
+                  assignmentId: member.assignmentId,
+                  instanceId: member.instanceId,
+                  roleId: member.roleId,
+                };
+                const admitted = yield* nativeAdmissionEvents({
+                  ...context,
+                  nativeWorkerAdmission: {
+                    summary: {
+                      launch,
+                      roleId: member.roleId,
+                      acceptedAt: member.admittedAt,
+                      ...(member.mandate.source === "TeamAssignment.task"
+                        ? {
+                            mandate: {
+                              source: member.mandate.source,
+                              text: architecturePreview(member.mandate.text),
+                              complete: member.mandate.text.length <= 512,
+                            },
+                          }
+                        : original
+                          ? {
+                              brief: architecturePreview(original.text),
+                              briefComplete: original.complete && original.text.length <= 512,
+                              ...(original.source === "unavailable"
+                                ? {}
+                                : { briefSource: original.source }),
+                            }
+                          : {}),
+                      execution: member.execution,
+                      result: member.execution === "completed" ? "available" : "pending",
+                      capture: "open",
+                      availability: "ready",
+                      gaps: [],
+                    },
+                    checkpoint: {
+                      launch,
+                      ownerGeneration: input.batch.checkpoint.ownerGeneration,
+                      owner: input.batch.checkpoint.owner,
+                      bindings: [],
+                      captureEpoch: null,
+                      bindingGeneration: null,
+                      bindingCursors: [],
+                      cursor: null,
+                      cut: 0,
+                      recovery: false,
+                      capture: "opening",
+                      finalSequence: null,
+                      gaps: [],
+                    },
+                  },
+                });
+                events.push(...admitted);
+              }
+              const nativeTables = [
+                ...(current.nativeTables ?? []).filter((table) => table.tableId !== tableId),
+                summary,
+              ].sort((a, b) => a.tableId.localeCompare(b.tableId));
+              if (!NodeUtil.isDeepStrictEqual(current.nativeTables, nativeTables))
+                events.push(
+                  yield* makeDomainEvent(context, {
+                    type: "thread.metadata-updated",
+                    payload: { ...current, nativeTables },
+                  }),
+                );
+              return {
+                archive: {
+                  summary,
+                  providerSessionId: input.providerSessionId,
+                  parentProviderThreadId: input.parentProviderThreadId,
+                  checkpoint,
+                  records: [...records.values()],
+                  ...(original ? { original } : {}),
+                },
+                events,
+              };
+            }),
+        });
+      },
       ingestNativeWorker: (batch, isConnected) =>
         eventSink.writeNativeWorker({
           ...(isConnected === undefined ? {} : { isConnected }),
@@ -906,7 +1192,17 @@ export const layer: Layer.Layer<
               ) {
                 return yield* Effect.die(new Error("Native batch provenance mismatch."));
               }
-              const summary = { ...subagent.nativeWorker, ...batch.summary };
+              const summary = {
+                ...subagent.nativeWorker,
+                ...batch.summary,
+                ...(subagent.nativeWorker?.briefComplete && !batch.summary.briefComplete
+                  ? {
+                      brief: subagent.nativeWorker.brief,
+                      briefComplete: true,
+                      briefSource: subagent.nativeWorker.briefSource,
+                    }
+                  : {}),
+              };
               const childThreadId = subagent.childThreadId!;
               const previous = yield* projections.getThreadRecords(childThreadId, ["turnItems"]);
               const now = yield* DateTime.now;
@@ -1203,7 +1499,11 @@ export const layer: Layer.Layer<
         Effect.gen(function* () {
           const events = [
             ...(yield* normalize(input)),
-            ...(yield* nativeAdmissionEvents(input).pipe(
+            ...(yield* (
+              input.event.type === "turn_item.updated"
+                ? nativeAdmissionEvents(input)
+                : Effect.succeed([])
+            ).pipe(
               Effect.mapError(
                 (cause) =>
                   new ProviderEventPublishError({

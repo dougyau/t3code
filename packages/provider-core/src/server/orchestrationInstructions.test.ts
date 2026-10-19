@@ -51,6 +51,43 @@ describe("T3 orchestration provider instructions", () => {
     assert.equal(t3OrchestrationSystemPrompt(true), T3_CODE_ORCHESTRATION_INSTRUCTIONS);
   });
 
+  it("shares Mermaid-first visuals across system, fallback, and ACP injection", () => {
+    const prompt = "  Explain this flow.\nKeep my instructions unchanged.  ";
+    const visuals = `### Showing visuals
+
+For flowcharts, sequence diagrams, state diagrams, and relationship diagrams, use Markdown code blocks with the \`mermaid\` language instead of ASCII diagrams. Reserve HTML for visualizations that Mermaid cannot represent adequately.
+
+When such a visualization would say more than prose, build a self-contained HTML page, check it with \`html_preview\`, then publish it with \`html_render\` before your final reply. The reader sees the page above that reply, so don't announce or restate it; add only what it doesn't say.`;
+    const fallback = t3OrchestrationPromptForFirstRun({
+      prompt,
+      runOrdinal: 1,
+      hasT3Mcp: true,
+    });
+    const acpPrompts = (["default", "plan"] as const).map((interactionMode) =>
+      t3AcpPromptWithInstructions({
+        prompt,
+        state: { interactionMode, hasT3Mcp: true },
+      }),
+    );
+    const reinjected = t3AcpPromptWithInstructions({
+      prompt,
+      state: { interactionMode: "default", hasT3Mcp: true },
+      previousState: { interactionMode: "default", hasT3Mcp: false },
+    });
+    for (const injected of [
+      t3OrchestrationSystemPrompt(true)!,
+      fallback,
+      ...acpPrompts,
+      reinjected,
+    ]) {
+      assert.include(injected, visuals);
+      assert.notInclude(injected, "When a chart, table, diagram, image collage, or mockup");
+    }
+    for (const injected of [fallback, ...acpPrompts, reinjected]) {
+      assert.include(injected, `<user_request>\n${prompt}\n</user_request>`);
+    }
+  });
+
   it("gives ACP sessions provider-neutral mode, browser, and orchestration guidance", () => {
     const injected = t3AcpPromptWithInstructions({
       prompt: "Inspect the repository.",
@@ -86,5 +123,17 @@ describe("T3 orchestration provider instructions", () => {
     assert.include(withoutMcp, "T3 Code interaction mode: Default");
     assert.notInclude(withoutMcp, "T3 Code collaborative browser");
     assert.notInclude(withoutMcp, "T3 Code orchestration");
+  });
+
+  it("leaves native ACP slash commands untouched even when guidance would be reinjected", () => {
+    const prompt = "  /review keep this literal\n";
+    assert.equal(
+      t3AcpPromptWithInstructions({
+        prompt,
+        state: { interactionMode: "plan", hasT3Mcp: true },
+        previousState: { interactionMode: "default", hasT3Mcp: false },
+      }),
+      prompt,
+    );
   });
 });

@@ -23,6 +23,20 @@ import { NativeStackScreenOptions, nativeHeaderScrollEdgeEffects } from "../../n
 import { SubagentRow } from "./SubagentRow";
 import { MaterialScreenContent } from "../../components/MaterialScreenContent";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
+import {
+  ArchitectureAction,
+  mobilePiArchitecture,
+  NativeTableStatus,
+} from "./ThreadArchitectTableScreen";
+import {
+  isTableWorker,
+  participantExecution,
+  participantLabel,
+  type TableTarget,
+} from "@t3tools/client-runtime/state/piArchitecture/model";
+import type { PiArchitectureSummary } from "@t3tools/contracts";
+import * as Option from "effect/Option";
+import { AsyncResult } from "effect/reactivity";
 
 const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
 
@@ -41,14 +55,19 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
   const turn = useThreadTurnSubagents(target);
   const subagents = turn?.subagents ?? [];
   const projection = useAtomValue(environmentThreadDetails.threadAtom(target))?.projection;
+  const tables = projection?.thread.nativeTables ?? [];
+  const inTable = (agent: OrchestrationV2Subagent) =>
+    tables.some((table) => isTableWorker(table, agent));
   const currentIds = new Set(subagents.map((agent) => agent.id));
   const earlier = (projection?.subagents ?? []).filter(
-    (agent) => agent.nativeWorker && !currentIds.has(agent.id),
+    (agent) => agent.nativeWorker && !currentIds.has(agent.id) && !inTable(agent),
   );
   const individual = subagents.filter(
-    (agent) => agent.nativeWorker?.launch.source !== "team_assign",
+    (agent) => agent.nativeWorker?.launch.source !== "team_assign" && !inTable(agent),
   );
-  const team = subagents.filter((agent) => agent.nativeWorker?.launch.source === "team_assign");
+  const team = subagents.filter(
+    (agent) => agent.nativeWorker?.launch.source === "team_assign" && !inTable(agent),
+  );
   const hasLiveAgent = (turn?.liveCount ?? 0) > 0;
 
   const openChildThread = (childThreadId: ThreadId) => {
@@ -73,7 +92,17 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
       contentContainerClassName="px-5 pb-6"
       contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 8 }}
     >
-      {subagents.length === 0 && earlier.length === 0 ? (
+      {tables.map((table) => (
+        <NativeTableEntry
+          key={table.tableId}
+          table={table}
+          environmentId={target.environmentId}
+          onOpen={(tableTarget) =>
+            navigation.dispatch(StackActions.replace("ThreadArchitectTable", tableTarget))
+          }
+        />
+      ))}
+      {subagents.length === 0 && earlier.length === 0 && tables.length === 0 ? (
         <Text className="pt-6 text-center text-sm text-foreground-muted">
           No agents in this turn.
         </Text>
@@ -141,6 +170,100 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
       <MaterialScreenContent insetHorizontal={layout.usesSplitView}>
         {content}
       </MaterialScreenContent>
+    </View>
+  );
+}
+
+function NativeTableEntry(props: {
+  readonly table: PiArchitectureSummary;
+  readonly environmentId: EnvironmentId;
+  readonly onOpen: (target: TableTarget) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [identifiers, setIdentifiers] = useState(false);
+  const canRead = useAtomValue(mobilePiArchitecture.read.permissionAtom(props.environmentId));
+  return (
+    <View className="my-2 min-w-0 gap-3 rounded-lg border border-border p-4">
+      <View className="flex-row flex-wrap items-baseline justify-between gap-2">
+        <Text className="font-t3-bold text-sm text-foreground">Architect table</Text>
+        <Text className="text-xs text-foreground-muted">
+          {props.table.participants} participants
+        </Text>
+      </View>
+      <NativeTableStatus summary={props.table} />
+      {canRead ? (
+        <ArchitectureAction
+          primary
+          onPress={() =>
+            props.onOpen({
+              environmentId: props.environmentId,
+              threadId: props.table.threadId,
+              tableId: props.table.tableId,
+            })
+          }
+        >
+          Open Architect table
+        </ArchitectureAction>
+      ) : (
+        <Text>Requires orchestration read permission.</Text>
+      )}
+      <ArchitectureAction expanded={expanded} onPress={() => setExpanded(!expanded)}>
+        Participants
+      </ArchitectureAction>
+      {expanded && canRead ? (
+        <>
+          <NativeTableRoster
+            identifiers={identifiers}
+            target={{
+              environmentId: props.environmentId,
+              threadId: props.table.threadId,
+              tableId: props.table.tableId,
+            }}
+          />
+          <ArchitectureAction expanded={identifiers} onPress={() => setIdentifiers(!identifiers)}>
+            Technical identifiers
+          </ArchitectureAction>
+        </>
+      ) : null}
+    </View>
+  );
+}
+
+function NativeTableRoster({
+  target,
+  identifiers,
+}: {
+  readonly target: TableTarget;
+  readonly identifiers: boolean;
+}) {
+  const result = useAtomValue(
+    mobilePiArchitecture.query({
+      environmentId: target.environmentId,
+      input: { kind: "records", threadId: target.threadId, tableId: target.tableId },
+    }),
+  );
+  const data = Option.getOrNull(AsyncResult.value(result));
+  return (
+    <View className="gap-2">
+      {data?.kind === "records" ? (
+        data.items
+          .filter((record) => record.kind === "member")
+          .map((member) => (
+            <View key={member.id} className="min-w-0 gap-1">
+              <Text className="font-t3-medium text-sm text-foreground">
+                {participantLabel(member)}
+              </Text>
+              <Text className="text-xs text-foreground-muted">{participantExecution(member)}</Text>
+              {identifiers ? (
+                <Text selectable className="text-xs text-foreground-muted">
+                  Member ID: {member.id} · Assignment ID: {member.assignmentId}
+                </Text>
+              ) : null}
+            </View>
+          ))
+      ) : (
+        <Text>{result._tag === "Failure" ? "Roster unavailable" : "Loading roster…"}</Text>
+      )}
     </View>
   );
 }

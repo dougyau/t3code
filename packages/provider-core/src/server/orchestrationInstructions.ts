@@ -33,7 +33,9 @@ ACP fallback: some ACP agents accept the injected MCP server but fail to expose 
 
 ### Showing visuals
 
-When a chart, table, diagram, image collage, or mockup would say more than prose, build a self-contained HTML page, check it with \`html_preview\`, then publish it with \`html_render\` before your final reply. The reader sees the page above that reply, so don't announce or restate it; add only what it doesn't say.
+For flowcharts, sequence diagrams, state diagrams, and relationship diagrams, use Markdown code blocks with the \`mermaid\` language instead of ASCII diagrams. Reserve HTML for visualizations that Mermaid cannot represent adequately.
+
+When such a visualization would say more than prose, build a self-contained HTML page, check it with \`html_preview\`, then publish it with \`html_render\` before your final reply. The reader sees the page above that reply, so don't announce or restate it; add only what it doesn't say.
 `;
 
 export const T3_CODE_BROWSER_TOOL_INSTRUCTIONS = `
