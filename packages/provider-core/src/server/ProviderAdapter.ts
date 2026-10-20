@@ -576,6 +576,17 @@ export interface ProviderNativeWorkersPort {
   readonly ownerGeneration: number;
   /** Protocol-2 handshake owner, absent before binding or after invalidation. */
   readonly owner: PiNativeWorkerOwner | undefined;
+  /** Adapter-correlated native coordinator identity for the current handshake. */
+  readonly coordinatorBinding?:
+    | {
+        readonly owner: PiNativeWorkerOwner;
+        readonly ownerGeneration: number;
+        readonly nativeThreadRef: {
+          readonly driver: ProviderDriverKind;
+          readonly nativeId: string;
+        };
+      }
+    | undefined;
   /** Coalescible read hints, never launch admission or ordinary provider events. */
   readonly hints: Stream.Stream<void>;
   readonly reconcile: (

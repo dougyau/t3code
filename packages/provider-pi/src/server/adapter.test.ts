@@ -55,6 +55,8 @@ import { makePiRpcConnection, type PiRpcRecord } from "./rpc.ts";
 import { nativeTodoBranch, withNativeTodo } from "./piTodo.native.fixture.ts";
 import { loadMcpBridge } from "./mcpBridge.testkit.ts";
 import { turnItemOutputText } from "../../../client-runtime/src/work-log/itemDetail.ts";
+import { workerWireFixture } from "./workerBridge.wire.fixture.ts";
+import { PiWorkerBridge } from "./workerBridge.ts";
 
 const layerTest = Layer.mergeAll(
   NodeServices.layer,
@@ -193,8 +195,15 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
         const next = stateQueue.shift();
         if (next && Object.hasOwn(next, "model")) model = next.model;
         if (next && Object.hasOwn(next, "thinkingLevel")) thinkingLevel = next.thinkingLevel;
-        return { ...base, data: { ...recordedIdleState(sessionFile), ...(model === undefined ? {} : { model }),
-          ...(thinkingLevel === undefined ? {} : { thinkingLevel }), ...next } };
+        return {
+          ...base,
+          data: {
+            ...recordedIdleState(sessionFile),
+            ...(model === undefined ? {} : { model }),
+            ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
+            ...next,
+          },
+        };
       }
       case "get_available_models":
         return { ...base, data: { models } };
@@ -269,7 +278,9 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
         kill: () => Effect.void,
         unref: Effect.succeed(Effect.void),
         stdin: Sink.forEach(handleStdinChunk).pipe(
-          Sink.ensuring(Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0)).pipe(Effect.asVoid)),
+          Sink.ensuring(
+            Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0)).pipe(Effect.asVoid),
+          ),
         ),
         stdout: Stream.fromQueue(stdout),
         stderr: Stream.empty,
@@ -507,34 +518,105 @@ const expectModelFailure = (errorMessage: string) =>
 
 describe("PiAdapterV2", () => {
   it.effect.each([
-    { tool: "agent_spawn", details: { instanceId: "child" }, started: true, isError: false, admitted: true },
-    { tool: "team_assign", details: { id: "assignment", instanceId: "child", roleId: "researcher" }, started: true, isError: false, admitted: true },
-    { tool: "agent_run", details: { instanceId: "child" }, started: true, isError: false, admitted: false },
-    { tool: "agent_spawn", details: { instanceId: "child" }, started: true, isError: true, admitted: false },
-    { tool: "agent_spawn", details: { instanceId: "" }, started: true, isError: false, admitted: false },
-    { tool: "team_assign", details: { id: "assignment", instanceId: "child" }, started: true, isError: false, admitted: false },
-    { tool: "agent_spawn", details: { instanceId: "child" }, started: false, isError: false, admitted: false },
+    {
+      tool: "agent_spawn",
+      details: { instanceId: "child" },
+      started: true,
+      isError: false,
+      admitted: true,
+    },
+    {
+      tool: "team_assign",
+      details: { id: "assignment", instanceId: "child", roleId: "researcher" },
+      started: true,
+      isError: false,
+      admitted: true,
+    },
+    {
+      tool: "agent_run",
+      details: { instanceId: "child" },
+      started: true,
+      isError: false,
+      admitted: false,
+    },
+    {
+      tool: "agent_spawn",
+      details: { instanceId: "child" },
+      started: true,
+      isError: true,
+      admitted: false,
+    },
+    {
+      tool: "agent_spawn",
+      details: { instanceId: "" },
+      started: true,
+      isError: false,
+      admitted: false,
+    },
+    {
+      tool: "team_assign",
+      details: { id: "assignment", instanceId: "child" },
+      started: true,
+      isError: false,
+      admitted: false,
+    },
+    {
+      tool: "agent_spawn",
+      details: { instanceId: "child" },
+      started: false,
+      isError: false,
+      admitted: false,
+    },
   ])("supplements only typed successful $tool launches started=$started error=$isError", (test) =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;
       const { runtime, takeEvent } = yield* openRuntime(fake);
       const providerThread = yield* runtime.ensureThread({
-        threadId: THREAD_ID, modelSelection: modelSelection("default"), runtimePolicy,
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
       });
       yield* startTurn(runtime, providerThread);
       yield* fake.takeRequest("prompt");
       if (test.started) {
-        yield* fake.emit({ type: "tool_execution_start", toolName: test.tool, toolCallId: "launch-call", args: {} });
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolName: test.tool,
+          toolCallId: "launch-call",
+          args: {},
+        });
       }
-      const start = test.started ? yield* takeEvent((event) =>
-        event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool" && event.turnItem.status === "running") : undefined;
-      yield* fake.emit({ type: "tool_execution_end", toolName: test.tool, toolCallId: "launch-call", isError: test.isError,
-        result: { content: [{ type: "text", text: "ordinary tool output" }], details: {
-          ...test.details, coordinatorSessionId: "forged", parentThreadId: "forged", toolNodeId: "forged",
-        } } });
-      const end = yield* takeEvent((event) =>
-        event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool" && event.turnItem.status !== "running");
-      if (end.type !== "turn_item.updated" || end.turnItem.type !== "dynamic_tool") throw new Error("Missing tool item");
+      const start = test.started
+        ? yield* takeEvent(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "dynamic_tool" &&
+              event.turnItem.status === "running",
+          )
+        : undefined;
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolName: test.tool,
+        toolCallId: "launch-call",
+        isError: test.isError,
+        result: {
+          content: [{ type: "text", text: "ordinary tool output" }],
+          details: {
+            ...test.details,
+            coordinatorSessionId: "forged",
+            parentThreadId: "forged",
+            toolNodeId: "forged",
+          },
+        },
+      });
+      const end = yield* takeEvent(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "dynamic_tool" &&
+          event.turnItem.status !== "running",
+      );
+      if (end.type !== "turn_item.updated" || end.turnItem.type !== "dynamic_tool")
+        throw new Error("Missing tool item");
       assert.equal(end.turnItem.output, "ordinary tool output");
       const launch = end.turnItem.nativeWorkerLaunch;
       if (!test.admitted) {
@@ -560,7 +642,8 @@ describe("PiAdapterV2", () => {
         assert.equal(launch.roleId, "researcher");
       }
       assert.isUndefined(start.turnItem.nativeWorkerLaunch);
-    }).pipe(Effect.scoped, Effect.provide(layerTest)));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
   it.effect.each(["ready", "invalid", "unappended"] as const)(
     "settled native todo %s selection travels only on its ordinary final tool item",
     (selection) =>
@@ -718,7 +801,9 @@ describe("PiAdapterV2", () => {
           },
         };
         fake.vetoNextSwitch();
-        const rejected = yield* runtime.resumeThread({ providerThread: persisted }).pipe(Effect.flip);
+        const rejected = yield* runtime
+          .resumeThread({ providerThread: persisted })
+          .pipe(Effect.flip);
         assert.equal(rejected._tag, "ProviderAdapterResumeThreadError");
         fake.queueEntries({ entries: [], leafId: null });
         fake.queueState({ sessionFile: "/fake/fallback-session.jsonl" });
@@ -1078,6 +1163,101 @@ describe("PiAdapterV2", () => {
       assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
+  it.effect("binds only the correlated get_state source across switches and failures", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime } = yield* openRuntime(fake);
+      const port = runtime.nativeWorkers!;
+      if (!(port instanceof PiWorkerBridge)) throw new Error("Expected the Pi worker bridge");
+      const binding = () => port.coordinatorBinding;
+      const directory = fake
+        .lastSpawn()
+        .args.find((arg) => arg.startsWith("--pitako-agent-bridge="))!
+        .slice("--pitako-agent-bridge=".length);
+      const owner = {
+        processId: "adapter-process",
+        coordinatorSessionId: recordedIdleState(FAKE_SESSION_FILE).sessionId,
+        epoch: "adapter-epoch",
+      };
+      yield* workerWireFixture(owner, directory);
+      yield* Effect.addFinalizer(() => port.close);
+      const ready = port.hints.pipe(
+        Stream.filter(() => binding() !== undefined),
+        Stream.runHead,
+      );
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* fake.takeRequest("get_state");
+      yield* ready;
+      assert.deepEqual(binding(), {
+        owner,
+        ownerGeneration: port.ownerGeneration,
+        nativeThreadRef: {
+          driver: PI_PROVIDER,
+          nativeId: providerThread.nativeThreadRef!.nativeId,
+        },
+      });
+      assert.notEqual(owner.coordinatorSessionId, providerThread.nativeThreadRef?.nativeId);
+      const generation = port.ownerGeneration;
+      const switched = {
+        ...providerThread,
+        nativeThreadRef: {
+          driver: PI_PROVIDER,
+          nativeId: "/fake/same-id-new-source.jsonl",
+          strength: "strong" as const,
+        },
+      };
+      fake.deferNextLifecycle("switch_session");
+      const switching = yield* runtime
+        .resumeThread({ providerThread: switched })
+        .pipe(Effect.forkChild);
+      const switchRequest = yield* fake.takeRequest("switch_session");
+      assert.isUndefined(binding());
+      fake.queueState({ sessionFile: switched.nativeThreadRef.nativeId });
+      yield* fake.emit({
+        type: "response",
+        id: switchRequest.id,
+        command: "switch_session",
+        success: true,
+        data: { cancelled: false },
+      });
+      yield* Fiber.join(switching);
+      yield* fake.takeRequest("get_state");
+      yield* ready;
+      assert.isAbove(port.ownerGeneration, generation);
+      assert.deepInclude(switched.nativeThreadRef, binding()!.nativeThreadRef);
+      fake.failNextState();
+      assert.equal(
+        (yield* runtime.resumeThread({ providerThread: switched }).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      assert.isUndefined(binding());
+      yield* fake.takeRequest("get_state");
+      yield* runtime.resumeThread({ providerThread: switched });
+      yield* fake.takeRequest("get_state");
+      yield* ready;
+      assert.deepInclude(switched.nativeThreadRef, binding()!.nativeThreadRef);
+      fake.vetoNextSwitch();
+      assert.equal(
+        (yield* runtime.resumeThread({ providerThread }).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      assert.isUndefined(binding());
+      fake.deferNextState();
+      const staleRegistration = yield* runtime
+        .resumeThread({ providerThread: switched })
+        .pipe(Effect.forkChild);
+      yield* fake.takeRequest("get_state");
+      yield* port.invalidate;
+      yield* fake.resolveDeferredState(recordedIdleState(switched.nativeThreadRef.nativeId));
+      yield* Fiber.join(staleRegistration);
+      assert.isUndefined(binding());
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect.each([false, true])(
     "serializes rollback fork hooks with native wake ownership, wake=%s",
     (nativeWake) =>
@@ -1095,11 +1275,33 @@ describe("PiAdapterV2", () => {
             offer: (request) => Queue.offer(offers, request).pipe(Effect.asVoid),
           },
         );
+        const port = runtime.nativeWorkers!;
+        if (!(port instanceof PiWorkerBridge)) throw new Error("Expected the Pi worker bridge");
+        const binding = () => port.coordinatorBinding;
+        const directory = fake
+          .lastSpawn()
+          .args.find((arg) => arg.startsWith("--pitako-agent-bridge="))!
+          .slice("--pitako-agent-bridge=".length);
+        yield* workerWireFixture(
+          {
+            processId: "fork-process",
+            coordinatorSessionId: recordedIdleState(FAKE_SESSION_FILE).sessionId,
+            epoch: "fork-epoch",
+          },
+          directory,
+        );
+        yield* Effect.addFinalizer(() => port.close);
+        const ready = port.hints.pipe(
+          Stream.filter(() => binding() !== undefined),
+          Stream.runHead,
+        );
         const providerThread = yield* runtime.ensureThread({
           threadId: THREAD_ID,
           modelSelection: modelSelection("default"),
           runtimePolicy,
         });
+        yield* ready;
+        assert.deepInclude(providerThread.nativeThreadRef, binding()!.nativeThreadRef);
         fake.deferNextLifecycle("fork");
         const rollingBack = yield* runtime
           .rollbackThread({
@@ -1129,6 +1331,7 @@ describe("PiAdapterV2", () => {
           })
           .pipe(Effect.result, Effect.forkScoped);
         const fork = yield* fake.takeRequest("fork");
+        assert.isUndefined(binding());
         const overlappingTurn = yield* startTurn(runtime, providerThread).pipe(Effect.result);
         assert.equal(overlappingTurn._tag, "Failure");
         const overlappingRegistration = yield* runtime
@@ -1188,6 +1391,7 @@ describe("PiAdapterV2", () => {
           ).pipe(Effect.result);
           assert.equal(staleTurn._tag, "Failure");
           assert.isFalse(fake.allRequests().some((request) => request["type"] === "prompt"));
+          assert.isUndefined(binding());
           return;
         }
         fake.queueState({ sessionFile: "/fake/rolled-back-session.jsonl" });
@@ -1204,6 +1408,11 @@ describe("PiAdapterV2", () => {
         assert.equal(
           result.success.providerThread.nativeThreadRef?.nativeId,
           "/fake/rolled-back-session.jsonl",
+        );
+        yield* ready;
+        assert.deepInclude(
+          result.success.providerThread.nativeThreadRef,
+          binding()!.nativeThreadRef,
         );
         yield* startTurn(runtime, result.success.providerThread);
         const prompt = yield* fake.takeRequest("prompt");
@@ -1945,13 +2154,18 @@ describe("PiAdapterV2", () => {
       const fake = yield* makeFakePi;
       const { runtime } = yield* openRuntime(fake);
       const providerThread = yield* runtime.ensureThread({
-        threadId: THREAD_ID, modelSelection: modelSelection("default"), runtimePolicy,
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
       });
       fake.queueState({ sessionFile: "/unrequested/latest.jsonl" });
       const error = yield* runtime.resumeThread({ providerThread }).pipe(Effect.flip);
       assert.equal(error._tag, "ProviderAdapterResumeThreadError");
       assert.match(String(error.cause), /did not resume the requested session file/);
-      assert.equal(fake.allRequests().filter((record) => record.type === "switch_session").length, 1);
+      assert.equal(
+        fake.allRequests().filter((record) => record.type === "switch_session").length,
+        1,
+      );
       assert.isFalse(fake.allRequests().some((record) => record.type === "new_session"));
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
@@ -4814,26 +5028,49 @@ describe("PiRpc early process exit", () => {
       const diagnostic = "Error: Unknown option: --pitako-agent-bridge\n";
       for (const example of [
         { stderr: diagnostic, code: 1, rejected: true },
-        { stderr: "\x1b[31mError: Unknown options: --pitako-agent-bridge, --pitako-agent-bridge-grants\x1b[39m\n", code: 1, rejected: true },
+        {
+          stderr:
+            "\x1b[31mError: Unknown options: --pitako-agent-bridge, --pitako-agent-bridge-grants\x1b[39m\n",
+          code: 1,
+          rejected: true,
+        },
         { stderr: "Error: Unknown option: --other\n", code: 1, rejected: false },
-        { stderr: "Error: Unknown options: --pitako-agent-bridge, --other\n", code: 1, rejected: false },
+        {
+          stderr: "Error: Unknown options: --pitako-agent-bridge, --other\n",
+          code: 1,
+          rejected: false,
+        },
         { stderr: diagnostic + "Fatal: extension failed\n", code: 1, rejected: false },
         { stderr: diagnostic.trimEnd(), code: 1, rejected: false },
         { stderr: diagnostic + " ".repeat(16 * 1024), code: 1, rejected: false },
         { stderr: diagnostic, code: 0, rejected: false },
         { stderr: diagnostic, code: 143, rejected: false },
         { stderr: diagnostic, code: 1, stdout: "malformed RPC\n", rejected: false },
-        { stderr: diagnostic, code: 1, stdout: '{"type":"response","success":false}\n', rejected: false },
+        {
+          stderr: diagnostic,
+          code: 1,
+          stdout: '{"type":"response","success":false}\n',
+          rejected: false,
+        },
       ]) {
         yield* Effect.gen(function* () {
           const bytes = new TextEncoder().encode(example.stderr);
-          const spawner = ChildProcessSpawner.make(() => Effect.succeed(makeHandle({
-            exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(example.code)),
-            stderr: Stream.fromIterable([bytes.slice(0, 7), bytes.slice(7)]),
-            stdout: Stream.fromIterable(example.stdout ? [new TextEncoder().encode(example.stdout)] : []),
-          })));
+          const spawner = ChildProcessSpawner.make(() =>
+            Effect.succeed(
+              makeHandle({
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(example.code)),
+                stderr: Stream.fromIterable([bytes.slice(0, 7), bytes.slice(7)]),
+                stdout: Stream.fromIterable(
+                  example.stdout ? [new TextEncoder().encode(example.stdout)] : [],
+                ),
+              }),
+            ),
+          );
           const connection = yield* makePiRpcConnection({
-            command: "pi", args: [], cwd: undefined, env: {},
+            command: "pi",
+            args: [],
+            cwd: undefined,
+            env: {},
             bridgeOptions: ["--pitako-agent-bridge", "--pitako-agent-bridge-grants"],
           }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
           assert.equal(yield* connection.bridgeOptionsRejected, example.rejected);
@@ -4846,17 +5083,31 @@ describe("PiRpc early process exit", () => {
     Effect.gen(function* () {
       for (const uncertain of ["exit", "stderr"] as const) {
         const started = yield* Deferred.make<void>();
-        const spawner = ChildProcessSpawner.make(() => Effect.succeed(makeHandle({
-          exitCode: uncertain === "exit"
-            ? Effect.never
-            : Effect.succeed(ChildProcessSpawner.ExitCode(1)),
-          stderr: Stream.fromIterable([new TextEncoder().encode("Error: Unknown option: --pitako-agent-bridge\n")]).pipe(
-            Stream.concat(Stream.fromEffect(Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)))),
+        const spawner = ChildProcessSpawner.make(() =>
+          Effect.succeed(
+            makeHandle({
+              exitCode:
+                uncertain === "exit"
+                  ? Effect.never
+                  : Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+              stderr: Stream.fromIterable([
+                new TextEncoder().encode("Error: Unknown option: --pitako-agent-bridge\n"),
+              ]).pipe(
+                Stream.concat(
+                  Stream.fromEffect(
+                    Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+                  ),
+                ),
+              ),
+            }),
           ),
-        })));
+        );
         yield* Effect.gen(function* () {
           const connection = yield* makePiRpcConnection({
-            command: "pi", args: [], cwd: undefined, env: {},
+            command: "pi",
+            args: [],
+            cwd: undefined,
+            env: {},
             bridgeOptions: ["--pitako-agent-bridge"],
           }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
           yield* Deferred.await(started);
@@ -4868,94 +5119,137 @@ describe("PiRpc early process exit", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("joins the rejected owned attempt before wrapping its sole flag-free resume winner", () =>
-    Effect.gen(function* () {
-      const original = yield* makeFakePi;
-      const { runtime: originalRuntime } = yield* openRuntime(original);
-      const saved = yield* originalRuntime.ensureThread({
-        threadId: THREAD_ID, modelSelection: modelSelection("default"), runtimePolicy,
-      });
-      const target = "/requested/persisted-session.jsonl";
-      const winner = yield* makeFakePi;
-      let attempts = 0;
-      let joined = false;
-      const wrapped: Array<ReadonlyArray<string>> = [];
-      const spawner = ChildProcessSpawner.make((command) => Effect.gen(function* () {
-        attempts++;
-        if (attempts > 1) {
-          assert.isTrue(joined);
-          return yield* winner.spawner.spawn(command);
-        }
-        yield* Effect.addFinalizer(() => Effect.sync(() => { joined = true; }));
-        return makeHandle({
-          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
-          stderr: Stream.fromIterable([new TextEncoder().encode(
-            "Error: Unknown option: --pitako-agent-bridge\n",
-          )]),
+  it.effect(
+    "joins the rejected owned attempt before wrapping its sole flag-free resume winner",
+    () =>
+      Effect.gen(function* () {
+        const original = yield* makeFakePi;
+        const { runtime: originalRuntime } = yield* openRuntime(original);
+        const saved = yield* originalRuntime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
         });
-      }));
-      const adapter = yield* makePiAdapterV2({
-        instanceId: PI_INSTANCE_ID,
-        settings: yield* decodePiSettings({
-          enabled: true, binaryPath: "pi",
-        }),
-        environment: { FIXTURE_RESOURCE: "preserved" },
-      }).pipe(
-        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        Effect.provideService(AgentScope, {
-          wrap: (input) => Effect.sync(() => {
-            if (wrapped.length > 0) assert.isTrue(joined);
-            wrapped.push([...input.args]);
-            return { command: input.command, args: input.args };
+        const target = "/requested/persisted-session.jsonl";
+        const winner = yield* makeFakePi;
+        let attempts = 0;
+        let joined = false;
+        const wrapped: Array<ReadonlyArray<string>> = [];
+        const spawner = ChildProcessSpawner.make((command) =>
+          Effect.gen(function* () {
+            attempts++;
+            if (attempts > 1) {
+              assert.isTrue(joined);
+              return yield* winner.spawner.spawn(command);
+            }
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                joined = true;
+              }),
+            );
+            return makeHandle({
+              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+              stderr: Stream.fromIterable([
+                new TextEncoder().encode("Error: Unknown option: --pitako-agent-bridge\n"),
+              ]),
+            });
           }),
-          clear: () => Effect.void,
-          oomKilled: () => Effect.succeed(false),
-        }),
-      );
-      const runtime = yield* adapter.openSession({
-        threadId: THREAD_ID, providerSessionId: SESSION_ID,
-        modelSelection: modelSelection("default"),
-        runtimePolicy: { ...runtimePolicy, runtimeMode: "auto" },
-      });
-      assert.equal(attempts, 2);
-      assert.deepEqual(wrapped[1], wrapped[0]!.filter((arg) => !arg.startsWith("--pitako-agent-bridge")));
-      assert.equal(winner.lastSpawn().env.FIXTURE_RESOURCE, "preserved");
-      assert.deepEqual(winner.allRequests(), []);
-      const resumed = yield* runtime.resumeThread({
-        providerThread: {
-          ...saved,
-          nativeThreadRef: { ...saved.nativeThreadRef!, nativeId: target },
-        },
-      });
-      assert.equal(resumed.nativeThreadRef?.nativeId, target);
-      assert.equal(winner.allRequests().filter((record) => record.type === "switch_session").length, 1);
-      assert.equal(winner.allRequests().find((record) => record.type === "switch_session")?.sessionPath, target);
-      assert.isFalse(winner.allRequests().some((record) => record.type === "prompt" || record.type === "new_session"));
-      assert.isDefined(runtime.nativeWorkers);
-      assert.isFalse(yield* runtime.nativeWorkers!.hasPendingWork([]));
-      assert.deepEqual(yield* runtime.nativeWorkers!.readBackgroundPending(), {
-        state: "unavailable", reason: "stale_owner",
-      });
-      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
-    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+        );
+        const adapter = yield* makePiAdapterV2({
+          instanceId: PI_INSTANCE_ID,
+          settings: yield* decodePiSettings({
+            enabled: true,
+            binaryPath: "pi",
+          }),
+          environment: { FIXTURE_RESOURCE: "preserved" },
+        }).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provideService(AgentScope, {
+            wrap: (input) =>
+              Effect.sync(() => {
+                if (wrapped.length > 0) assert.isTrue(joined);
+                wrapped.push([...input.args]);
+                return { command: input.command, args: input.args };
+              }),
+            clear: () => Effect.void,
+            oomKilled: () => Effect.succeed(false),
+          }),
+        );
+        const runtime = yield* adapter.openSession({
+          threadId: THREAD_ID,
+          providerSessionId: SESSION_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy: { ...runtimePolicy, runtimeMode: "auto" },
+        });
+        assert.equal(attempts, 2);
+        assert.deepEqual(
+          wrapped[1],
+          wrapped[0]!.filter((arg) => !arg.startsWith("--pitako-agent-bridge")),
+        );
+        assert.equal(winner.lastSpawn().env.FIXTURE_RESOURCE, "preserved");
+        assert.deepEqual(winner.allRequests(), []);
+        const resumed = yield* runtime.resumeThread({
+          providerThread: {
+            ...saved,
+            nativeThreadRef: { ...saved.nativeThreadRef!, nativeId: target },
+          },
+        });
+        assert.equal(resumed.nativeThreadRef?.nativeId, target);
+        assert.equal(
+          winner.allRequests().filter((record) => record.type === "switch_session").length,
+          1,
+        );
+        assert.equal(
+          winner.allRequests().find((record) => record.type === "switch_session")?.sessionPath,
+          target,
+        );
+        assert.isFalse(
+          winner
+            .allRequests()
+            .some((record) => record.type === "prompt" || record.type === "new_session"),
+        );
+        assert.isDefined(runtime.nativeWorkers);
+        assert.isFalse(yield* runtime.nativeWorkers!.hasPendingWork([]));
+        assert.deepEqual(yield* runtime.nativeWorkers!.readBackgroundPending(), {
+          state: "unavailable",
+          reason: "stale_owner",
+        });
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
   it.effect("never replaces responsive invalid RPC or unrelated startup rejection", () =>
     Effect.gen(function* () {
-      for (const failure of ["negative-rpc", "malformed-state", "unrelated-option", "spawn"] as const) {
+      for (const failure of [
+        "negative-rpc",
+        "malformed-state",
+        "unrelated-option",
+        "spawn",
+      ] as const) {
         const fake = yield* makeFakePi;
         if (failure === "negative-rpc") fake.failNextState();
         if (failure === "malformed-state") fake.queueState({ sessionFile: null });
         let attempts = 0;
         const spawner = ChildProcessSpawner.make((command) => {
           attempts++;
-          if (failure === "spawn") return Effect.fail(PlatformError.systemError({
-            _tag: "NotFound", module: "ChildProcess", method: "spawn", description: "missing binary",
-          }));
-          if (failure === "unrelated-option") return Effect.succeed(makeHandle({
-            exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
-            stderr: Stream.fromIterable([new TextEncoder().encode("Error: Unknown option: --other\n")]),
-          }));
+          if (failure === "spawn")
+            return Effect.fail(
+              PlatformError.systemError({
+                _tag: "NotFound",
+                module: "ChildProcess",
+                method: "spawn",
+                description: "missing binary",
+              }),
+            );
+          if (failure === "unrelated-option")
+            return Effect.succeed(
+              makeHandle({
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+                stderr: Stream.fromIterable([
+                  new TextEncoder().encode("Error: Unknown option: --other\n"),
+                ]),
+              }),
+            );
           return fake.spawner.spawn(command);
         });
         yield* Effect.gen(function* () {
@@ -4964,10 +5258,14 @@ describe("PiRpc early process exit", () => {
             settings: yield* decodePiSettings({ enabled: true, binaryPath: "pi" }),
             environment: {},
           }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
-          const error = yield* adapter.openSession({
-            threadId: THREAD_ID, providerSessionId: SESSION_ID,
-            modelSelection: modelSelection("default"), runtimePolicy,
-          }).pipe(Effect.flip);
+          const error = yield* adapter
+            .openSession({
+              threadId: THREAD_ID,
+              providerSessionId: SESSION_ID,
+              modelSelection: modelSelection("default"),
+              runtimePolicy,
+            })
+            .pipe(Effect.flip);
           assert.equal(error._tag, "ProviderAdapterOpenSessionError");
           assert.equal(attempts, 1);
           assert.isFalse(fake.allRequests().some((record) => record.type !== "get_state"));

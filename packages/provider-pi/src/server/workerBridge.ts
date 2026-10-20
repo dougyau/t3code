@@ -9,6 +9,7 @@ import * as Stream from "effect/Stream";
 import {
   PiNativeWorkerRecord,
   PiNativeWorkerAdmission,
+  ProviderDriverKind,
   type PiNativeWorkerSummary,
   type PiNativeWorkerCheckpoint,
   type PiNativeWorkerBinding,
@@ -280,7 +281,10 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
   private readonly work = new Set<Promise<unknown>>();
   private readonly listeners = new Set<() => void>();
   private readinessCancel: (() => void) | undefined;
-  private binding: { sessionId: string | undefined; task: Promise<void> } | undefined;
+  private binding:
+    | { sessionId: string | undefined; sessionFile: string | undefined; task: Promise<void> }
+    | undefined;
+  private sessionFile: string | undefined;
   private state: "connecting" | "ready" | "unavailable" | "stale_owner" = "connecting";
   private launchFailed: boolean;
 
@@ -311,6 +315,16 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
   }
   get owner() {
     return this.state === "ready" ? this.client?.owner : undefined;
+  }
+  get coordinatorBinding(): ProviderNativeWorkersPort["coordinatorBinding"] {
+    const owner = this.owner;
+    return owner && this.sessionFile
+      ? {
+          owner,
+          ownerGeneration: this.generation,
+          nativeThreadRef: { driver: ProviderDriverKind.make("pi"), nativeId: this.sessionFile },
+        }
+      : undefined;
   }
   readonly hints = Stream.callback<void>(
     (queue) =>
@@ -371,19 +385,42 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
       check();
     });
   }
-  /** Correlated stdio get_state session ID is authoritative, never sessionFile/descriptor. */
-  readonly bind = (sessionId: string | undefined) =>
+  /** Only a correlated stdio get_state pair binds a file to the handshake session ID. */
+  readonly bind = (
+    sessionId: string | undefined,
+    sessionFile?: string,
+    expectedGeneration = this.generation,
+  ) =>
     Effect.promise(async () => {
-      if (this.launchFailed || this.closed || !this.directory) return;
-      if (this.binding && this.binding.sessionId === sessionId) return this.binding.task;
-      if (this.binding) await this.invalidateNative();
-      if (this.client?.owner.coordinatorSessionId === sessionId) return;
-      if (this.client) await this.invalidateNative();
+      if (
+        this.launchFailed ||
+        this.closed ||
+        !this.directory ||
+        expectedGeneration !== this.generation
+      )
+        return;
+      if (
+        this.binding &&
+        this.binding.sessionId === sessionId &&
+        this.binding.sessionFile === sessionFile
+      )
+        return this.binding.task;
+      if (
+        !this.binding &&
+        this.client?.owner.coordinatorSessionId === sessionId &&
+        this.sessionFile === sessionFile
+      )
+        return;
+      // Invalidate synchronously before awaiting retirement, so competing binds
+      // and lifecycle invalidation cannot resurrect an older get_state result.
+      const retirement = this.binding || this.client ? this.invalidateNative() : Promise.resolve();
       const generation = this.generation;
       const directory = this.directory;
       const task = this.track(
         (async () => {
           try {
+            await retirement;
+            if (generation !== this.generation || this.closed) return;
             if (!sessionId)
               throw new BridgeError("missing_session_id", "Pi returned no session ID");
             await this.descriptorReady();
@@ -395,6 +432,7 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
               return;
             }
             this.client = client;
+            this.sessionFile = sessionFile;
             if (
               ![
                 "workers.detail.public-v1",
@@ -407,7 +445,9 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
               this.state = "ready";
               // A subscription is only an optimization. A publicDetail probe never depends on it.
               try {
-                this.subscription = await client.subscribe(() => this.hint());
+                const subscription = await client.subscribe(() => this.hint());
+                if (generation !== this.generation || this.closed) await subscription.dispose();
+                else this.subscription = subscription;
               } catch {
                 /* Refresh on demand. */
               }
@@ -419,7 +459,7 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
           }
         })(),
       );
-      this.binding = { sessionId, task };
+      this.binding = { sessionId, sessionFile, task };
       try {
         await task;
       } finally {
@@ -862,14 +902,17 @@ export class PiWorkerBridge implements ProviderNativeWorkersPort {
   private async invalidateNative() {
     this.generation++;
     this.state = "stale_owner";
+    this.binding = undefined;
+    this.sessionFile = undefined;
     this.readinessCancel?.();
     const subscription = this.subscription;
     this.subscription = undefined;
     const disposal = subscription?.dispose().catch(() => undefined);
     const client = this.client;
     this.client = undefined;
+    const work = [...this.work];
     if (client) await client.disconnect();
-    await Promise.allSettled([...(disposal ? [disposal] : []), ...this.work]);
+    await Promise.allSettled([...(disposal ? [disposal] : []), ...work]);
     this.hint();
   }
   readonly close = Effect.sync(() => {
