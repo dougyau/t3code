@@ -340,6 +340,8 @@ const member = {
     },
   ],
 } satisfies PiArchitectureRecord;
+const longProposal =
+  "Proposal earlier 🧠 " + "Café e\u0301 中文 👩🏽‍💻 🧭 ".repeat(100) + "EXACT CONTRIBUTION END 🦉";
 function publication(id: string, ordinal: number, round: number): PiArchitectureRecord {
   return {
     kind: "publication",
@@ -358,8 +360,10 @@ function publication(id: string, ordinal: number, round: number): PiArchitecture
       attemptId: `attempt-${id}`,
       body: {
         kind: "contribution",
-        proposal: `Proposal ${id} 🧠`,
-        arguments: ["Explicit argument"],
+        proposal: id === "earlier" ? longProposal : `Proposal ${id} 🧠`,
+        arguments: [
+          id === "earlier" ? "Secondary argument remains verbatim 🏗️" : "Explicit argument",
+        ],
         objections: [
           { memberId: "absent-member", messageId: "absent-message", argument: "Missing reference" },
           ...(id === "latest"
@@ -372,7 +376,10 @@ function publication(id: string, ordinal: number, round: number): PiArchitecture
               ]
             : []),
         ],
-        doubts: [],
+        doubts:
+          id === "earlier"
+            ? [{ question: "Exact doubt?", purpose: "Original doubt purpose 🔎" }]
+            : [],
       },
       native: { sessionId: "native-child", toolCallId: id, persistence: "unconfirmed" },
       doubts: [],
@@ -489,7 +496,9 @@ function control(renderer: ReactTestRenderer, label: string) {
   const found = renderer.root.findAll(
     (node) =>
       (node.type === "button" || String(node.type) === "Pressable") &&
-      (text(node) === label || node.props.accessibilityLabel === label),
+      (text(node) === label ||
+        node.props["aria-label"] === label ||
+        node.props.accessibilityLabel === label),
   )[0];
   if (!found) throw new Error(`Missing control: ${label}\n${text(renderer.root).slice(0, 3000)}`);
   return found;
@@ -835,6 +844,12 @@ it.effect(
               }>("../../../mobile/src/features/threads/ThreadAgentsSheet.tsx"),
             );
             let focusedTab: string | null = null;
+            const referenceScroll = vi.fn(() => {
+              // Reference navigation must expose the real full target before scrolling.
+              expect(text(web!.root)).toContain(longProposal);
+              expect(text(web!.root)).toContain("Secondary argument remains verbatim 🏗️");
+            });
+            const referenceFocus = vi.fn();
             vi.stubGlobal("document", {
               getElementById: (id: string) =>
                 web?.root.findAll((node) => node.props.role === "tab" && node.props.id === id)
@@ -844,7 +859,9 @@ it.effect(
                         focusedTab = id;
                       },
                     }
-                  : null,
+                  : id === "publication-earlier"
+                    ? { scrollIntoView: referenceScroll, focus: referenceFocus }
+                    : null,
             });
             vi.stubGlobal("window", Object.assign(new EventTarget(), { localStorage }));
             // Layout inputs are host events, not physical geometry evidence.
@@ -935,6 +952,29 @@ it.effect(
             expect(text(web!.root)).toContain("missed native interval");
             expect(text(web!.root)).not.toContain("historical-table");
             expect(text(web!.root)).not.toContain("Observation stale");
+            expect(text(web!.root)).toContain("2 participants");
+            expect(text(web!.root)).not.toContain("Technical details");
+            expect(text(web!.root)).toContain("Native closure could not be confirmed.");
+            host.navigate.mockClear();
+            yield* Effect.promise(() => press(web!, "Expand Architect participants"));
+            expect(host.navigate).not.toHaveBeenCalled();
+            expect(text(web!.root)).toContain("Specialist · architect · #1");
+            expect(text(web!.root)).toContain("Completed");
+            const identifiers = web!.root.findAllByType("details")[0]!;
+            expect(identifiers.props.open).not.toBe(true);
+            expect(text(identifiers)).toContain("Member ID: specialist");
+            yield* Effect.promise(() => press(web!, "Collapse Architect participants"));
+            expect(text(web!.root)).not.toContain("Specialist · architect · #1");
+            yield* Effect.promise(() => press(web!, "Expand Architect participants"));
+            expect(text(web!.root)).toContain("Specialist · architect · #1");
+            yield* Effect.promise(() => press(web!, "Open Architect table"));
+            expect(host.navigate).toHaveBeenCalledWith({
+              to: "/architect/$environmentId/$threadId/$tableId",
+              params: target,
+            });
+            yield* Effect.promise(() => act(async () => web!.update(table())));
+            expect(text(web!.root)).toContain("missed native interval");
+            expect(text(web!.root)).not.toContain("Observation stale");
             const technical = web!.root.findAllByType("details")[0]!;
             expect(technical.props.open).toBe(false);
             yield* Effect.promise(() =>
@@ -950,24 +990,6 @@ it.effect(
             );
             expect(technical.props.open).toBe(false);
             expect(text(technical)).not.toContain("Observation stale");
-            expect(text(web!.root)).toContain("Native closure could not be confirmed.");
-            const details = web!.root.findAllByType("details")[1]!;
-            yield* Effect.promise(() =>
-              act(async () => invoke(details, "onToggle", { currentTarget: { open: true } })),
-            );
-            expect(text(web!.root)).toContain("Specialist · architect · #1");
-            expect(text(details)).toContain("Completed");
-            const identifiers = details.findAllByType("details")[0]!;
-            expect(identifiers.props.open).not.toBe(true);
-            expect(text(identifiers)).toContain("Member ID: specialist");
-            yield* Effect.promise(() => press(web!, "Open Architect table"));
-            expect(host.navigate).toHaveBeenCalledWith({
-              to: "/architect/$environmentId/$threadId/$tableId",
-              params: target,
-            });
-            yield* Effect.promise(() => act(async () => web!.update(table())));
-            expect(text(web!.root)).toContain("missed native interval");
-            expect(text(web!.root)).not.toContain("Observation stale");
             yield* Effect.promise(() => press(web!, "Read original brief"));
             const expectBriefMode = (selected: "Reading" | "Source") => {
               for (const label of ["Reading", "Source"]) {
@@ -1063,9 +1085,60 @@ it.effect(
             yield* Effect.promise(() => press(web!, "Debate"));
             yield* Effect.promise(() => press(web!, "Round 1"));
             expect(text(web!.root)).toContain("Proposal earlier 🧠");
+            expect(text(web!.root)).toContain("Specialist · architect · #1 · Contribution");
+            expect(text(web!.root)).toContain("Contribution excerpt · Proposal");
+            expect(text(web!.root)).not.toContain("EXACT CONTRIBUTION END 🦉");
+            expect(text(web!.root)).not.toContain("Secondary argument remains verbatim 🏗️");
+            expect(text(web!.root)).not.toContain("snapshot-earlier");
+            const publicationTechnical = web!.root
+              .findAllByType("details")
+              .find((node) => text(node).includes("Contribution technical details"))!;
+            expect(publicationTechnical.props.open).toBe(false);
+            yield* Effect.promise(() =>
+              act(async () =>
+                invoke(publicationTechnical, "onToggle", { currentTarget: { open: true } }),
+              ),
+            );
             expect(text(web!.root)).toContain(
               "Snapshot snapshot-earlier · turn turn-earlier · attempt attempt-earlier",
             );
+            expect(text(publicationTechnical)).toContain("Member ID: specialist");
+            expect(text(publicationTechnical)).toContain("Message ID: earlier");
+            yield* Effect.promise(() => press(web!, "Read full contribution"));
+            expect(text(web!.root)).toContain(longProposal);
+            expect(text(web!.root)).toContain("Secondary argument remains verbatim 🏗️");
+            expect(text(web!.root)).toContain("Exact doubt?");
+            expect(text(web!.root)).toContain("Original doubt purpose 🔎");
+            const earlierContribution = web!.root.findAll(
+              (node) => node.type === "article" && node.props.id === "publication-earlier",
+            )[0]!;
+            expect(earlierContribution).toBeDefined();
+            expect(text(earlierContribution)).toContain("Reference unavailable: absent-member");
+            expect(text(earlierContribution)).toContain("absent-message");
+            expect(text(earlierContribution)).toContain("Missing reference");
+            yield* Effect.promise(() => press(web!, "Show less"));
+            expect(text(web!.root)).not.toContain("EXACT CONTRIBUTION END 🦉");
+            yield* Effect.promise(() => press(web!, "Round 1"));
+            const referenceFrames: Array<() => void> = [];
+            vi.stubGlobal("requestAnimationFrame", (fn: () => void) => {
+              referenceFrames.push(fn);
+              return 0;
+            });
+            yield* Effect.promise(() => press(web!, "Read referenced contribution"));
+            yield* Effect.promise(() =>
+              act(async () => referenceFrames.splice(0).forEach((frame) => frame())),
+            );
+            vi.stubGlobal("requestAnimationFrame", (fn: () => void) => {
+              fn();
+              return 0;
+            });
+            expect(referenceScroll).toHaveBeenCalledOnce();
+            expect(referenceFocus).toHaveBeenCalledOnce();
+            expect(text(web!.root)).toContain(longProposal);
+            expect(registry.get(tablePresentationAtom(target)).expanded).toMatchObject({
+              "Round 1": true,
+              "contribution:earlier": true,
+            });
             pane.scrollTop = 532;
             yield* Effect.promise(() =>
               act(async () =>
@@ -1354,6 +1427,13 @@ it.effect(
               reading: { Debate: { id: "publication:earlier", offset: 50 } },
             });
             expect(text(web!.root)).toContain("Proposal inserted 🧠");
+            expect(text(web!.root)).toContain(longProposal);
+            expect(text(web!.root)).toContain("Secondary argument remains verbatim 🏗️");
+            expect(
+              registry.get(tablePresentationAtom(target)).expanded["contribution:earlier"],
+            ).toBe(true);
+            expect(pane.scrollTop).toBe(532);
+            expect(referenceScroll).toHaveBeenCalledOnce();
             expect(text(native!.root)).toContain("Proposal inserted 🧠");
             shift = 300;
             yield* Effect.promise(() => act(async () => emitResize()));

@@ -1,7 +1,7 @@
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import type { ScopedThreadRef } from "@t3tools/contracts";
-import { Outlet, useNavigate, useParams } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { Outlet, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { useEffect, useState, type ReactNode } from "react";
 
 import ChatView from "./ChatView";
 import { resolveDraftPromotionNavigationTarget, threadHasStarted } from "./ChatView.logic";
@@ -25,11 +25,14 @@ import {
   type ThreadRouteTarget,
 } from "../threadRoutes";
 
-/** Table routes share coordinator params, but must not select its chat surface. */
+/** Keep the coordinator workspace across chat/table swaps; participants own their workspace. */
 export function ThreadRouteOutlet() {
   const params = useParams({ strict: false });
+  const search = useSearch({ strict: false });
   const target = resolveThreadRouteTarget(params);
-  return !("tableId" in params) && target ? <ThreadRouteView target={target} /> : <Outlet />;
+  const table = "tableId" in params;
+  if (!target || (table && search.participant)) return <Outlet />;
+  return <ThreadRouteView target={target} mainContent={table ? <Outlet /> : undefined} />;
 }
 
 /**
@@ -45,7 +48,13 @@ export function ThreadRouteOutlet() {
  * Rendered by the `_chat` layout rather than by the two leaf routes, since
  * an element only survives a route swap when the same parent renders it.
  */
-export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
+export function ThreadRouteView({
+  target,
+  mainContent,
+}: {
+  target: ThreadRouteTarget;
+  mainContent?: ReactNode;
+}) {
   const navigate = useNavigate();
   const draftId = target.kind === "draft" ? target.draftId : null;
   const draftSession = useComposerDraftStore((store) =>
@@ -194,6 +203,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
         environmentId={target.threadRef.environmentId}
         threadId={target.threadRef.threadId}
         routeKind="server"
+        mainContent={mainContent}
       />
     );
   }

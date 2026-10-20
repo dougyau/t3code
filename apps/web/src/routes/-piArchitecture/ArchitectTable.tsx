@@ -1,6 +1,7 @@
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import {
   debateGroups,
+  participantLabel,
   participantModel,
   recordSections,
   tableKey,
@@ -27,7 +28,6 @@ import ChatMarkdown from "../../components/ChatMarkdown";
 import { Button } from "../../components/ui/button";
 import { observeResize } from "../../lib/observeResize";
 import { cn } from "../../lib/utils";
-import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "../../workspaceTitlebar";
 import { piArchitecture } from "./state";
 import { TableStatus } from "./TableStatus";
 
@@ -142,7 +142,11 @@ export function ArchitectTable({
     update({
       tab: "Debate",
       briefOpen: false,
-      expanded: { ...presentation.expanded, [group.id]: true },
+      expanded: {
+        ...presentation.expanded,
+        [group.id]: true,
+        [`contribution:${messageId}`]: true,
+      },
       reading: { ...presentation.reading, Debate: point.current },
     });
     requestAnimationFrame(() => {
@@ -156,71 +160,93 @@ export function ArchitectTable({
       key={`${record.kind}:${record.id}`}
       data-reading-id={record.kind === "publication" ? undefined : `${record.kind}:${record.id}`}
     >
-      <RecordContent {...{ target, atoms, record }} records={records} onReference={openReference} />
+      <RecordContent
+        {...{ target, atoms, record }}
+        records={records}
+        onReference={openReference}
+        expanded={
+          record.kind === "publication"
+            ? presentation.expanded[`contribution:${record.messageId}`] === true
+            : false
+        }
+        onExpandedChange={(expanded) => {
+          if (record.kind === "publication")
+            update({
+              expanded: {
+                ...presentation.expanded,
+                [`contribution:${record.messageId}`]: expanded,
+              },
+            });
+        }}
+      />
     </div>
   );
   return (
     <section
-      className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+      className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background font-sans text-sm leading-relaxed text-foreground"
       aria-label="Architect table"
     >
-      <header className={cn("shrink-0 border-b p-4", COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS)}>
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h1 ref={heading} tabIndex={-1} className="text-lg font-semibold">
-            Architect table
-          </h1>
-          <Button variant="outline" size="sm" onClick={onCoordinator}>
-            Return to coordinator
-          </Button>
-        </div>
-        {summary ? (
-          <div className="mt-3">
-            <TableStatus summary={summary} />
+      <header className="shrink-0 border-b py-4 ps-(--chat-lane-inset-start) pe-(--chat-lane-inset-end)">
+        <div className="mx-auto box-content max-w-(--chat-content-max-width) px-3 sm:px-12">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h1 ref={heading} tabIndex={-1} className="text-lg font-semibold">
+              Architect table
+            </h1>
+            <Button variant="outline" size="sm" onClick={onCoordinator}>
+              Return to coordinator
+            </Button>
           </div>
-        ) : null}
+          {summary ? (
+            <div className="mt-3">
+              <TableStatus summary={summary} />
+            </div>
+          ) : null}
+        </div>
       </header>
       <div
         role="tablist"
         aria-label="Architect table sections"
-        className="flex shrink-0 flex-wrap gap-2 border-b p-2"
+        className="shrink-0 border-b py-2 ps-(--chat-lane-inset-start) pe-(--chat-lane-inset-end)"
       >
-        {tableTabs.map((tab, index) => (
-          <button
-            key={tab}
-            role="tab"
-            id={`architect-tab-${tab}`}
-            aria-controls="architect-reading-pane"
-            aria-selected={presentation.tab === tab}
-            tabIndex={presentation.tab === tab ? 0 : -1}
-            type="button"
-            className={cn(
-              "rounded-md border-b-2 px-3 py-2 text-sm focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
-              presentation.tab === tab
-                ? "border-primary bg-primary font-semibold text-primary-foreground focus-visible:outline-primary-foreground"
-                : "border-transparent font-normal text-muted-foreground hover:bg-muted hover:text-foreground",
-            )}
-            onClick={() => changeTab(tab)}
-            onKeyDown={(event) => {
-              const next =
-                event.key === "ArrowRight"
-                  ? (index + 1) % tableTabs.length
-                  : event.key === "ArrowLeft"
-                    ? (index + tableTabs.length - 1) % tableTabs.length
-                    : event.key === "Home"
-                      ? 0
-                      : event.key === "End"
-                        ? tableTabs.length - 1
-                        : null;
-              if (next === null) return;
-              event.preventDefault();
-              const tab = tableTabs[next]!;
-              changeTab(tab);
-              document.getElementById(`architect-tab-${tab}`)?.focus();
-            }}
-          >
-            {tab}
-          </button>
-        ))}
+        <div className="mx-auto box-content flex max-w-(--chat-content-max-width) flex-wrap gap-2 px-3 sm:px-12">
+          {tableTabs.map((tab, index) => (
+            <button
+              key={tab}
+              role="tab"
+              id={`architect-tab-${tab}`}
+              aria-controls="architect-reading-pane"
+              aria-selected={presentation.tab === tab}
+              tabIndex={presentation.tab === tab ? 0 : -1}
+              type="button"
+              className={cn(
+                "rounded-md border-b-2 px-3 py-2 text-sm focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
+                presentation.tab === tab
+                  ? "border-primary bg-primary font-semibold text-primary-foreground focus-visible:outline-primary-foreground"
+                  : "border-transparent font-normal text-muted-foreground hover:bg-muted hover:text-foreground",
+              )}
+              onClick={() => changeTab(tab)}
+              onKeyDown={(event) => {
+                const next =
+                  event.key === "ArrowRight"
+                    ? (index + 1) % tableTabs.length
+                    : event.key === "ArrowLeft"
+                      ? (index + tableTabs.length - 1) % tableTabs.length
+                      : event.key === "Home"
+                        ? 0
+                        : event.key === "End"
+                          ? tableTabs.length - 1
+                          : null;
+                if (next === null) return;
+                event.preventDefault();
+                const tab = tableTabs[next]!;
+                changeTab(tab);
+                document.getElementById(`architect-tab-${tab}`)?.focus();
+              }}
+            >
+              {tab}
+            </button>
+          ))}
+        </div>
       </div>
       <div
         ref={pane}
@@ -229,9 +255,12 @@ export function ArchitectTable({
         onScroll={saveReadingPoint}
         aria-labelledby={`architect-tab-${presentation.tab}`}
         tabIndex={0}
-        className="scrollbar-gutter-both min-h-0 min-w-0 flex-1 overflow-y-auto p-4 [overflow-wrap:anywhere]"
+        className="scrollbar-gutter-both min-h-0 min-w-0 flex-1 overflow-y-auto py-4 ps-(--chat-lane-inset-start) pe-(--chat-lane-inset-end) [overflow-wrap:anywhere]"
       >
-        <div ref={content} className="mx-auto flex min-w-0 max-w-4xl flex-col gap-5">
+        <div
+          ref={content}
+          className="mx-auto box-content flex min-w-0 max-w-(--chat-content-max-width) flex-col gap-5 px-3 sm:px-12"
+        >
           {missingPoint ? (
             <p role="status">
               Saved reading location unavailable. Showing the nearest retained position.
@@ -318,16 +347,19 @@ export function ArchitectTable({
             </>
           ) : presentation.tab === "Debate" ? (
             <>
-              <div data-reading-id="preparation">
-                <Button variant="outline" size="sm" onClick={() => update({ briefOpen: true })}>
+              <div
+                data-reading-id="preparation"
+                role="toolbar"
+                aria-label="Debate actions"
+                className="flex flex-wrap items-center gap-2"
+              >
+                <Button variant="ghost" size="xs" onClick={() => update({ briefOpen: true })}>
                   Read original brief
                 </Button>
-              </div>
-              {groups.length ? (
-                <div>
+                {groups.length ? (
                   <Button
-                    variant="outline"
-                    size="sm"
+                    variant="ghost"
+                    size="xs"
                     onClick={() => {
                       const latest = groups.at(-1)!;
                       update({ expanded: { ...presentation.expanded, [latest.id]: true } });
@@ -338,8 +370,8 @@ export function ArchitectTable({
                   >
                     Go to latest contributions
                   </Button>
-                </div>
-              ) : null}
+                ) : null}
+              </div>
               {groups.length === 0 ? <p>No settled contributions captured.</p> : null}
               {groups.map((group, index) => {
                 const expanded = presentation.expanded[group.id] ?? index === groups.length - 1;
@@ -360,29 +392,71 @@ export function ArchitectTable({
                       {group.id}
                     </Button>
                     {expanded
-                      ? group.publications.map((publication) => (
-                          <article
-                            key={publication.id}
-                            data-reading-id={`publication:${publication.messageId}`}
-                            id={`publication-${publication.messageId}`}
-                            tabIndex={-1}
-                            className="mt-4 min-w-0"
-                          >
-                            <h3 className="font-semibold">
-                              {members.find((member) => member.id === publication.memberId)
-                                ?.roleId ?? publication.memberId}
-                              {" · "}
-                              {publication.memberId}
-                              {" · "}
-                              {publication.stage}
-                            </h3>
-                            <p className="break-all text-xs text-muted-foreground">
-                              Snapshot {publication.snapshotId} · turn {publication.turnId} ·
-                              attempt {publication.attemptId}
-                            </p>
-                            {textRecord(publication)}
-                          </article>
-                        ))
+                      ? group.publications.map((publication) => {
+                          const member = members.find(
+                            (member) => member.id === publication.memberId,
+                          );
+                          const technicalKey = `technical:${publication.messageId}`;
+                          const technicalOpen = presentation.expanded[technicalKey] === true;
+                          return (
+                            <article
+                              key={publication.id}
+                              data-reading-id={`publication:${publication.messageId}`}
+                              id={`publication-${publication.messageId}`}
+                              tabIndex={-1}
+                              className="mt-4 min-w-0"
+                            >
+                              <h3 className="font-semibold">
+                                {member ? participantLabel(member) : "Author unavailable"}
+                                {" · "}
+                                {
+                                  {
+                                    composition: "Composition",
+                                    preparation: "Preparation",
+                                    contribution: "Contribution",
+                                    decision: "Decision",
+                                    answer: "Answer",
+                                    "consultation-plan": "Consultation plan",
+                                    "consultation-response": "Consultation response",
+                                    knowledge: "Knowledge",
+                                    synthesis: "Synthesis",
+                                  }[publication.stage]
+                                }
+                              </h3>
+                              <details
+                                open={technicalOpen}
+                                onToggle={(event) =>
+                                  update({
+                                    expanded: {
+                                      ...presentation.expanded,
+                                      [technicalKey]: event.currentTarget.open,
+                                    },
+                                  })
+                                }
+                                className="text-xs text-muted-foreground"
+                              >
+                                <summary className="cursor-pointer">
+                                  Contribution technical details
+                                </summary>
+                                {technicalOpen ? (
+                                  <div className="break-all">
+                                    <p>
+                                      Publication ID: {publication.id} · Member ID:{" "}
+                                      {publication.memberId}
+                                      {" · "}Assignment ID: {publication.assignmentId} · Message ID:{" "}
+                                      {publication.messageId}
+                                    </p>
+                                    <p>
+                                      Snapshot {publication.snapshotId} · turn {publication.turnId}{" "}
+                                      · attempt {publication.attemptId}
+                                    </p>
+                                  </div>
+                                ) : null}
+                              </details>
+                              {textRecord(publication)}
+                            </article>
+                          );
+                        })
                       : null}
                   </section>
                 );
@@ -450,6 +524,7 @@ export function CapturedContent(props: {
   readonly atoms: PiArchitectureAtoms;
   readonly textId: string;
   readonly captureKey?: string;
+  readonly quietComplete?: boolean;
   readonly children: (text: string) => ReactNode;
 }) {
   const result = useAtomValue(
@@ -478,9 +553,16 @@ export function CapturedContent(props: {
         ) : null
       ) : (
         <>
-          <p className="text-sm text-muted-foreground">
-            {page.source} · {page.complete ? "Complete capture" : "Partial native capture"}
-          </p>
+          {props.quietComplete && page.complete && page.source !== "unavailable" ? (
+            <details className="text-xs text-muted-foreground">
+              <summary className="cursor-pointer">Capture details</summary>
+              {page.source} · Complete capture
+            </details>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              {page.source} · {page.complete ? "Complete capture" : "Partial native capture"}
+            </p>
+          )}
           {page.source === "unavailable" ? (
             <p>Original brief unavailable.</p>
           ) : (
@@ -497,47 +579,100 @@ function RecordContent(props: {
   readonly record: PiArchitectureDetailRecord;
   readonly records: readonly PiArchitectureDetailRecord[];
   readonly onReference: (memberId: string, messageId: string) => void;
+  readonly expanded: boolean;
+  readonly onExpandedChange: (expanded: boolean) => void;
 }) {
   if (!("textId" in props.record)) return null;
   return (
-    <CapturedContent target={props.target} atoms={props.atoms} textId={props.record.textId}>
-      {(text) =>
-        recordSections(props.record, text).map((section, index) => {
-          const referenced =
-            section.reference &&
-            props.records.find(
-              (record) =>
-                record.kind === "publication" &&
-                record.memberId === section.reference?.memberId &&
-                record.messageId === section.reference.messageId,
-            );
+    <CapturedContent
+      target={props.target}
+      atoms={props.atoms}
+      textId={props.record.textId}
+      quietComplete={props.record.kind === "publication"}
+    >
+      {(text) => {
+        const sections = recordSections(props.record, text);
+        const long =
+          props.record.kind === "publication" &&
+          sections.reduce((length, section) => length + section.text.length, 0) > 1000;
+        if (long && !props.expanded) {
+          const first = sections[0]!;
+          const excerpt = [];
+          // Bound the excerpt at grapheme boundaries, not inside a Unicode character.
+          for (const { segment } of new Intl.Segmenter(undefined, {
+            granularity: "grapheme",
+          }).segment(first.text)) {
+            if (excerpt.length === 600) break;
+            excerpt.push(segment);
+          }
           return (
-            <section key={index} className="my-3 min-w-0">
-              <h4 className="text-sm font-semibold">{section.title}</h4>
-              {section.reference ? (
-                referenced ? (
-                  <Button
-                    variant="link"
-                    size="sm"
-                    onClick={() => {
-                      if (section.reference)
-                        props.onReference(section.reference.memberId, section.reference.messageId);
-                    }}
-                  >
-                    Read referenced contribution
-                  </Button>
-                ) : (
-                  <p className="text-sm">
-                    Reference unavailable: {section.reference.memberId} ·{" "}
-                    {section.reference.messageId}
-                  </p>
-                )
-              ) : null}
-              <Markdown target={props.target} text={section.text} />
-            </section>
+            <div className="my-3">
+              <h4 className="text-sm font-semibold">Contribution excerpt · {first.title}</h4>
+              <p className="whitespace-pre-wrap">{excerpt.join("")}…</p>
+              <Button
+                variant="link"
+                size="xs"
+                aria-expanded={false}
+                onClick={() => props.onExpandedChange(true)}
+              >
+                Read full contribution
+              </Button>
+            </div>
           );
-        })
-      }
+        }
+        return (
+          <>
+            {sections.map((section, index) => {
+              const referenced =
+                section.reference &&
+                props.records.find(
+                  (record) =>
+                    record.kind === "publication" &&
+                    record.memberId === section.reference?.memberId &&
+                    record.messageId === section.reference.messageId,
+                );
+              return (
+                <section key={index} className="my-3 min-w-0">
+                  <h4 className="text-sm font-semibold">{section.title}</h4>
+                  {section.reference ? (
+                    referenced ? (
+                      <Button
+                        variant="link"
+                        size="sm"
+                        onClick={() => {
+                          if (section.reference)
+                            props.onReference(
+                              section.reference.memberId,
+                              section.reference.messageId,
+                            );
+                        }}
+                      >
+                        Read referenced contribution
+                      </Button>
+                    ) : (
+                      <p className="text-sm">
+                        Reference unavailable: {section.reference.memberId} ·{" "}
+                        {section.reference.messageId}
+                      </p>
+                    )
+                  ) : null}
+                  <Markdown target={props.target} text={section.text} />
+                </section>
+              );
+            })}
+            {long ? (
+              <Button
+                variant="link"
+                size="xs"
+                aria-expanded={true}
+                onClick={() => props.onExpandedChange(false)}
+              >
+                Show less
+              </Button>
+            ) : null}
+          </>
+        );
+      }}
     </CapturedContent>
   );
 }
