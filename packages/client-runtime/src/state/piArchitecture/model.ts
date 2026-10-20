@@ -170,10 +170,18 @@ export function bodySections(body: PiArchitectureBody): readonly ContentSection[
     values.map((doubt) => ({ title: doubt.question, text: doubt.purpose }));
   switch (body.kind) {
     case "composition":
-      return body.specialists.map((member) => ({
-        title: member.candidateRef,
-        text: `${member.mandate}\n\n${member.reason}`,
-      }));
+      return [
+        ...(body.reason === undefined ? [] : [{ title: "Composition", text: body.reason }]),
+        ...body.specialists.map((member) => ({
+          title:
+            member.kind === "retain"
+              ? `Retain · ${member.memberId}`
+              : member.kind === "add"
+                ? `Add · ${member.candidateRef}`
+                : member.candidateRef,
+          text: `${member.mandate}\n\n${member.reason}`,
+        })),
+      ];
     case "preparation":
       return [{ title: "Analysis", text: body.analysis }, ...doubts(body.doubts)];
     case "contribution":
@@ -244,7 +252,7 @@ export function recordSections(
         return [
           {
             title: `Individual mandate · ${mandate.source}`,
-            text: mandate.source === "TeamAssignment.task" ? mandate.text : "See original brief",
+            text: mandate.source === "root-workbrief" ? "See original brief" : mandate.text,
           },
         ];
       }

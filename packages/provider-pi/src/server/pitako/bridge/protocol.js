@@ -411,9 +411,17 @@ const resolution = (value, statuses, extra) => fields(value, ["doubtId", "status
 export function isPublicArchitectureBody(body) {
   if (!object(body)) return false;
   switch (body.kind) {
-    case "composition": return keys(body, ["kind", "snapshotId", "specialists"]) && nonempty(body.snapshotId) &&
-      Array.isArray(body.specialists) && body.specialists.length >= 1 && body.specialists.length <= 5 && body.specialists.every(item =>
-        fields(item, ["candidateRef", "mandate", "reason"]) && [item.candidateRef, item.mandate, item.reason].every(nonempty));
+    // This consumer decoder also reads history; live submissions use the table schema.
+    case "composition": {
+      if (!nonempty(body.snapshotId) || !Array.isArray(body.specialists) || body.specialists.length > 5) return false;
+      if (!("reason" in body)) return keys(body, ["kind", "snapshotId", "specialists"]) && body.specialists.length >= 1 &&
+        body.specialists.every(item => fields(item, ["candidateRef", "mandate", "reason"]) &&
+          [item.candidateRef, item.mandate, item.reason].every(nonempty));
+      return keys(body, ["kind", "snapshotId", "reason", "specialists"]) && nonempty(body.reason) &&
+        body.specialists.every(item => object(item) && nonempty(item.mandate) && nonempty(item.reason) &&
+          (item.kind === "retain" ? keys(item, ["kind", "memberId", "mandate", "reason"]) && nonempty(item.memberId) :
+            item.kind === "add" && keys(item, ["kind", "candidateRef", "mandate", "reason"]) && nonempty(item.candidateRef)));
+    }
     case "preparation": return keys(body, ["kind", "analysis", "doubts"]) && nonempty(body.analysis) && array(body.doubts, doubt);
     case "contribution": return keys(body, ["kind", "proposal", "arguments", "objections", "doubts"]) && nonempty(body.proposal) && strings(body.arguments) &&
       array(body.objections, item => fields(item, ["memberId", "messageId", "argument"]) && [item.memberId, item.messageId, item.argument].every(nonempty)) && array(body.doubts, doubt);
@@ -454,17 +462,20 @@ function architectureMessage(value) {
 export function isArchitectureRecord(value) {
   if (!object(value) || !string(value.id)) return false;
   switch (value.kind) {
-    case "room": return keys(value, ["kind", "id", "mode", "origin", "goalSource", "lifecycle", "pendingDoubtIds"]) && ["table", "consultation"].includes(value.mode) &&
+    case "room": return keys(value, ["kind", "id", "mode", "origin", "goalSource", "lifecycle", "pendingDoubtIds"]) && optional(value, "mode", mode => ["table", "consultation"].includes(mode)) &&
       fields(value.origin, ["coordinatorSessionId", "tool", "toolCallId", "memberId", "assignmentId", "instanceId"]) && value.origin.tool === "architecture_start" &&
       ["coordinatorSessionId", "toolCallId", "memberId", "assignmentId", "instanceId"].every(key => string(value.origin[key])) &&
       fields(value.goalSource, ["kind", "instanceId"]) && value.goalSource.kind === "worker-workbrief" && string(value.goalSource.instanceId) &&
       architectureLifecycle(value.lifecycle) && strings(value.pendingDoubtIds);
-    case "member": return keys(value, ["kind", "id", "assignmentId", "instanceId", "roleId", "function", "ordinal", "admittedAt", "mandate", "execution", "workerRef", "conversationRefs", "compositionMessageId", "supersededByCompositionId"]) &&
+    case "member": return keys(value, ["kind", "id", "assignmentId", "instanceId", "roleId", "function", "ordinal", "admittedAt", "mandate", "execution", "workerRef", "conversationRefs", "compositionMessageId", "compositionChoiceIndex", "selection", "state", "supersededByCompositionId"]) &&
       ["assignmentId", "instanceId", "roleId"].every(key => string(value[key])) && ["director", "specialist", "support"].includes(value.function) && integer(value.ordinal) && Number.isFinite(value.admittedAt) &&
       object(value.mandate) && (value.mandate.source === "root-workbrief" ? keys(value.mandate, ["source", "instanceId"]) && string(value.mandate.instanceId) :
-        value.mandate.source === "TeamAssignment.task" && keys(value.mandate, ["source", "text"]) && unboundedText(value.mandate.text)) &&
+        ["TeamAssignment.task", "composition"].includes(value.mandate.source) && keys(value.mandate, ["source", "text"]) && unboundedText(value.mandate.text)) &&
       ["accepted", "running", "completed", "failed", "cancelled"].includes(value.execution) && optional(value, "workerRef", item => readReference(item, true)) &&
-      array(value.conversationRefs, item => readReference(item, true)) && ["compositionMessageId", "supersededByCompositionId"].every(key => optional(value, key, string));
+      array(value.conversationRefs, item => readReference(item, true)) && ["compositionMessageId", "supersededByCompositionId"].every(key => optional(value, key, string)) &&
+      optional(value, "compositionChoiceIndex", integer) && optional(value, "selection", item =>
+        fields(item, ["compositionMessageId", "choiceIndex"]) && string(item.compositionMessageId) && integer(item.choiceIndex)) &&
+      optional(value, "state", state => ["preparing", "active", "closing", "closed", "closure-unknown"].includes(state));
     case "publication": return keys(value, ["kind", "id", "message"]) && architectureMessage(value.message) && value.id === value.message.id;
     case "knowledge-boundary": return keys(value, ["kind", "id", "ordinal", "roomId", "cycleId", "planMessageId", "knowledgeMessageId", "resolutions"]) &&
       integer(value.ordinal) && ["roomId", "cycleId", "planMessageId"].every(key => string(value[key])) &&
@@ -503,7 +514,7 @@ function architectureReply(value, method, owner) {
       !(value.next === null || architectureCursor(value.next))) return false;
   if (method === "architecture.list") return keys(value, ["format", "state", "owner", "snapshotId", "cut", "items", "next"]) && isOwner(value.owner) && sameOwner(value.owner, owner) &&
     array(value.items, item => fields(item, ["ref", "mode", "director", "lifecycle"]) && isArchitectureRef(item.ref) && sameOwner(item.ref, owner) &&
-      ["table", "consultation"].includes(item.mode) && architectureIdentity(item.director) && architectureLifecycle(item.lifecycle));
+      optional(item, "mode", mode => ["table", "consultation"].includes(mode)) && architectureIdentity(item.director) && architectureLifecycle(item.lifecycle));
   return keys(value, ["format", "state", "ref", "snapshotId", "cut", "capture", "records", "next"]) && isArchitectureRef(value.ref) && sameOwner(value.ref, owner) &&
     fields(value.capture, ["state", "finalCut", "gaps"]) && ["open", "closed", "incomplete"].includes(value.capture.state) &&
     (value.capture.finalCut === null || integer(value.capture.finalCut) && value.capture.finalCut <= value.cut) && array(value.capture.gaps, item => ["not_captured", "capture_failed"].includes(item)) &&

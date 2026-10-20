@@ -118,7 +118,7 @@ function coordinator(root: string, pitako: string) {
     )
     .replace(
       /role: "researcher", task: "Offline background fixture"[\s\S]*?task: "Offline Team fixture" \} \}/,
-      `mode: "table", goal: ${JSON.stringify(goal)} } }`,
+      `goal: ${JSON.stringify(goal)} } }`,
     );
 }
 
@@ -177,6 +177,7 @@ describe.skipIf(process.env.T3_PITAKO_NATIVE_TEST_ROOT === undefined)(
               const catalog = yield* Effect.promise(() => fixture.client.listArchitectures());
               assert.equal(catalog.state, "ready");
               if (catalog.state !== "ready") throw Error("Missing native catalog");
+              for (const item of catalog.items) assert.notProperty(item, "mode");
               assert.sameMembers(
                 catalog.items.map((item) => item.ref.roomId),
                 starts.map((start) => start.details.roomId),
@@ -206,7 +207,7 @@ describe.skipIf(process.env.T3_PITAKO_NATIVE_TEST_ROOT === undefined)(
               assert.equal(members.filter((member) => member.function === "support").length, 1);
               const failed = members.find(
                 (member) =>
-                  member.mandate.source === "TeamAssignment.task" &&
+                  member.mandate.source === "composition" &&
                   member.mandate.text === "Fails before contribution",
               )!;
               assert.equal(failed.execution, "failed");
@@ -312,38 +313,93 @@ describe.skipIf(process.env.T3_PITAKO_NATIVE_TEST_ROOT === undefined)(
                   member.mandate,
                   member.function === "director"
                     ? { source: "root-workbrief", instanceId: assignment.instanceId }
-                    : { source: "TeamAssignment.task", text: assignment.task },
+                    : {
+                        source:
+                          member.function === "specialist" ? "composition" : "TeamAssignment.task",
+                        text: assignment.task,
+                      },
                 );
                 assert.equal(member.workerRef?.instanceId, member.instanceId);
               }
               const finalMembers = final.records.filter((record) => record.kind === "member");
               assert.equal(
-                finalMembers.filter((member) => member.supersededByCompositionId).length,
-                3,
+                new Set(finalMembers.map((member) => member.id)).size,
+                finalMembers.length,
               );
+              const finalFailed = finalMembers.find((member) => member.id === failed.id)!;
+              assert.deepInclude(finalFailed, {
+                assignmentId: failed.assignmentId,
+                instanceId: failed.instanceId,
+                function: "specialist",
+                mandate: failed.mandate,
+                execution: "failed",
+                state: "closed",
+              });
+              // Stage failure already closed this member, before recomposition.
+              assert.notProperty(finalFailed, "supersededByCompositionId");
+              const healthy = members.filter(
+                (member) =>
+                  member.mandate.source === "composition" &&
+                  ["Healthy one", "Healthy two"].includes(member.mandate.text),
+              );
+              assert.sameDeepMembers(
+                healthy.map((member) => member.mandate),
+                [
+                  { source: "composition", text: "Healthy one" },
+                  { source: "composition", text: "Healthy two" },
+                ],
+              );
+              const replacements = finalMembers.filter(
+                (member) =>
+                  member.mandate.source === "composition" && member.mandate.text === "Replacement",
+              );
+              assert.lengthOf(replacements, 1);
+              const replacement = replacements[0]!;
+              assert.equal(replacement.function, "specialist");
+              assert.isNotEmpty(replacement.compositionMessageId);
+              const outgoing = finalMembers.filter(
+                (member) => member.supersededByCompositionId !== undefined,
+              );
+              assert.sameMembers(
+                outgoing.map((member) => member.id),
+                healthy.map((member) => member.id),
+              );
+              for (const member of outgoing) {
+                assert.equal(member.function, "specialist");
+                assert.equal(member.state, "closed");
+                assert.equal(member.supersededByCompositionId, replacement.compositionMessageId);
+              }
+              const publications = final.records.filter((record) => record.kind === "publication");
               assert.isTrue(
-                finalMembers.some(
-                  (member) =>
-                    member.mandate.source === "TeamAssignment.task" &&
-                    member.mandate.text === "Replacement",
+                publications.some(
+                  (record) =>
+                    record.message.id === replacement.compositionMessageId &&
+                    record.message.body.kind === "composition",
                 ),
               );
-              const publications = final.records.filter((record) => record.kind === "publication");
-              const dissent = publications.find(
+              const dissent = publications.filter(
                 (record) =>
                   record.message.body.kind === "contribution" &&
                   record.message.body.objections.length,
               );
-              assert.isDefined(dissent, "Real protocol must settle the authored dissent");
-              if (dissent?.message.body.kind === "contribution") {
-                for (const objection of dissent.message.body.objections) {
-                  assert.isTrue(
-                    publications.some(
-                      (record) =>
-                        record.message.id === objection.messageId &&
-                        record.message.memberId === objection.memberId,
-                    ),
-                  );
+              assert.lengthOf(dissent, 5, "Real protocol must settle all authored dissent");
+              for (const contribution of dissent) {
+                assert.isTrue(
+                  finalMembers.some((member) => member.id === contribution.message.memberId),
+                );
+                if (contribution.message.body.kind === "contribution") {
+                  assert.lengthOf(contribution.message.body.objections, 1);
+                  for (const objection of contribution.message.body.objections) {
+                    assert.equal(objection.argument, "A genuine dissent");
+                    assert.notEqual(objection.memberId, contribution.message.memberId);
+                    assert.isTrue(
+                      publications.some(
+                        (record) =>
+                          record.message.id === objection.messageId &&
+                          record.message.memberId === objection.memberId,
+                      ),
+                    );
+                  }
                 }
               }
               for (const record of publications) {
@@ -352,14 +408,18 @@ describe.skipIf(process.env.T3_PITAKO_NATIVE_TEST_ROOT === undefined)(
                 assert.isNotEmpty(record.message.attemptId);
                 assert.isNotEmpty(record.message.snapshotId);
               }
-              assert.equal(final.capture?.state, "closed");
-              assert.deepEqual(
-                final.records.find((record) => record.kind === "room")?.lifecycle.closure,
-                { state: "released", members: "released", director: "released" },
-              );
+              for (const room of [final, otherFinal]) {
+                assert.equal(room.capture?.state, "closed");
+                assert.deepEqual(
+                  room.records.find((record) => record.kind === "room")?.lifecycle.closure,
+                  { state: "released", members: "released", director: "released" },
+                );
+              }
               const outcome = final.records.find((record) => record.kind === "outcome");
               assert.equal(outcome?.status, "failed");
               assert.equal(outcome?.content.kind, "synthesis");
+              if (outcome?.content.kind === "synthesis")
+                assert.equal(outcome.content.body.status, "partial");
               assert.equal(
                 otherFinal.records.find((record) => record.kind === "outcome")?.status,
                 "completed",

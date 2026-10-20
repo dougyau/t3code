@@ -54,8 +54,8 @@ const root = `,
     .replace(
       /const content = true && coordinatorCalls === 1 \? \[[\s\S]*?\] : \[/,
       `const content = coordinatorCalls === 1 ? [
-        { type: "toolCall", id: "architecture-one", name: "architecture_start", arguments: { mode: "table", goal: ${JSON.stringify(architectureGoal)} } },
-        { type: "toolCall", id: "architecture-two", name: "architecture_start", arguments: { mode: "table", goal: "Separate room" } }
+        { type: "toolCall", id: "architecture-one", name: "architecture_start", arguments: { goal: ${JSON.stringify(architectureGoal)} } },
+        { type: "toolCall", id: "architecture-two", name: "architecture_start", arguments: { goal: "Separate room" } }
       ] : [`,
     )
     .replace(
@@ -104,11 +104,12 @@ export default function(pi) {
       const failed = request.stage === "preparation" && request.context.mandate === "Fails before contribution";
       const other = request.goal === "Separate room";
       const stage = request.stage;
+      try {
       let body;
-      if (stage === "composition") body = { kind: stage, snapshotId: request.snapshot.id,
+      if (stage === "composition") body = { kind: stage, snapshotId: request.snapshot.id, reason: "Known native composition",
         specialists: (other ? ["Other specialist"] :
           request.round ? ["Replacement"] : ["Fails before contribution", "Healthy one", "Healthy two"])
-          .map(mandate => ({ candidateRef: request.snapshot.general[0].ref, mandate, reason: "Known native composition" })) };
+          .map(mandate => ({ kind: "add", candidateRef: request.snapshot.general[0].ref, mandate, reason: "Known native composition" })) };
       if (stage === "preparation") body = { kind: stage, analysis: request.context.mandate,
         doubts: other ? [] : [{ question: "Is the evidence sufficient?", purpose: "Real support path" }] };
       if (stage === "answer") body = { kind: stage, answer: "Direct answer", evidence: [], limits: [], doubts: [] };
@@ -116,9 +117,12 @@ export default function(pi) {
         [{ role: "scout", brief: "Independent support mandate", doubtIds: request.context.doubts.map(d => d.id), prerequisites: [] }] : [] };
       if (stage === "consultation-response") body = { kind: stage, doubtIds: request.context.request.doubtIds,
         answer: "Observed support evidence", evidence: [], limits: [], doubts: [] };
-      if (stage === "knowledge") body = { kind: stage, resolutions: request.context.delegatedDoubts.map(d => ({
-        doubtId: d.id, status: "answered", answer: "Known support answer",
-        supportIds: request.context.responses.filter(response => response.status === "completed").map(response => response.id) })) };
+      if (stage === "knowledge") {
+        const doubtIds = request.context.delegatedDoubtIds ?? request.context.delegatedDoubts.map(d => d.id);
+        body = { kind: stage, resolutions: doubtIds.map(doubtId => ({
+          doubtId, status: "answered", answer: "Known support answer",
+          supportIds: request.context.responses.filter(response => response.status === "completed").map(response => response.id) })) };
+      }
       if (stage === "contribution") {
         const prior = request.authorization.objections.find(reference =>
           request.context.shared.messages.some(message => message.author === "specialist" && message.id === reference.messageId));
@@ -162,6 +166,10 @@ export default function(pi) {
         stream.push({ type: "done", reason: message.stopReason, message }); stream.end(message);
       });
       return stream;
+      } catch (error) {
+        writeFileSync(f.root + "/worker-error.json", JSON.stringify({ stage, round: request.round, error: String(error) }));
+        throw error;
+      }
     }
   });
 }

@@ -867,7 +867,7 @@ export const PiNativeWorkerSummary = Schema.Struct({
   briefSource: Schema.optional(Schema.Literals(["original WorkBrief", "invocation task"])),
   mandate: Schema.optional(
     Schema.Struct({
-      source: Schema.Literal("TeamAssignment.task"),
+      source: Schema.Literals(["TeamAssignment.task", "composition"]),
       text: Schema.String,
       complete: Schema.Boolean,
     }),

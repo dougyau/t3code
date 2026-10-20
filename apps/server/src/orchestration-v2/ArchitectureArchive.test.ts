@@ -19,13 +19,20 @@ import {
   nativeWorkerFixture,
 } from "../../../../packages/client-runtime/src/testing/nativeWorker.ts";
 
-it.effect(
-  "reads archived history after closing and reopening the database without a native source",
-  () =>
+it.effect.each([undefined, "table", "consultation"] as const)(
+  "reads archived history after closing and reopening the database without a native source, mode=%s",
+  (mode) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-architecture-history-" });
       const threadId = ThreadId.make("coordinator");
+      const lifecycle = {
+        stage: "waiting",
+        round: 1,
+        protocolState: "running",
+        outcome: "pending",
+        closure: { state: "pending", members: "pending", director: "pending" },
+      } as const;
       const archive: ArchitectureArchive.ArchitectureArchive = {
         summary: {
           tableId: "table",
@@ -33,15 +40,9 @@ it.effect(
           providerInstanceId: ProviderInstanceId.make("pi"),
           coordinatorSessionId: "native",
           roomId: "room",
-          mode: "table",
+          ...(mode === undefined ? {} : { mode }),
           participants: 0,
-          lifecycle: {
-            stage: "waiting",
-            round: 1,
-            protocolState: "running",
-            outcome: "pending",
-            closure: { state: "pending", members: "pending", director: "pending" },
-          },
+          lifecycle,
           capture: "open",
           observation: "stale",
           gaps: [],
@@ -54,13 +55,54 @@ it.effect(
         },
         providerSessionId: ProviderSessionId.make("session"),
         parentProviderThreadId: ProviderThreadId.make("parent"),
-        records: [],
         original: {
           id: "original",
           text: "  # exacto\n🧭 café 中文\n",
           source: "original WorkBrief",
           complete: true,
         },
+        records: [
+          {
+            kind: "room",
+            id: "room",
+            ...(mode === undefined ? {} : { mode }),
+            origin: {
+              coordinatorSessionId: "native",
+              tool: "architecture_start",
+              toolCallId: "start",
+              instanceId: "director",
+              memberId: "director",
+              assignmentId: "assignment",
+            },
+            goalSource: { kind: "worker-workbrief", instanceId: "director" },
+            lifecycle,
+            pendingDoubtIds: [],
+          },
+          {
+            kind: "publication",
+            id: "composition",
+            message: {
+              id: "composition",
+              ordinal: 1,
+              roomId: "room",
+              memberId: "director",
+              assignmentId: "assignment",
+              author: "director",
+              stage: "composition",
+              snapshotId: "snapshot",
+              turnId: "turn",
+              attemptId: "attempt",
+              native: { sessionId: "session", toolCallId: "submit", persistence: "unconfirmed" },
+              doubts: [],
+              body: {
+                kind: "composition",
+                snapshotId: "snapshot",
+                reason: "The director can answer independently",
+                specialists: [],
+              },
+            },
+          },
+        ],
       };
       const layer = () => NodeSqliteClient.layer({ filename: `${directory}/history.sqlite` });
       yield* Effect.scoped(
@@ -75,6 +117,31 @@ it.effect(
           const sql = yield* SqlClient.SqlClient;
           const loaded = yield* ArchitectureArchive.read(sql, threadId);
           assert.deepEqual(loaded, [archive]);
+          const details = yield* ArchitectureQuery.read(
+            { threadId, kind: "records", tableId: "table" },
+            loaded,
+            [],
+          );
+          if (details.kind !== "records") throw Error("Expected records");
+          if (mode === undefined) {
+            assert.notProperty(details.summary, "mode");
+            assert.notProperty(details.items[0], "mode");
+          } else {
+            assert.equal(details.summary.mode, mode);
+            assert.deepInclude(details.items[0], { mode });
+          }
+          const composition = yield* ArchitectureQuery.read(
+            { threadId, kind: "text", tableId: "table", textId: "publication:composition" },
+            loaded,
+            [],
+          );
+          if (composition.kind !== "text") throw Error("Expected composition");
+          assert.deepEqual(JSON.parse(composition.text).body, {
+            kind: "composition",
+            snapshotId: "snapshot",
+            reason: "The director can answer independently",
+            specialists: [],
+          });
           const result = yield* ArchitectureQuery.read(
             { threadId, kind: "text", tableId: "table", textId: "original" },
             loaded,

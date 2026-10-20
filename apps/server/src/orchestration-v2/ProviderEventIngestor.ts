@@ -1067,7 +1067,7 @@ export const layer: Layer.Layer<
                 providerInstanceId: input.providerInstanceId,
                 coordinatorSessionId,
                 roomId: input.batch.roomId,
-                mode: confirmedRoom.mode,
+                ...(confirmedRoom.mode === undefined ? {} : { mode: confirmedRoom.mode }),
                 participants: members.length,
                 lifecycle: confirmedRoom.lifecycle,
                 capture: input.batch.capture,
@@ -1110,7 +1110,7 @@ export const layer: Layer.Layer<
                       launch,
                       roleId: member.roleId,
                       acceptedAt: member.admittedAt,
-                      ...(member.mandate.source === "TeamAssignment.task"
+                      ...(member.mandate.source !== "root-workbrief"
                         ? {
                             mandate: {
                               source: member.mandate.source,
