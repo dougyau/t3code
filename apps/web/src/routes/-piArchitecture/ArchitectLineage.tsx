@@ -1,12 +1,19 @@
 import { useAtomValue } from "@effect/atom-react";
 import type { EnvironmentId, PiArchitectureSummary } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
+import { useId, useState } from "react";
+import { ChevronDownIcon, PanelsTopLeftIcon } from "lucide-react";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
 import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { retainTimelinePosition } from "../../components/chat/timelineScrollAnchoring";
-import { Button } from "../../components/ui/button";
+import { ThreadDetailsControl } from "../../components/chat/ThreadDetailsControl";
+import {
+  THREAD_DETAILS_PANEL_ICON_CLASS,
+  THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS,
+  THREAD_DETAILS_PANEL_SPLIT_SEPARATOR_CLASS,
+} from "../../components/chat/threadDetailsPanelStyles";
+import { cn } from "../../lib/utils";
 import {
   participantExecution,
   participantLabel,
@@ -32,38 +39,58 @@ function TableEntry({
 }) {
   const navigate = useNavigate();
   const [expanded, setExpanded] = useState(false);
+  const rosterId = useId();
   const canRead = useAtomValue(piArchitecture.read.permissionAtom(environmentId));
   return (
-    <section className="min-w-0 rounded-lg border p-4 [overflow-wrap:anywhere]">
-      <div className="flex min-w-0 flex-col gap-3">
-        <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <h3 className="text-sm font-semibold">Architect table</h3>
-          <span className="text-xs text-muted-foreground">{table.participants} participants</span>
-        </div>
-        <TableStatus summary={table} />
-        <div>
-          <Button
-            variant="default"
-            size="sm"
-            disabled={!canRead}
-            onClick={() => {
-              retainTimelinePosition(
-                scopedThreadKey(scopeThreadRef(environmentId, table.threadId)),
-              );
-              void navigate({
-                to: "/architect/$environmentId/$threadId/$tableId",
-                params: { environmentId, threadId: table.threadId, tableId: table.tableId },
-              });
-            }}
-          >
-            Open Architect table
-          </Button>
-        </div>
-        {!canRead ? <p className="text-xs">Requires orchestration read permission.</p> : null}
-        <details onToggle={(event) => setExpanded(event.currentTarget.open)}>
-          <summary className="cursor-pointer text-sm font-medium">Participants</summary>
-          {expanded && canRead ? <TableRoster environmentId={environmentId} table={table} /> : null}
-        </details>
+    <section className="min-w-0 [overflow-wrap:anywhere]">
+      <div className={THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS}>
+        <ThreadDetailsControl
+          part="primary"
+          multiline
+          aria-label="Open Architect table"
+          disabled={!canRead}
+          onClick={() => {
+            retainTimelinePosition(scopedThreadKey(scopeThreadRef(environmentId, table.threadId)));
+            void navigate({
+              to: "/architect/$environmentId/$threadId/$tableId",
+              params: { environmentId, threadId: table.threadId, tableId: table.tableId },
+            });
+          }}
+        >
+          <PanelsTopLeftIcon aria-hidden className={THREAD_DETAILS_PANEL_ICON_CLASS} />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-sm font-medium">Architect table</span>
+            <span className="block text-2xs font-normal text-muted-foreground">
+              {table.participants} {table.participants === 1 ? "participant" : "participants"}
+              {table.lifecycle.round === undefined ? null : ` · Round ${table.lifecycle.round}`}
+            </span>
+          </span>
+        </ThreadDetailsControl>
+        <span aria-hidden className={THREAD_DETAILS_PANEL_SPLIT_SEPARATOR_CLASS} />
+        <ThreadDetailsControl
+          part="secondary"
+          aria-label={`${expanded ? "Collapse" : "Expand"} Architect participants`}
+          aria-expanded={expanded}
+          aria-controls={rosterId}
+          disabled={!canRead}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <ChevronDownIcon
+            aria-hidden
+            className={cn("size-3.5 text-muted-foreground", expanded && "rotate-180")}
+          />
+        </ThreadDetailsControl>
+      </div>
+      <div className="px-2.5 pb-1">
+        <TableStatus summary={table} compact />
+        {!canRead ? (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Requires orchestration read permission.
+          </p>
+        ) : null}
+      </div>
+      <div id={rosterId}>
+        {expanded && canRead ? <TableRoster environmentId={environmentId} table={table} /> : null}
       </div>
     </section>
   );
@@ -84,7 +111,7 @@ function TableRoster({
   );
   const data = Option.getOrNull(AsyncResult.value(result));
   return (
-    <ul className="mt-3 flex min-w-0 flex-col gap-3 text-sm">
+    <ul className="flex min-w-0 list-none flex-col gap-2 py-1 ps-9 pe-2.5 text-sm">
       {data?.kind === "records" ? (
         data.items
           .filter((record) => record.kind === "member")
