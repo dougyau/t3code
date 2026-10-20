@@ -15,7 +15,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadId,
-  type ProviderSessionId,
+  ProviderSessionId,
   type PiNativeWorkerLaunch,
   type PiNativeWorkerCheckpoint,
   type PiNativeWorkerSummary,
@@ -933,12 +933,119 @@ const writeResidencyCheckpoint = Effect.fnUntraced(function* (
   assert.isTrue(receipt.committed);
 });
 
-it.effect.each(["completed-root", "owned-node", "other-provider-thread", "missing-root"] as const)(
+it.effect("exposes live coordinator bindings until the manager retires the runtime", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    let binding: ProviderAdapter.ProviderNativeWorkersPort["coordinatorBinding"];
+    const port: ProviderAdapter.ProviderNativeWorkersPort = {
+      ...residencyPort(() => Effect.succeed({ state: "none" })),
+      get owner() {
+        return binding?.owner;
+      },
+      get ownerGeneration() {
+        return binding?.ownerGeneration ?? 1;
+      },
+      get coordinatorBinding() {
+        return binding;
+      },
+    };
+    yield* Effect.gen(function* () {
+      const { manager, providerSessionId, runtime } = yield* openResidencySession();
+      const exposed = runtime.nativeWorkers!;
+      assert.isUndefined(exposed.coordinatorBinding);
+      binding = {
+        owner: residencyOwner,
+        ownerGeneration: 1,
+        nativeThreadRef: { driver: CODEX_DRIVER, nativeId: "/sessions/first.jsonl" },
+      };
+      assert.deepEqual(exposed.coordinatorBinding, binding);
+      const resident = Option.getOrThrow(yield* manager.getResident(providerSessionId));
+      const current = Option.getOrThrow(yield* manager.get(providerSessionId));
+      assert.strictEqual(resident, runtime);
+      assert.strictEqual(current, runtime);
+
+      binding = {
+        owner: { ...residencyOwner, epoch: "epoch-2" },
+        ownerGeneration: 2,
+        nativeThreadRef: { driver: CODEX_DRIVER, nativeId: "/sessions/second.jsonl" },
+      };
+      assert.deepEqual(exposed.coordinatorBinding, binding);
+      assert.deepEqual(resident.nativeWorkers?.coordinatorBinding, binding);
+      assert.deepEqual(current.nativeWorkers?.coordinatorBinding, binding);
+      assert.deepEqual(exposed.owner, binding.owner);
+      assert.equal(exposed.ownerGeneration, binding.ownerGeneration);
+
+      const rebound = binding;
+      binding = undefined;
+      assert.isUndefined(exposed.owner);
+      assert.isUndefined(exposed.coordinatorBinding);
+      assert.isUndefined(resident.nativeWorkers?.coordinatorBinding);
+      assert.isUndefined(current.nativeWorkers?.coordinatorBinding);
+      binding = rebound;
+      assert.deepEqual(exposed.coordinatorBinding, rebound);
+      assert.equal((yield* Ref.get(state)).openCount, 1);
+
+      yield* manager.close(providerSessionId);
+      assert.deepEqual(port.coordinatorBinding, rebound);
+      assert.isUndefined(exposed.owner);
+      assert.isUndefined(exposed.coordinatorBinding);
+      assert.isUndefined(resident.nativeWorkers?.coordinatorBinding);
+      assert.isUndefined(current.nativeWorkers?.coordinatorBinding);
+      assert.isTrue(Option.isNone(yield* manager.get(providerSessionId)));
+      assert.isTrue(Option.isNone(yield* manager.getResident(providerSessionId)));
+    }).pipe(
+      Effect.provide(layerTest({ state, idleTimeoutMs: 30 * 60_000, nativeWorkers: () => port })),
+    );
+  }),
+);
+
+it.effect.each([
+  "completed-root",
+  "owned-node",
+  "session-file-root",
+  "other-provider-thread",
+  "missing-root",
+  "wrong-binding-source",
+  "wrong-binding-provider",
+  "wrong-binding-owner",
+  "wrong-binding-generation",
+  "wrong-provider-instance",
+  "wrong-provider-session",
+  "detached-thread",
+  "lookalike-unbound",
+  "stale-binding",
+] as const)(
   "collects Architecture only with a legitimate ordinary coordinator anchor: %s",
   (anchor) =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);
-      const owner = { ...residencyOwner, coordinatorSessionId: "native-thread" };
+      const direct = anchor === "completed-root" || anchor === "owned-node";
+      const owner = {
+        ...residencyOwner,
+        coordinatorSessionId: direct ? "native-thread" : "01a143cd-7426-7665-826d-656a15e41885",
+      };
+      const nativeThreadRef = {
+        driver: CODEX_DRIVER,
+        nativeId: `/sessions/opaque-${owner.coordinatorSessionId}.jsonl`,
+      };
+      let coordinatorBinding: ProviderAdapter.ProviderNativeWorkersPort["coordinatorBinding"] =
+        direct || anchor === "lookalike-unbound"
+          ? undefined
+          : {
+              owner:
+                anchor === "wrong-binding-owner" ? { ...owner, epoch: "foreign-epoch" } : owner,
+              ownerGeneration: anchor === "wrong-binding-generation" ? 0 : 1,
+              nativeThreadRef: {
+                driver:
+                  anchor === "wrong-binding-provider"
+                    ? ProviderDriverKind.make("foreign-provider")
+                    : nativeThreadRef.driver,
+                nativeId:
+                  anchor === "wrong-binding-source"
+                    ? "/sessions/unrelated.jsonl"
+                    : nativeThreadRef.nativeId,
+              },
+            };
       const batch: ProviderAdapter.ProviderArchitectureBatch = {
         roomId: "root-room",
         checkpoint: { owner, ownerGeneration: 1, snapshotId: "root-cut", cut: 1 },
@@ -994,6 +1101,16 @@ it.effect.each(["completed-root", "owned-node", "other-provider-thread", "missin
         });
         const parent = {
           ...makeProviderThread({ idAllocator: ids, threadId, providerSessionId, now }),
+          ...(direct
+            ? {}
+            : { nativeThreadRef: { ...nativeThreadRef, strength: "strong" as const } }),
+          ...(anchor === "wrong-provider-instance"
+            ? { providerInstanceId: ProviderInstanceId.make("foreign-instance") }
+            : {}),
+          ...(anchor === "wrong-provider-session"
+            ? { providerSessionId: ProviderSessionId.make("foreign-session") }
+            : {}),
+          ...(anchor === "detached-thread" ? { appThreadId: ThreadId.make("foreign-thread") } : {}),
           ownerNodeId: anchor === "owned-node" ? NodeId.make("owned-provider-node") : null,
         };
         if (anchor !== "owned-node") assert.isNull(parent.ownerNodeId);
@@ -1055,7 +1172,7 @@ it.effect.each(["completed-root", "owned-node", "other-provider-thread", "missin
         const archives = yield* sink.architectures(threadId);
         const thread = yield* projections.getThread(threadId);
         const members = yield* sink.nativeWorkers(providerSessionId);
-        if (anchor === "completed-root" || anchor === "owned-node") {
+        if (direct || anchor === "session-file-root") {
           assert.lengthOf(archives, 1);
           assert.equal(archives[0]?.parentProviderThreadId, parent.id);
           assert.deepEqual(archives[0]?.records, batch.records);
@@ -1091,7 +1208,14 @@ it.effect.each(["completed-root", "owned-node", "other-provider-thread", "missin
             nativeWorkers: () => ({
               ...residencyPort(() => Effect.succeed({ state: "pending" })),
               owner,
-              readArchitectures: () => Effect.succeed([batch]),
+              get coordinatorBinding() {
+                return coordinatorBinding;
+              },
+              readArchitectures: () =>
+                Effect.sync(() => {
+                  if (anchor === "stale-binding") coordinatorBinding = undefined;
+                  return [batch];
+                }),
               read: (launch, expected) => {
                 if (expected === undefined) return Effect.die("Expected admitted checkpoint");
                 return Effect.succeed({

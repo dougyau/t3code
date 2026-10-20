@@ -27,7 +27,11 @@ import {
   invalidHandoffWorkerRows,
   legacyWorkerRow,
 } from "../../../contracts/src/providerWorkers.fixture.ts";
-import { PiNativeWorkerLaunch, PiNativeWorkerCheckpoint } from "@t3tools/contracts";
+import {
+  PiNativeWorkerLaunch,
+  PiNativeWorkerCheckpoint,
+  ProviderDriverKind,
+} from "@t3tools/contracts";
 
 describe("passive worker handoff wire boundary", () => {
   const owner = { processId: "process", coordinatorSessionId: "session", epoch: "epoch" };
@@ -1204,6 +1208,45 @@ describe("owner-global background pending", () => {
         state: "unavailable",
         reason: "stale_owner",
       });
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("fences correlated source bindings across rebind, stale completion, and failure", () =>
+    Effect.gen(function* () {
+      const bridge = new PiWorkerBridge("linux");
+      yield* Effect.addFinalizer(() => Effect.sync(() => bridge.cleanupDirectory(true)));
+      yield* workerWireFixture(owner, bridge.directory);
+      yield* Effect.addFinalizer(() => bridge.close);
+      const file = "/sessions/opaque-coordinator.jsonl";
+      const binding = () => bridge.coordinatorBinding;
+      yield* bridge.bind("session", file);
+      const generation = bridge.ownerGeneration;
+      assert.deepEqual(binding(), {
+        owner,
+        ownerGeneration: generation,
+        nativeThreadRef: { driver: ProviderDriverKind.make("pi"), nativeId: file },
+      });
+      // A queued get_state completion must not bind after lifecycle invalidation.
+      const stale = bridge.bind("session", "/sessions/stale.jsonl");
+      yield* bridge.invalidate;
+      yield* stale;
+      assert.isUndefined(binding());
+      yield* bridge.bind("session", file, generation);
+      assert.isUndefined(binding());
+      yield* bridge.bind("session", file);
+      const reboundGeneration = bridge.ownerGeneration;
+      yield* bridge.bind("session", "/sessions/same-id-other-file.jsonl");
+      assert.isAbove(bridge.ownerGeneration, reboundGeneration);
+      assert.equal(binding()?.nativeThreadRef.nativeId, "/sessions/same-id-other-file.jsonl");
+      yield* bridge.bind("wrong-session", file);
+      assert.isUndefined(binding());
+      // A UUID-looking filename cannot establish authority after failed authentication.
+      yield* bridge.bind(undefined, "/sessions/session.jsonl");
+      assert.isUndefined(binding());
+      yield* bridge.bind("session", file);
+      assert.isDefined(binding());
+      yield* bridge.close;
+      assert.isUndefined(binding());
     }).pipe(Effect.scoped),
   );
 

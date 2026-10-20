@@ -2627,6 +2627,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             return yield* protocolError("A Pi extension cancelled the session switch");
           }
         }
+        const bindingGeneration = workers.ownerGeneration;
         const stateData = yield* request({ type: "get_state" });
         if (!modelsDiscovered) {
           const modelsData = yield* request({ type: "get_available_models" }).pipe(
@@ -2665,7 +2666,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           return yield* protocolError("Pi did not create a distinct session file");
         }
         coordinatorSessionId = recordString(stateData, "sessionId");
-        yield* workers.bind(coordinatorSessionId).pipe(Effect.forkIn(scope));
+        yield* workers
+          .bind(coordinatorSessionId, nativeId, bindingGeneration)
+          .pipe(Effect.forkIn(scope));
         lastNativeThreadId = nativeId;
         const createdAt = yield* DateTime.now;
         const providerThread: OrchestrationV2ProviderThread =
@@ -3392,6 +3395,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                   const forkData = yield* lifecycleRequest({ type: "fork", entryId: forkEntryId });
                   if (recordField(forkData, "cancelled") === true)
                     return yield* protocolError("A Pi extension cancelled the session fork");
+                  const bindingGeneration = workers.ownerGeneration;
                   const forkState = yield* request({ type: "get_state" }).pipe(
                     Effect.onError(() =>
                       Effect.sync(() => {
@@ -3405,7 +3409,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                     return yield* protocolError("Pi fork did not return a persisted session file");
                   }
                   coordinatorSessionId = recordString(forkState, "sessionId");
-                  yield* workers.bind(coordinatorSessionId).pipe(Effect.forkIn(scope));
+                  yield* workers
+                    .bind(coordinatorSessionId, forkSessionFile, bindingGeneration)
+                    .pipe(Effect.forkIn(scope));
                   const entriesData = yield* request({ type: "get_entries" }).pipe(
                     Effect.orElseSucceed(() => undefined),
                   );

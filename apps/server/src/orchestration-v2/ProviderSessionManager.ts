@@ -1926,6 +1926,10 @@ export const layerWithOptions = (
                   get ownerGeneration() {
                     return runtime.nativeWorkers!.ownerGeneration;
                   },
+                  get coordinatorBinding() {
+                    if (!nativeLifetime.nativeWorkersConnected.value) return undefined;
+                    return runtime.nativeWorkers?.coordinatorBinding;
+                  },
                   hints: runtime.nativeWorkers.hints,
                   reconcile: runtime.nativeWorkers.reconcile,
                   read: runtime.nativeWorkers.read,
@@ -2368,6 +2372,14 @@ export const layerWithOptions = (
               if (port.readArchitectures && port.owner) {
                 const owner = { ...port.owner };
                 const ownerGeneration = port.ownerGeneration;
+                const binding = port.coordinatorBinding;
+                if (
+                  binding !== undefined &&
+                  (binding.ownerGeneration !== ownerGeneration ||
+                    !NodeUtil.isDeepStrictEqual(binding.owner, owner) ||
+                    binding.nativeThreadRef.driver !== entry.runtime.driver)
+                )
+                  return;
                 const connected = Ref.get(sessions).pipe(
                   Effect.map(
                     (latest) =>
@@ -2375,6 +2387,7 @@ export const layerWithOptions = (
                         entry.runtime &&
                       entry.nativeWorkersConnected.value &&
                       ownerGeneration === port.ownerGeneration &&
+                      NodeUtil.isDeepStrictEqual(binding, port.coordinatorBinding) &&
                       NodeUtil.isDeepStrictEqual(owner, port.owner),
                   ),
                 );
@@ -2408,10 +2421,13 @@ export const layerWithOptions = (
                   ]);
                   const parent = projection.providerThreads.find(
                     (thread) =>
+                      thread.appThreadId === threadId &&
                       thread.providerSessionId === entry.runtime.providerSessionId &&
                       thread.providerInstanceId ===
                         entry.runtime.providerSession.providerInstanceId &&
-                      thread.nativeThreadRef?.nativeId === owner.coordinatorSessionId,
+                      thread.nativeThreadRef?.driver === entry.runtime.driver &&
+                      thread.nativeThreadRef.nativeId ===
+                        (binding?.nativeThreadRef.nativeId ?? owner.coordinatorSessionId),
                   );
                   if (!parent) continue;
                   // Ordinary coordinators own no node. Their latest matching run
