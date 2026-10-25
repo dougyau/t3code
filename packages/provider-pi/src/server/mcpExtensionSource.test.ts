@@ -39,6 +39,8 @@ async function loadHooks(commands: ReadonlyArray<SkillCommand> = []) {
     NodePath,
     stripFrontmatter: (content: string) => content,
     pi: {
+      events: { on: () => () => {}, emit: () => {} },
+      registerCommand: () => {},
       on: (name: string, handler: unknown) => handlers.set(name, handler),
       getCommands: () => commands,
     },
@@ -335,6 +337,8 @@ describe("Pi tool discovery permissions", () => {
     await NodeVM.runInNewContext(`${source}\nt3McpExtension(pi)`, {
       process: { env: { T3_PI_RUNTIME_MODE: "approval-required" } },
       pi: {
+        events: { on: () => () => {}, emit: () => {} },
+        registerCommand: () => {},
         on: (name: string, handler: ToolCallHook) => {
           if (name === "tool_call") toolCall = handler;
         },
@@ -379,7 +383,11 @@ async function loadRequestHook(): Promise<RequestHook> {
   );
   await NodeVM.runInNewContext(`${source}\nt3McpExtension(pi)`, {
     process: { env: {} },
-    pi: { on: (name: string, handler: RequestHook) => handlers.set(name, handler) },
+    pi: {
+      on: (name: string, handler: RequestHook) => handlers.set(name, handler),
+      events: { on: () => () => {}, emit: () => {} },
+      registerCommand: () => {},
+    },
   });
   const hook = handlers.get("before_provider_request");
   assert.isDefined(hook);

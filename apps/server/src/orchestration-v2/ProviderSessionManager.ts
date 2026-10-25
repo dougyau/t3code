@@ -1089,16 +1089,25 @@ export const layerWithOptions = (
           }
           // Capture runtime identity before yielding; replacements can reuse the session id.
           const probedRuntime = entry.runtime;
-          const hasPendingWork =
-            probedRuntime.hasPendingBackgroundWork === undefined
-              ? false
-              : yield* probedRuntime.hasPendingBackgroundWork.pipe(
-                  Effect.catchCause(() => Effect.succeed(false)),
+          const backgroundStatus =
+            probedRuntime.backgroundWorkStatus === undefined
+              ? "unavailable"
+              : yield* probedRuntime.backgroundWorkStatus.pipe(
+                  Effect.catchCause(() => Effect.succeed("unavailable" as const)),
                 );
+          const hasPendingWork =
+            backgroundStatus === "active"
+              ? true
+              : probedRuntime.hasPendingBackgroundWork === undefined
+                ? false
+                : yield* probedRuntime.hasPendingBackgroundWork.pipe(
+                    Effect.catchCause(() => Effect.succeed(false)),
+                  );
           if (hasPendingWork) {
             const now = yield* Clock.currentTimeMillis;
-            const pinnedSinceMs = entry.pinnedSinceMs ?? now;
-            if (now - pinnedSinceMs < maxIdlePinMs) {
+            const pinnedSinceMs =
+              backgroundStatus === "active" ? now : (entry.pinnedSinceMs ?? now);
+            if (backgroundStatus === "active" || now - pinnedSinceMs < maxIdlePinMs) {
               const shouldContinuePin = yield* Ref.modify(sessions, (latest) => {
                 const latestEntry = latest.get(key);
                 if (

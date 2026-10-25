@@ -334,6 +334,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
       readonly initialProviderItemIdentityVersion?: 2;
     }) => Effect.Effect<void>;
     readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
+    readonly backgroundWorkStatus?: ProviderAdapter.ProviderAdapterV2SessionRuntime["backgroundWorkStatus"];
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
     readonly backgroundTasksEndWithProcess?: boolean;
     readonly hangSessionScopeClose?: boolean;
@@ -420,6 +421,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           ...(options.hasPendingBackgroundWork === undefined
             ? {}
             : { hasPendingBackgroundWork: options.hasPendingBackgroundWork }),
+          ...(options.backgroundWorkStatus === undefined
+            ? {}
+            : { backgroundWorkStatus: options.backgroundWorkStatus }),
           ...(options.hasPendingBackgroundWorkForThread === undefined
             ? {}
             : {
@@ -481,6 +485,7 @@ function layerTest(input: {
     readonly paused: Deferred.Deferred<void>;
   };
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
+  readonly backgroundWorkStatus?: ProviderAdapter.ProviderAdapterV2SessionRuntime["backgroundWorkStatus"];
   readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
   readonly backgroundTasksEndWithProcess?: boolean;
   readonly hangSessionScopeClose?: boolean;
@@ -510,6 +515,9 @@ function layerTest(input: {
       ...(input.hasPendingBackgroundWork === undefined
         ? {}
         : { hasPendingBackgroundWork: input.hasPendingBackgroundWork }),
+      ...(input.backgroundWorkStatus === undefined
+        ? {}
+        : { backgroundWorkStatus: input.backgroundWorkStatus }),
       ...(input.hasPendingBackgroundWorkForThread === undefined
         ? {}
         : { hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread }),
@@ -1029,6 +1037,64 @@ it.effect("ProviderSessionManagerV2 opens a duplicate session only once", () =>
       ),
     );
   }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 retains freshly confirmed native work beyond the stale pin grace",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const active = yield* Ref.make(true);
+      const checks = yield* Queue.unbounded<void>();
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const threadId = ThreadId.make("native-work-residency");
+        const now = yield* DateTime.now;
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        const stopped = yield* eventSink
+          .stream({
+            threadId,
+            afterSequence: yield* eventSink.latestSequence({ threadId }),
+            eventType: "provider-session.updated",
+          })
+          .pipe(Stream.runHead, Effect.forkScoped);
+        for (let window = 0; window < 4; window += 1) {
+          yield* TestClock.adjust("1 second");
+          yield* Effect.raceFirst(
+            Queue.take(checks),
+            Fiber.join(stopped).pipe(
+              Effect.andThen(Effect.die("released a session with live native work")),
+            ),
+          );
+          assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+        }
+        yield* Ref.set(active, false);
+        yield* TestClock.adjust("1 second");
+        yield* Fiber.join(stopped);
+        assert.isTrue(Option.isNone(yield* manager.get(providerSessionId)));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1_000,
+            maxIdlePinMs: 1_000,
+            backgroundWorkStatus: Ref.get(active).pipe(
+              Effect.tap(() => Queue.offer(checks, undefined)),
+              Effect.map((value) => (value ? ("active" as const) : ("inactive" as const))),
+            ),
+          }),
+        ),
+      );
+    }),
 );
 
 it.effect(

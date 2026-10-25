@@ -21,6 +21,10 @@ import {
   type ProviderApprovalDecision,
   type ProviderInstanceId,
   type OrchestrationV2ProviderTurnTokenUsage,
+  type OrchestrationV2Subagent,
+  type OrchestrationV2AppThread,
+  type NodeId,
+  type RunId,
 } from "@t3tools/contracts";
 import { PiSettings } from "../settings.ts";
 import * as Cause from "effect/Cause";
@@ -71,6 +75,30 @@ import {
   resolvePiLaunchArgs,
 } from "./mcpInjection.ts";
 import { PI_FILE_CHANGE_TOOLS } from "./mcpExtensionSource.ts";
+import {
+  piSubagentResults,
+  piSubagentSnapshot,
+  piSubagentRunStates,
+  piSubagentWorkflowRunIds,
+  piSubagentObservationId,
+  piSubagentLifecycle,
+  piSubagentLifecycleHints,
+  piSubagentMetadataString,
+  PI_SUBAGENT_LIFECYCLE_MAX_BYTES,
+  type PiSubagentLifecycle,
+  type PiSubagentObservation,
+} from "./subagents.ts";
+import {
+  PiSubagentInspectReply,
+  PiSubagentMessage,
+  piSubagentToolSummaries,
+} from "./inspection.ts";
+import {
+  makeSubagentChildThread,
+  makeSubagentConversationArtifacts,
+  subagentThreadTitle,
+} from "@t3tools/provider-core/server/subagentProjection";
+import { piSubagentMessages } from "./inspection.ts";
 
 export const PI_PROVIDER = ProviderDriverKind.make("pi");
 const PI_DRIVER_KIND = PI_PROVIDER;
@@ -84,6 +112,11 @@ const PI_REQUEST_TIMEOUT_MS = 15_000;
 const PI_SESSION_TIMEOUT_MS = 60_000;
 const PI_UNSOLICITED_ACTIVITY_ERROR =
   "Pi started agent work outside an active T3 turn. The session was stopped to prevent invisible tool execution.";
+const PI_SUBAGENT_UNKNOWN_TOOL_OUTCOME =
+  "Earlier tool activity has no live-call identity; its outcome is unknown because the native result cannot be correlated.";
+const NATIVE_OBSERVATION_WINDOW_MS = 30 * 60 * 1000;
+const NATIVE_RECENT_OWNER_LIMIT = 32;
+const NATIVE_REPLAY_KEY_LIMIT = 64;
 const SETTLE_PROBE_MAX_ATTEMPTS = 3;
 const SETTLE_PROBE_RETRY_DELAY = Duration.millis(100);
 
@@ -369,6 +402,8 @@ interface ActivePiTurn {
   failure: ReturnType<typeof makeProviderFailure> | null;
   rejectedPromptFailure: ReturnType<typeof makeProviderFailure> | null;
   stopTreeRefs?: PiTurnTreeRefs | null;
+  nativeParentSettled?: boolean;
+  nativeHistoryEligibleAt?: number;
 }
 
 interface PiTurnTreeRefs {
@@ -401,6 +436,7 @@ function piApprovalRequestKind(title: string): "command" | "file-change" {
 interface PiThreadState {
   providerThread: OrchestrationV2ProviderThread;
   activeTurn: ActivePiTurn | null;
+  lastTurn?: ActivePiTurn;
 }
 
 interface PiWake {
@@ -576,6 +612,184 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
 
       const emit = (event: ProviderAdapter.ProviderAdapterV2Event) =>
         Queue.offer(events, event).pipe(Effect.asVoid);
+
+      const subagentRuns = new Map<
+        string,
+        {
+          turn: ActivePiTurn;
+          toolCallId?: string | undefined;
+          awaitingFirstChild?: boolean;
+          firstChildDeadline?: number;
+          observationExpired?: boolean;
+          confirmedLaunch?: boolean;
+          executionMode?: "attached" | "async";
+          foregroundActive?: boolean;
+          asyncDir?: string | undefined;
+          lifecycle?: PiSubagentLifecycle;
+          workflow?: boolean;
+          nativeStatus?: string;
+          finalLaunchEvent?: Extract<
+            ProviderAdapter.ProviderAdapterV2Event,
+            { type: "turn_item.updated" }
+          >;
+          childHints?: Map<string, { asyncDir: string; workflowKey: string }>;
+          children?: Map<string, { workflowKey: string; selfChildId: string; canonicalId: string }>;
+        }
+      >();
+      type NativeSubagent = {
+        observation: PiSubagentObservation;
+        turn: ActivePiTurn;
+        subagent: OrchestrationV2Subagent;
+        childThread: OrchestrationV2AppThread;
+        providerThread: OrchestrationV2ProviderThread;
+        rootNodeId: NodeId;
+        items: Map<string, { ordinal: number; fingerprint: string }>;
+        inspectionPhase: "requesting" | "delivering" | null;
+        refreshNeeded: boolean;
+        observationClosed?: boolean;
+      };
+      const nativeSubagents = new Map<string, NativeSubagent>();
+      const retiredNativeKeys = new Set<string>();
+      const nativeMaintenanceChanged = yield* Queue.sliding<void>(1);
+      let drainedStreamFailure: ProviderAdapter.ProviderAdapterEventStreamError | null = null;
+      const pendingDeliveries = new Map<
+        ProviderAdapter.ProviderAdapterV2Event,
+        {
+          runId: RunId;
+          acknowledged?: Deferred.Deferred<void>;
+        }
+      >();
+      const subagentRootEvent = (child: NativeSubagent, now: DateTime.Utc) => ({
+        type: "node.updated" as const,
+        driver: PI_PROVIDER,
+        node: {
+          id: child.rootNodeId,
+          threadId: child.childThread.id,
+          runId: null,
+          parentNodeId: null,
+          rootNodeId: child.rootNodeId,
+          kind: "root_turn" as const,
+          status: child.subagent.status,
+          countsForRun: false,
+          providerThreadId: child.providerThread.id,
+          providerTurnId: null,
+          nativeItemRef: child.subagent.nativeTaskRef,
+          runtimeRequestId: null,
+          checkpointScopeId: null,
+          startedAt: child.subagent.startedAt,
+          completedAt: child.subagent.completedAt === null ? null : now,
+        },
+      });
+      type BackgroundWorkStatus = "active" | "inactive" | "unavailable";
+      let livenessReady = false;
+      let livenessSequence = 0;
+      const livenessRequests = new Map<string, Deferred.Deferred<BackgroundWorkStatus>>();
+      const inspectionRequests = new Map<
+        string,
+        {
+          readonly runId: string;
+          readonly childId: string;
+          readonly reply: Deferred.Deferred<typeof PiSubagentInspectReply.Type>;
+        }
+      >();
+      const inspectSubagent = Effect.fn("Pi.inspectSubagent")(function* ({
+        providerThread,
+        subagent,
+        inspectionTarget,
+      }: {
+        providerThread: OrchestrationV2ProviderThread;
+        subagent: OrchestrationV2Subagent;
+        inspectionTarget?: PiSubagentObservation["inspectionTarget"];
+      }) {
+        const unavailable = (reason: string) => ({
+          availability: "unavailable" as const,
+          reason,
+          messages: [],
+          truncated: false,
+        });
+        const prefix = `subagent:${providerThread.id}:`;
+        const nativeId = subagent.nativeTaskRef?.nativeId;
+        if (closed || !nativeId?.startsWith(prefix))
+          return unavailable("Inspection is not available for this agent.");
+        const target = Schema.decodeUnknownOption(
+          Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String])),
+        )(nativeId.slice(prefix.length));
+        if (Option.isNone(target)) return unavailable("The native agent reference is unavailable.");
+        const [runId, childId] =
+          inspectionTarget === undefined
+            ? target.value
+            : [inspectionTarget.runId, inspectionTarget.childId];
+        if (
+          [runId, childId].some(
+            (id) => !id || id.length > 256 || /\s/.test(id) || id.startsWith("--"),
+          )
+        )
+          return unavailable("The native agent reference cannot be inspected.");
+        const requestId = `inspect-${++livenessSequence}`;
+        const reply = yield* Deferred.make<typeof PiSubagentInspectReply.Type>();
+        inspectionRequests.set(requestId, { runId, childId, reply });
+        return yield* request({
+          type: "prompt",
+          message: `/subagents-inspect-rpc ${requestId} ${runId} ${childId} --lines 100`,
+        }).pipe(
+          Effect.andThen(Deferred.await(reply)),
+          Effect.map((response) =>
+            response.error
+              ? unavailable(response.error.message)
+              : {
+                  availability: "available" as const,
+                  ...(response.task === undefined ? {} : { task: response.task }),
+                  ...(response.finalOutput === undefined ? {} : { output: response.finalOutput }),
+                  messages: response.messages ?? [],
+                  truncated:
+                    response.truncated !== undefined &&
+                    (response.truncated.task ||
+                      response.truncated.messages > 0 ||
+                      response.truncated.finalOutput),
+                },
+          ),
+          Effect.timeoutOrElse({
+            duration: Duration.seconds(5),
+            orElse: () =>
+              Effect.succeed(
+                unavailable(
+                  "The native inspector did not respond. The extension may not support inspection.",
+                ),
+              ),
+          }),
+          Effect.catchCause(() =>
+            Effect.succeed(unavailable("The provider session is no longer available.")),
+          ),
+          Effect.ensuring(Effect.sync(() => inspectionRequests.delete(requestId))),
+        );
+      });
+      const observeBackgroundWork = Effect.fn("Pi.observeBackgroundWork")(function* () {
+        if (!livenessReady || closed) return "unavailable" as const;
+        const requestId = `observe-${++livenessSequence}`;
+        const reply = yield* Deferred.make<BackgroundWorkStatus>();
+        livenessRequests.set(requestId, reply);
+        return yield* request({
+          type: "prompt",
+          message: `/t3-subagent-liveness ${requestId}`,
+        }).pipe(
+          Effect.andThen(Deferred.await(reply)),
+          Effect.timeoutOrElse({
+            duration: Duration.seconds(5),
+            orElse: () => Effect.succeed("unavailable" as const),
+          }),
+          Effect.catchCause(() => Effect.succeed("unavailable" as const)),
+          Effect.ensuring(Effect.sync(() => livenessRequests.delete(requestId))),
+        );
+      });
+      const hasObservedChildren = () =>
+        Array.from(nativeSubagents.values()).some(
+          ({ subagent, inspectionPhase, refreshNeeded }) =>
+            inspectionPhase === "requesting" ||
+            refreshNeeded ||
+            subagent.status === "running" ||
+            subagent.status === "pending" ||
+            subagent.status === "waiting",
+        );
 
       const updateProviderSession =
         /* Provider events include streaming deltas; avoid a span for each update. */
@@ -981,6 +1195,21 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const toolCallId = recordString(event, "toolCallId");
         const toolName = recordString(event, "toolName") ?? "tool";
         if (toolCallId === undefined) return;
+        if (toolName === "subagent" && phase !== "start") {
+          const details = recordField(
+            phase === "end" ? event["result"] : event["partialResult"],
+            "details",
+          );
+          const runId = recordString(details, "runId") ?? recordString(details, "asyncId");
+          const binding = runId === undefined ? undefined : subagentRuns.get(runId);
+          // After replay-key eviction, only an actual current tool start can admit an unknown callback.
+          if (
+            binding?.observationExpired ||
+            (runId !== undefined && retiredNativeKeys.has(runId)) ||
+            (!turn.toolArgs.has(toolCallId) && binding?.turn !== turn)
+          )
+            return;
+        }
         if (phase === "start") {
           turn.toolArgs.set(toolCallId, event["args"]);
         }
@@ -1054,7 +1283,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           }
         }
         const output = piToolOutput(resultRecord, toolName);
-        yield* emit({
+        const toolEvent = {
           type: "turn_item.updated",
           driver: PI_PROVIDER,
           turnItem: {
@@ -1066,9 +1295,19 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             input: args ?? {},
             ...(output === undefined ? {} : { output }),
           },
-        });
+        } satisfies ProviderAdapter.ProviderAdapterV2Event;
+        yield* emit(toolEvent);
         if (toolName === "subagent") {
-          yield* emitSubagentTasks(turn, toolCallId, resultRecord, completed);
+          yield* emitSubagentTasks(turn, toolCallId, resultRecord, completed, !isError);
+          if (completed) {
+            for (const binding of subagentRuns.values())
+              if (
+                binding.confirmedLaunch &&
+                binding.turn === turn &&
+                binding.toolCallId === toolCallId
+              )
+                binding.finalLaunchEvent = toolEvent;
+          }
         }
       });
 
@@ -1077,90 +1316,964 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         toolCallId: string,
         resultRecord: unknown,
         completed: boolean,
+        successful = true,
       ) {
-        const results = recordField(recordField(resultRecord, "details"), "results");
-        if (!Array.isArray(results)) return;
-        const emittedAt = yield* DateTime.now;
-        const parentNodeId = idAllocator.derive.nodeFromProviderItem({
-          driver: PI_PROVIDER,
-          nativeItemId: toolCallId,
+        const details = recordField(resultRecord, "details");
+        const args = turn.toolArgs.get(toolCallId);
+        const action = recordString(args, "action");
+        const asyncId = piSubagentMetadataString(details, "asyncId");
+        const runId = recordString(details, "runId") ?? recordString(details, "asyncId");
+        const binding = runId === undefined ? undefined : subagentRuns.get(runId);
+        if (binding?.observationExpired || (runId !== undefined && retiredNativeKeys.has(runId)))
+          return;
+        // Resume allocates a new async run; its target is not the execution being launched.
+        const resumes =
+          action === "resume" &&
+          completed &&
+          successful &&
+          recordField(resultRecord, "isError") !== true &&
+          turn.toolArgs.has(toolCallId) &&
+          recordString(details, "mode") === "single" &&
+          asyncId !== undefined &&
+          runId === asyncId &&
+          asyncId !== recordString(args, "id") &&
+          asyncId !== recordString(args, "runId") &&
+          (binding === undefined ||
+            (binding.turn === turn &&
+              (binding.toolCallId === toolCallId ||
+                (binding.toolCallId === undefined && binding.confirmedLaunch !== true)))) &&
+          ![...subagentRuns].some(
+            ([id, run]) =>
+              id !== asyncId &&
+              run.confirmedLaunch &&
+              run.turn === turn &&
+              run.toolCallId === toolCallId,
+          );
+        if (action === "resume" && !resumes) return;
+        const launches = action === undefined || resumes;
+        if (!launches && binding === undefined) return;
+        if (
+          runId !== undefined &&
+          launches &&
+          (binding === undefined || (binding.turn === turn && binding.toolCallId === undefined))
+        ) {
+          subagentRuns.set(runId, {
+            ...binding,
+            turn,
+            toolCallId,
+            confirmedLaunch: true,
+            asyncDir: piSubagentMetadataString(details, "asyncDir", 4096) ?? binding?.asyncDir,
+          });
+        }
+        const launchBinding = runId === undefined ? undefined : subagentRuns.get(runId);
+        if (launches && launchBinding?.turn === turn && launchBinding.toolCallId === toolCallId) {
+          // The foreground callback adds runId even when defaults selected its mode; async receipts use asyncId.
+          if (recordString(details, "asyncId") === runId) launchBinding.executionMode = "async";
+          else if (
+            launchBinding.executionMode === undefined &&
+            recordString(details, "asyncId") === undefined &&
+            (recordField(turn.toolArgs.get(toolCallId), "async") === false ||
+              (!completed &&
+                turn.toolArgs.has(toolCallId) &&
+                recordString(details, "runId") === runId)) &&
+            ["single", "parallel", "chain", "workflow"].includes(
+              recordString(details, "mode") ?? "",
+            )
+          )
+            launchBinding.executionMode = "attached";
+          // A late child callback cannot reopen its already-settled foreground tool.
+          if (
+            launchBinding.executionMode === "attached" &&
+            (completed || launchBinding.foregroundActive === undefined)
+          )
+            launchBinding.foregroundActive = !completed;
+        }
+        // Only a confirmed async receipt creates this pre-child obligation, once per native run.
+        if (
+          launches &&
+          recordString(details, "asyncId") !== undefined &&
+          launchBinding !== undefined &&
+          launchBinding.awaitingFirstChild === undefined
+        ) {
+          launchBinding.awaitingFirstChild = ![...nativeSubagents.values()].some(
+            (child) => child.observation.runId === runId,
+          );
+          if (launchBinding.awaitingFirstChild)
+            launchBinding.firstChildDeadline =
+              DateTime.toEpochMillis(yield* DateTime.now) + NATIVE_OBSERVATION_WINDOW_MS;
+        }
+        const observations = piSubagentResults(resultRecord, toolCallId, completed).map(
+          canonicalizeSubagentObservation,
+        );
+        const fences =
+          launchBinding?.executionMode === "async"
+            ? undefined
+            : new Map<NativeSubagent, ProviderAdapter.ProviderAdapterV2Event>();
+        yield* emitSubagentObservations(
+          observations,
+          binding?.turn ?? (launches ? turn : null),
+          binding?.toolCallId ?? (launches ? toolCallId : undefined),
+          false,
+          fences,
+        );
+        const results = recordField(details, "results");
+        if (Array.isArray(results)) {
+          for (const observation of observations) {
+            const child = nativeSubagents.get(observation.id);
+            const row =
+              observation.resultPosition === undefined
+                ? undefined
+                : results[observation.resultPosition];
+            if (child !== undefined && (fences === undefined || fences.has(child)))
+              yield* emitSubagentConversation(child, [
+                ...piSubagentMessages(recordField(row, "messages")),
+                ...piSubagentToolSummaries(recordField(row, "toolCalls")),
+              ]);
+          }
+        }
+        // Compact tool summaries follow the observation's final text in the same delivery batch.
+        for (const fence of fences?.values() ?? []) yield* emit(fence);
+      });
+
+      // Both native windows and foreground results feed the existing child-chat projection.
+      const emitSubagentConversation: (
+        child: NativeSubagent,
+        messages: ReadonlyArray<PiSubagentMessage>,
+        task?: string,
+        output?: string,
+      ) => Effect.Effect<void> = Effect.fnUntraced(function* (
+        child: NativeSubagent,
+        messages: ReadonlyArray<PiSubagentMessage>,
+        task?: string,
+        output?: string,
+      ) {
+        const now = yield* DateTime.now;
+        const occurrences = new Map<string, number>();
+        const rows: ReadonlyArray<PiSubagentMessage> = [
+          ...(task || child.subagent.prompt
+            ? [{ role: "user", kind: "text" as const, text: task || child.subagent.prompt }]
+            : []),
+          ...messages.filter(
+            (message) =>
+              message.role !== "user" || message.text !== (task || child.subagent.prompt),
+          ),
+          ...(output && !messages.some((message) => message.text === output)
+            ? [{ role: "assistant", kind: "text" as const, text: output }]
+            : []),
+        ];
+        let hasUnknownToolOutcome = false;
+        for (const message of rows) {
+          const hash = idAllocator.derive.turnItemFromProviderItem({
+            driver: PI_PROVIDER,
+            nativeItemId: yield* Schema.encodeEffect(Schema.fromJsonString(PiSubagentMessage))(
+              message,
+            ).pipe(Effect.orDie),
+          });
+          const occurrence = occurrences.get(hash) ?? 0;
+          occurrences.set(hash, occurrence + 1);
+          const nativeItemId = `${child.subagent.id}:${hash}:${occurrence}`;
+          const prior = child.items.get(nativeItemId);
+          // Bounded history has no live call identity, even while the child is running.
+          const fingerprint = hash;
+          if (prior?.fingerprint === fingerprint) continue;
+          const ordinal = prior?.ordinal ?? (child.items.size + 1) * 100;
+          child.items.set(nativeItemId, {
+            ordinal,
+            fingerprint,
+          });
+          const turnItemId = idAllocator.derive.turnItemFromProviderItem({
+            driver: PI_PROVIDER,
+            nativeItemId,
+          });
+          if (message.role === "system") {
+            yield* emit({
+              type: "turn_item.updated",
+              driver: PI_PROVIDER,
+              turnItem: {
+                id: turnItemId,
+                threadId: child.childThread.id,
+                runId: null,
+                nodeId: child.rootNodeId,
+                providerThreadId: child.providerThread.id,
+                providerTurnId: null,
+                nativeItemRef: providerRef(nativeItemId),
+                parentItemId: null,
+                ordinal,
+                status: "completed",
+                title: null,
+                type: "system_notice",
+                message: message.text,
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+              },
+            });
+          } else if (
+            message.kind === "text" &&
+            (message.role === "user" || message.role === "assistant")
+          ) {
+            const artifacts = makeSubagentConversationArtifacts({
+              messageId: idAllocator.derive.messageFromProviderItem({
+                driver: PI_PROVIDER,
+                nativeItemId,
+              }),
+              turnItemId,
+              threadId: child.childThread.id,
+              rootNodeId: child.rootNodeId,
+              providerThreadId: child.providerThread.id,
+              providerTurnId: null,
+              nativeItemRef: providerRef(nativeItemId),
+              ...(child.childThread.lineage.parentThreadId === null
+                ? {}
+                : { senderThreadId: child.childThread.lineage.parentThreadId }),
+              role: message.role,
+              text: message.text,
+              ordinal,
+              now,
+            });
+            yield* emit({
+              type: "message.updated",
+              driver: PI_PROVIDER,
+              message: artifacts.message,
+            });
+            yield* emit({
+              type: "turn_item.updated",
+              driver: PI_PROVIDER,
+              turnItem: artifacts.turnItem,
+            });
+          } else {
+            const turnItem = {
+              id: turnItemId,
+              threadId: child.childThread.id,
+              runId: null,
+              nodeId: child.rootNodeId,
+              providerThreadId: child.providerThread.id,
+              providerTurnId: null,
+              nativeItemRef: providerRef(nativeItemId),
+              parentItemId: null,
+              ordinal,
+              status: message.isError
+                ? "failed"
+                : message.kind === "toolCall"
+                  ? "idle"
+                  : "completed",
+              title: message.name ?? "Tool result",
+              type: "dynamic_tool",
+              toolName: message.name ?? null,
+              input: message.kind === "toolCall" ? message.text : null,
+              ...(message.kind === "toolCall" ? {} : { output: message.text }),
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+            } satisfies Extract<OrchestrationV2TurnItem, { type: "dynamic_tool" }>;
+            if (turnItem.status === "idle") hasUnknownToolOutcome = true;
+            yield* emit({ type: "turn_item.updated", driver: PI_PROVIDER, turnItem });
+          }
+        }
+        if (hasUnknownToolOutcome)
+          yield* emitSubagentConversation(child, [
+            { role: "system", kind: "text", text: PI_SUBAGENT_UNKNOWN_TOOL_OUTCOME },
+          ]);
+      });
+
+      const refreshSubagentConversation = Effect.fn("Pi.refreshSubagentConversation")(function* (
+        child: NativeSubagent,
+      ) {
+        if (child.inspectionPhase !== null) {
+          child.refreshNeeded = true;
+          return;
+        }
+        child.inspectionPhase = "requesting";
+        yield* Effect.gen(function* () {
+          do {
+            child.refreshNeeded = false;
+            child.inspectionPhase = "requesting";
+            const result = yield* inspectSubagent({
+              providerThread: child.turn.turnInput.providerThread,
+              subagent: child.subagent,
+              inspectionTarget: child.observation.inspectionTarget,
+            });
+            yield* sessionEventPermit.withPermit(
+              Effect.gen(function* () {
+                if (child.observationClosed) return;
+                yield* result.availability === "available"
+                  ? emitSubagentConversation(child, result.messages, result.task, result.output)
+                  : emitSubagentConversation(child, [
+                      {
+                        role: "system",
+                        kind: "text",
+                        text: result.reason ?? "Native worker activity is unavailable.",
+                      },
+                    ]);
+                const now = yield* DateTime.now;
+                const fence = subagentRootEvent(child, now);
+                pendingDeliveries.set(fence, { runId: child.turn.turnInput.runId });
+                child.inspectionPhase = "delivering";
+                // FIFO ingestion, not the queue offer, releases this capture's ownership.
+                yield* emit(fence);
+              }),
+            );
+          } while (child.refreshNeeded && !closed);
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              child.inspectionPhase = null;
+            }).pipe(Effect.andThen(Queue.offer(nativeMaintenanceChanged, undefined))),
+          ),
+        );
+      });
+
+      const readSubagentLifecycle = Effect.fn("Pi.readSubagentLifecycle")(function* (
+        asyncDir: string,
+        runId: string,
+      ) {
+        return yield* Effect.gen(function* () {
+          const chunks = yield* fileSystem
+            .stream(`${asyncDir}/status.json`, { bytesToRead: PI_SUBAGENT_LIFECYCLE_MAX_BYTES + 1 })
+            .pipe(Stream.runCollect);
+          const size = chunks.reduce((total, chunk) => total + chunk.length, 0);
+          if (size > PI_SUBAGENT_LIFECYCLE_MAX_BYTES) return undefined;
+          const bytes = new Uint8Array(size);
+          let offset = 0;
+          for (const chunk of chunks) {
+            bytes.set(chunk, offset);
+            offset += chunk.length;
+          }
+          return piSubagentLifecycle(new TextDecoder().decode(bytes), runId);
+        }).pipe(Effect.catchCause(() => Effect.succeed(undefined)));
+      });
+
+      const canonicalizeSubagentObservation = (
+        rawObservation: PiSubagentObservation,
+      ): PiSubagentObservation => {
+        let parentId = rawObservation.parentId;
+        // Only reciprocal lifecycle proofs install these grouped/promoted aliases.
+        for (const [parentRunId, binding] of subagentRuns) {
+          for (const [childRunId, child] of binding.children ?? []) {
+            if (
+              parentId === piSubagentObservationId(childRunId, child.selfChildId) ||
+              parentId === piSubagentObservationId(parentRunId, child.workflowKey)
+            )
+              parentId = child.canonicalId;
+          }
+        }
+        const observation =
+          parentId === rawObservation.parentId ? rawObservation : { ...rawObservation, parentId };
+        for (const [parentRunId, binding] of subagentRuns) {
+          for (const [childRunId, child] of binding.children ?? []) {
+            const grouped =
+              observation.runId === parentRunId && observation.childId === child.workflowKey;
+            const promoted =
+              observation.runId === childRunId && observation.childId === child.selfChildId;
+            if (!grouped && !promoted) continue;
+            const existing = nativeSubagents.get(child.canonicalId);
+            return {
+              ...observation,
+              id: child.canonicalId,
+              runId: parentRunId,
+              childId: child.workflowKey,
+              parentId:
+                existing === undefined ? observation.parentId : existing.observation.parentId,
+              inspectionTarget: { runId: childRunId, childId: child.selfChildId },
+            };
+          }
+        }
+        return observation;
+      };
+
+      const reconcileSubagentSnapshot = Effect.fn("Pi.reconcileSubagentSnapshot")(function* (
+        lines: unknown,
+      ) {
+        const observations = piSubagentSnapshot(lines);
+        for (const runId of new Set([
+          ...piSubagentRunStates(lines).keys(),
+          ...observations.map((observation) => observation.runId),
+        ])) {
+          const binding = subagentRuns.get(runId);
+          if (binding !== undefined) binding.executionMode = "async";
+        }
+        const workflows = piSubagentWorkflowRunIds(lines);
+        for (const runId of workflows) {
+          const binding = subagentRuns.get(runId);
+          if (binding !== undefined) {
+            binding.workflow = true;
+          }
+        }
+        const hints = piSubagentLifecycleHints(lines);
+        for (const hint of hints) {
+          const binding = subagentRuns.get(hint.runId);
+          if (binding?.confirmedLaunch !== true) continue;
+          // child-status.asyncDir belongs to runId (the workflow), not childRunId.
+          if (binding.asyncDir === undefined) binding.asyncDir = hint.asyncDir;
+        }
+        // Only explicit launch/hint directories are read. Run ids never become paths.
+        const observedRuns = new Set([
+          ...piSubagentRunStates(lines).keys(),
+          ...observations.map((observation) => observation.runId),
+          ...hints.map((hint) => hint.runId),
+        ]);
+        let remainingReads = 64;
+        for (const runId of [...observedRuns].slice(0, 64)) {
+          const binding = subagentRuns.get(runId);
+          if (binding?.confirmedLaunch !== true || binding.asyncDir === undefined) continue;
+          if (remainingReads-- <= 0) break;
+          const lifecycle = yield* readSubagentLifecycle(binding.asyncDir, runId);
+          if (lifecycle !== undefined) binding.lifecycle = lifecycle;
+          if (binding.lifecycle?.mode !== "workflow") continue;
+          binding.workflow = true;
+          for (const hint of hints) {
+            if (hint.childId !== undefined || hint.childRunId !== undefined) continue;
+            const steps = binding.lifecycle.steps.filter(
+              (step) => step.runId === hint.runId && step.workflowKey !== undefined,
+            );
+            if (steps.length !== 1) continue;
+            binding.childHints ??= new Map();
+            if (binding.childHints.size < 64 || binding.childHints.has(hint.runId))
+              binding.childHints.set(hint.runId, {
+                asyncDir: hint.asyncDir,
+                workflowKey: steps[0]!.workflowKey!,
+              });
+          }
+          for (const [childRunId, hint] of binding.childHints ?? []) {
+            if (binding.children?.has(childRunId)) continue;
+            const steps = binding.lifecycle.steps.filter(
+              (step) => step.runId === childRunId && step.workflowKey === hint.workflowKey,
+            );
+            if (steps.length !== 1) continue;
+            const childBinding = subagentRuns.get(childRunId);
+            // A later hint cannot steal a child already launched by another owner/tool.
+            if (
+              childBinding !== undefined &&
+              (childBinding.turn !== binding.turn ||
+                (childBinding.confirmedLaunch === true &&
+                  childBinding.toolCallId !== binding.toolCallId))
+            )
+              continue;
+            if (remainingReads-- <= 0) break;
+            const childLifecycle = yield* readSubagentLifecycle(hint.asyncDir, childRunId);
+            if (
+              childLifecycle?.mode !== "single" ||
+              childLifecycle.runId !== childRunId ||
+              childLifecycle.parentWorkflowRunId !== runId ||
+              childLifecycle.workflowKey !== hint.workflowKey ||
+              childLifecycle.steps.length !== 1
+            )
+              continue;
+            const groupedId = piSubagentObservationId(runId, hint.workflowKey);
+            const selfChildId = childLifecycle.steps[0]!.childId;
+            const rootId = piSubagentObservationId(childRunId, selfChildId);
+            const root = nativeSubagents.get(rootId);
+            if (root !== undefined && root.turn !== binding.turn) continue;
+            binding.children ??= new Map();
+            if (!binding.children.has(childRunId))
+              binding.children.set(childRunId, {
+                workflowKey: hint.workflowKey,
+                selfChildId,
+                canonicalId:
+                  nativeSubagents.has(groupedId) || root === undefined ? groupedId : rootId,
+              });
+          }
+        }
+        return observations.flatMap((rawObservation): PiSubagentObservation[] => {
+          const observation = canonicalizeSubagentObservation(rawObservation);
+          if (observation.inspectionTarget !== undefined) return [observation];
+          const binding = subagentRuns.get(observation.runId);
+          // Unknown promoted roots may be the same worker as a retained workflow lane.
+          // Without both lifecycle proofs, keep the original projection rather than guess.
+          if (
+            observation.parentId === null &&
+            !nativeSubagents.has(observation.id) &&
+            binding?.confirmedLaunch !== true &&
+            !workflows.has(observation.runId) &&
+            (workflows.size > 0 || [...subagentRuns.values()].some((run) => run.workflow))
+          )
+            return [];
+          return [observation];
         });
-        for (const [index, result] of results.entries()) {
-          const agent = recordString(result, "agent");
-          const task = recordString(result, "task");
-          if (agent === undefined || task === undefined) continue;
-          const nativeTaskId = `${toolCallId}:subagent:${recordNumber(result, "step") ?? index}`;
+      });
+
+      // These upserts run in the serialized event pump, alongside streaming updates.
+      const emitSubagentObservations = Effect.fnUntraced(function* (
+        observations: ReadonlyArray<PiSubagentObservation>,
+        fallbackTurn: ActivePiTurn | null,
+        toolCallId?: string,
+        fromSnapshot = false,
+        foregroundFences?: Map<NativeSubagent, ProviderAdapter.ProviderAdapterV2Event>,
+      ) {
+        const emittedAt = yield* DateTime.now;
+        const reserveForegroundDelivery = (child: NativeSubagent) => {
+          if (foregroundFences === undefined || foregroundFences.has(child)) return;
+          const fence = subagentRootEvent(child, emittedAt);
+          pendingDeliveries.set(fence, { runId: child.turn.turnInput.runId });
+          foregroundFences.set(child, fence);
+        };
+        for (const observation of observations) {
+          const existing = nativeSubagents.get(observation.id);
+          const binding = subagentRuns.get(observation.runId);
+          if (
+            stopRequested ||
+            binding?.observationExpired ||
+            retiredNativeKeys.has(observation.runId) ||
+            existing?.observationClosed
+          )
+            continue;
+          const parentAgent =
+            observation.parentId === null ? undefined : nativeSubagents.get(observation.parentId);
+          if (existing === undefined && parentAgent?.observationClosed) continue;
+          // A snapshot includes retained history, not just work launched by this turn.
+          if (
+            fromSnapshot &&
+            existing === undefined &&
+            binding === undefined &&
+            parentAgent === undefined
+          )
+            continue;
+          const turn = existing?.turn ?? binding?.turn ?? parentAgent?.turn ?? fallbackTurn;
+          if (turn === null) continue;
+          const observationTime = observation.observedAt ?? observation.updatedAt;
+          const previousTime = existing?.observation.observedAt ?? existing?.observation.updatedAt;
+          if (
+            observationTime !== undefined &&
+            previousTime !== undefined &&
+            observationTime < previousTime
+          )
+            continue;
+          const changed =
+            existing === undefined ||
+            observation.status !== existing.subagent.status ||
+            observation.paused !== existing.observation.paused ||
+            observation.partial !== existing.observation.partial ||
+            observation.title !== existing.subagent.title ||
+            observation.parentId !== existing.observation.parentId ||
+            observation.inspectionTarget?.runId !== existing.observation.inspectionTarget?.runId ||
+            observation.inspectionTarget?.childId !==
+              existing.observation.inspectionTarget?.childId ||
+            // Snapshot generation advances on reads; only actual child activity refreshes its tail.
+            (observation.updatedAt !== undefined &&
+              observation.updatedAt !== existing.observation.updatedAt) ||
+            (observation.prompt !== undefined && observation.prompt !== existing.subagent.prompt) ||
+            (observation.model !== undefined && observation.model !== existing.subagent.model) ||
+            (observation.progress !== undefined &&
+              observation.progress !== existing.subagent.progress) ||
+            (observation.result !== undefined && observation.result !== existing.subagent.result);
+          if (!changed && existing !== undefined) {
+            reserveForegroundDelivery(existing);
+            existing.observation = observation;
+            continue;
+          }
+          const wasTerminal =
+            existing !== undefined &&
+            !["running", "pending", "waiting", "idle"].includes(existing.subagent.status);
+          if (wasTerminal && ["running", "pending", "waiting"].includes(observation.status))
+            continue;
+          subagentRuns.set(observation.runId, binding ?? { turn, toolCallId });
+          const nativeTaskId = `subagent:${turn.turnInput.providerThread.id}:${observation.id}`;
           const subagentId = idAllocator.derive.nodeFromProviderItem({
             driver: PI_PROVIDER,
             nativeItemId: nativeTaskId,
           });
-          const startedAt = turn.toolStartedAt.get(nativeTaskId) ?? emittedAt;
-          turn.toolStartedAt.set(nativeTaskId, startedAt);
-          const finished = completed || recordField(result, "finished") === true;
-          const stopReason = recordString(result, "stopReason");
-          const interrupted = finished && stopReason === "aborted";
-          const failed =
-            finished &&
-            !interrupted &&
-            ((recordNumber(result, "exitCode") ?? 0) !== 0 || stopReason === "error");
-          const status = interrupted
-            ? "interrupted"
-            : failed
-              ? "failed"
-              : finished
-                ? "completed"
-                : "running";
-          const outputText = piSubagentOutput(result);
+          const causalTool = binding?.toolCallId ?? toolCallId;
+          const parentNodeId =
+            (observation.inspectionTarget === undefined
+              ? undefined
+              : existing?.subagent.parentNodeId) ??
+            parentAgent?.subagent.id ??
+            (causalTool === undefined
+              ? turn.turnInput.rootNodeId
+              : idAllocator.derive.nodeFromProviderItem({
+                  driver: PI_PROVIDER,
+                  nativeItemId: causalTool,
+                }));
+          const startedAt = existing?.subagent.startedAt ?? emittedAt;
+          const status = observation.status;
+          const finished = !["pending", "running", "waiting", "idle"].includes(status);
           const progress =
-            !finished && outputText.length > 0 ? { progress: outputText.slice(0, 200) } : {};
-          const resultText = finished && outputText.length > 0 ? outputText.slice(0, 10_000) : null;
+            !finished && observation.progress !== undefined
+              ? { progress: observation.progress }
+              : {};
+          const resultText = observation.result ?? existing?.subagent.result ?? null;
+          const childThreadId =
+            existing?.childThread.id ??
+            idAllocator.derive.threadFromProviderThread({
+              driver: PI_PROVIDER,
+              nativeThreadId: nativeTaskId,
+            });
+          const childProviderThread = existing?.providerThread ?? {
+            ...turn.turnInput.providerThread,
+            id: idAllocator.derive.providerThread({
+              driver: PI_PROVIDER,
+              nativeThreadId: nativeTaskId,
+            }),
+            appThreadId: childThreadId,
+            ownerNodeId: null,
+            nativeThreadRef: providerRef(nativeTaskId),
+            nativeConversationHeadRef: null,
+            firstRunOrdinal: null,
+            lastRunOrdinal: null,
+            handoffIds: [],
+            forkedFrom: {
+              providerThreadId: turn.turnInput.providerThread.id,
+              providerTurnId: turn.providerTurn.id,
+            },
+            createdAt: startedAt,
+          };
+          const childThread =
+            existing?.childThread ??
+            makeSubagentChildThread({
+              parentThread: parentAgent?.childThread ?? turn.turnInput.appThread,
+              childThreadId,
+              parentNodeId: subagentId,
+              activeProviderThreadId: childProviderThread.id,
+              providerInstanceId: options.instanceId,
+              modelSelection: {
+                ...turn.turnInput.modelSelection,
+                model: observation.model ?? turn.turnInput.modelSelection.model,
+              },
+              title: subagentThreadTitle({
+                parentTitle: turn.turnInput.appThread.title,
+                title: observation.title,
+                prompt: observation.prompt ?? "",
+                ordinal: nativeSubagents.size + 1,
+              }),
+              now: startedAt,
+              createdBy: "agent",
+              creationSource: "provider",
+            });
+          const childRootNodeId =
+            existing?.rootNodeId ??
+            idAllocator.derive.nodeFromProviderItem({
+              driver: PI_PROVIDER,
+              nativeItemId: `${nativeTaskId}:root`,
+            });
+          const subagent = {
+            ...existing?.subagent,
+            id: subagentId,
+            threadId:
+              (observation.inspectionTarget === undefined
+                ? undefined
+                : existing?.subagent.threadId) ??
+              parentAgent?.childThread.id ??
+              turn.turnInput.threadId,
+            runId: turn.turnInput.runId,
+            parentNodeId,
+            origin: "provider_native" as const,
+            createdBy: "agent" as const,
+            driver: PI_PROVIDER,
+            providerInstanceId: options.instanceId,
+            providerThreadId: childProviderThread.id,
+            childThreadId,
+            nativeTaskRef: providerRef(nativeTaskId),
+            prompt: observation.prompt ?? existing?.subagent.prompt ?? "",
+            title: observation.title,
+            model: observation.model ?? existing?.subagent.model ?? null,
+            status,
+            ...progress,
+            result: resultText,
+            startedAt,
+            completedAt: finished ? (existing?.subagent.completedAt ?? emittedAt) : null,
+            updatedAt: emittedAt,
+          };
+          const child: NativeSubagent = existing ?? {
+            observation,
+            turn,
+            subagent,
+            childThread,
+            providerThread: childProviderThread,
+            rootNodeId: childRootNodeId,
+            items: new Map(),
+            inspectionPhase: null,
+            refreshNeeded: false,
+          };
+          child.observation = observation;
+          child.subagent = subagent;
+          // Final transcript capture still belongs to the run after the child stops.
+          if (fromSnapshot) child.refreshNeeded = true;
+          reserveForegroundDelivery(child);
+          nativeSubagents.set(observation.id, child);
+          if (binding !== undefined) binding.awaitingFirstChild = false;
           yield* emit({
             type: "subagent.updated",
             driver: PI_PROVIDER,
-            subagent: {
-              id: subagentId,
-              threadId: turn.turnInput.threadId,
-              runId: turn.turnInput.runId,
-              parentNodeId,
-              origin: "provider_native",
-              createdBy: "agent",
+            subagent,
+          });
+          // The owning run enrolls the child before its delayed native snapshot creates the chat.
+          if (existing === undefined) {
+            yield* emit({
+              type: "app_thread.created",
               driver: PI_PROVIDER,
-              providerInstanceId: options.instanceId,
-              providerThreadId: turn.turnInput.providerThread.id,
-              childThreadId: null,
-              nativeTaskRef: providerRef(nativeTaskId),
-              prompt: task,
-              title: agent,
-              model: recordString(result, "model") ?? null,
-              status,
-              ...progress,
-              result: resultText,
-              startedAt,
-              completedAt: finished ? emittedAt : null,
+              appThread: childThread,
+              createOnly: true,
+            });
+          }
+          yield* emit({
+            type: "provider_thread.updated",
+            driver: PI_PROVIDER,
+            providerThread: {
+              ...childProviderThread,
+              status: finished || status === "idle" ? "idle" : "active",
               updatedAt: emittedAt,
             },
           });
+          yield* emit(subagentRootEvent(child, emittedAt));
           yield* emit({
             type: "turn_item.updated",
             driver: PI_PROVIDER,
             turnItem: {
               ...baseItemFields(turn, nativeTaskId, startedAt, emittedAt),
+              threadId: subagent.threadId,
               status,
-              title: agent,
-              completedAt: finished ? emittedAt : null,
+              title: observation.title,
+              completedAt: subagent.completedAt,
               type: "subagent",
               subagentId,
               origin: "provider_native",
               driver: PI_PROVIDER,
               providerInstanceId: options.instanceId,
-              childThreadId: null,
-              prompt: task,
+              childThreadId,
+              prompt: subagent.prompt,
               ...progress,
               result: resultText,
             },
           });
+          yield* emitSubagentConversation(
+            child,
+            [
+              ...(existing === undefined
+                ? [
+                    {
+                      role: "system",
+                      kind: "text" as const,
+                      text: "Recent native worker activity is shown here. Earlier activity may be unavailable.",
+                    },
+                  ]
+                : []),
+              ...(observation.partial
+                ? [
+                    {
+                      role: "system",
+                      kind: "text" as const,
+                      text: "Native worker returned a partial result and is no longer active. The final outcome is unknown; physical worker exit is not confirmed.",
+                    },
+                  ]
+                : []),
+            ],
+            observation.prompt,
+            resultText ?? undefined,
+          );
+          if (fromSnapshot) yield* refreshSubagentConversation(child).pipe(Effect.forkIn(scope));
         }
       });
+
+      // Enroll every original-run fence before any inactive event can close its consumer.
+      const closeNativeObservations = Effect.fn("Pi.closeNativeObservations")(function* (
+        children: ReadonlyArray<NativeSubagent>,
+        launches: ReadonlyArray<string>,
+        notice: string,
+      ) {
+        const now = yield* DateTime.now;
+        const fences: ProviderAdapter.ProviderAdapterV2Event[] = [];
+        const acknowledgements: Deferred.Deferred<void>[] = [];
+        for (const child of children) {
+          child.observationClosed = true;
+          child.refreshNeeded = false;
+          const status = ["pending", "running", "waiting", "idle"].includes(child.subagent.status)
+            ? "interrupted"
+            : child.subagent.status;
+          child.observation = { ...child.observation, status };
+          child.subagent = {
+            ...child.subagent,
+            status,
+            completedAt: child.subagent.completedAt ?? now,
+            updatedAt: now,
+          };
+          const fence = subagentRootEvent(child, now);
+          const acknowledged = yield* Deferred.make<void>();
+          pendingDeliveries.set(fence, { runId: child.turn.turnInput.runId, acknowledged });
+          acknowledgements.push(acknowledged);
+          fences.push(fence);
+        }
+        for (const runId of launches) {
+          const binding = subagentRuns.get(runId)!;
+          const turn = binding.turn;
+          const fence = {
+            type: "turn_item.updated" as const,
+            driver: PI_PROVIDER,
+            turnItem: {
+              ...baseItemFields(turn, `native-stop:${runId}`, now, now),
+              status: "completed" as const,
+              completedAt: now,
+              title: null,
+              type: "system_notice" as const,
+              message: notice,
+            },
+          };
+          const acknowledged = yield* Deferred.make<void>();
+          pendingDeliveries.set(fence, { runId: turn.turnInput.runId, acknowledged });
+          acknowledgements.push(acknowledged);
+          fences.push(fence);
+          binding.awaitingFirstChild = false;
+        }
+        for (const child of children) {
+          yield* emit({ type: "subagent.updated", driver: PI_PROVIDER, subagent: child.subagent });
+          yield* emit({
+            type: "provider_thread.updated",
+            driver: PI_PROVIDER,
+            providerThread: { ...child.providerThread, status: "idle", updatedAt: now },
+          });
+          yield* emit({
+            type: "turn_item.updated",
+            driver: PI_PROVIDER,
+            turnItem: {
+              ...baseItemFields(
+                child.turn,
+                child.subagent.nativeTaskRef!.nativeId!,
+                child.subagent.startedAt ?? now,
+                now,
+              ),
+              threadId: child.subagent.threadId,
+              status: child.subagent.status,
+              title: child.subagent.title,
+              completedAt: child.subagent.completedAt,
+              type: "subagent",
+              subagentId: child.subagent.id,
+              origin: "provider_native",
+              driver: PI_PROVIDER,
+              providerInstanceId: options.instanceId,
+              childThreadId: child.childThread.id,
+              prompt: child.subagent.prompt,
+              result: child.subagent.result,
+            },
+          });
+          yield* emitSubagentConversation(child, [{ role: "system", kind: "text", text: notice }]);
+        }
+        for (const fence of fences) yield* emit(fence);
+        return acknowledgements;
+      });
+
+      // Per-event maintenance shares the pump's trace/permit; expiry reserves its fence before release.
+      const maintainNativeHistory = Effect.fnUntraced(function* () {
+        const now = DateTime.toEpochMillis(yield* DateTime.now);
+        const expired = [...subagentRuns].filter(
+          ([, binding]) =>
+            binding.awaitingFirstChild &&
+            binding.firstChildDeadline !== undefined &&
+            binding.firstChildDeadline <= now,
+        );
+        if (expired.length > 0) {
+          yield* closeNativeObservations(
+            [],
+            expired.map(([runId]) => runId),
+            "Native worker observation window expired before its first child was available. Worker outcome is unknown; the worker may still be running. Observation has ended.",
+          );
+          for (const [, binding] of expired) binding.observationExpired = true;
+        }
+        const owners = new Set<ActivePiTurn>();
+        const blockedRuns = new Set(
+          [...pendingDeliveries.values()].map((delivery) => delivery.runId),
+        );
+        for (const binding of subagentRuns.values()) {
+          owners.add(binding.turn);
+          if (
+            binding.awaitingFirstChild ||
+            binding.foregroundActive ||
+            (binding.executionMode === "async" &&
+              !binding.observationExpired &&
+              // Only native paused or ended partial states map to idle; descendants block independently.
+              ["running", "pending", "waiting"].includes(binding.nativeStatus ?? ""))
+          )
+            blockedRuns.add(binding.turn.turnInput.runId);
+        }
+        // An empty owner needs its actual finalized launch item to close delivery canonically.
+        // A missing tool end is not evidence that an original consumer can be released.
+        const fenceOwners = new Set([...nativeSubagents.values()].map((child) => child.turn));
+        for (const binding of subagentRuns.values())
+          if (binding.finalLaunchEvent !== undefined) fenceOwners.add(binding.turn);
+        for (const turn of owners)
+          if (!fenceOwners.has(turn)) blockedRuns.add(turn.turnInput.runId);
+        for (const child of nativeSubagents.values()) {
+          owners.add(child.turn);
+          if (
+            child.inspectionPhase !== null ||
+            child.refreshNeeded ||
+            (!child.observationClosed &&
+              (["running", "pending", "waiting"].includes(child.subagent.status) ||
+                (child.subagent.status === "idle" &&
+                  !child.observation.paused &&
+                  !child.observation.partial)))
+          )
+            blockedRuns.add(child.turn.turnInput.runId);
+        }
+        const eligible = [...owners].filter(
+          (turn) =>
+            turn.nativeParentSettled &&
+            pendingWake === null &&
+            !blockedRuns.has(turn.turnInput.runId),
+        );
+        for (const turn of eligible) turn.nativeHistoryEligibleAt ??= now;
+        eligible.sort((a, b) => a.nativeHistoryEligibleAt! - b.nativeHistoryEligibleAt!);
+        const retiring = new Set(
+          eligible.filter(
+            (turn, index) =>
+              index < eligible.length - NATIVE_RECENT_OWNER_LIMIT ||
+              turn.nativeHistoryEligibleAt! + NATIVE_OBSERVATION_WINDOW_MS <= now,
+          ),
+        );
+        const remember = (key: string) => {
+          retiredNativeKeys.add(key);
+          if (retiredNativeKeys.size > NATIVE_REPLAY_KEY_LIMIT)
+            retiredNativeKeys.delete(retiredNativeKeys.values().next().value!);
+        };
+        const retirementFences = new Map<ActivePiTurn, ProviderAdapter.ProviderAdapterV2Event>();
+        for (const child of nativeSubagents.values()) {
+          if (!retiring.has(child.turn) || retirementFences.has(child.turn)) continue;
+          const fence = subagentRootEvent(child, DateTime.makeUnsafe(now));
+          pendingDeliveries.set(fence, { runId: child.turn.turnInput.runId });
+          retirementFences.set(child.turn, fence);
+        }
+        for (const binding of subagentRuns.values()) {
+          if (
+            !retiring.has(binding.turn) ||
+            retirementFences.has(binding.turn) ||
+            binding.finalLaunchEvent === undefined
+          )
+            continue;
+          // Same final item, fresh delivery identity: ingestion may be a no-op, but its accepted ACK is real.
+          const fence = { ...binding.finalLaunchEvent };
+          pendingDeliveries.set(fence, { runId: binding.turn.turnInput.runId });
+          retirementFences.set(binding.turn, fence);
+        }
+        // Close admission under the pump permit only after every original final fence is reserved.
+        for (const [runId, binding] of subagentRuns) {
+          if (!retiring.has(binding.turn)) continue;
+          remember(runId);
+          for (const childRunId of binding.children?.keys() ?? []) remember(childRunId);
+          subagentRuns.delete(runId);
+        }
+        for (const [id, child] of nativeSubagents)
+          if (retiring.has(child.turn)) nativeSubagents.delete(id);
+        for (const fence of retirementFences.values()) yield* emit(fence);
+        let deadline = Infinity;
+        for (const binding of subagentRuns.values())
+          if (binding.awaitingFirstChild && binding.firstChildDeadline !== undefined)
+            deadline = Math.min(deadline, binding.firstChildDeadline);
+        for (const turn of eligible)
+          if (!retiring.has(turn))
+            deadline = Math.min(
+              deadline,
+              turn.nativeHistoryEligibleAt! + NATIVE_OBSERVATION_WINDOW_MS,
+            );
+        return deadline === Infinity ? undefined : Math.max(0, deadline - now);
+      });
+
+      yield* Effect.gen(function* () {
+        while (true) {
+          const delay = yield* sessionEventPermit.withPermit(maintainNativeHistory());
+          const changed = Queue.take(nativeMaintenanceChanged);
+          yield* delay === undefined
+            ? changed
+            : Effect.raceFirst(changed, Effect.sleep(Duration.millis(delay)));
+        }
+      }).pipe(Effect.forkIn(scope));
 
       const cancelPrompt = Effect.fn("PiAdapter.cancelPrompt")(function* (
         pending: PendingPiPrompt,
@@ -1216,6 +2329,80 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const method = recordString(event, "method");
         const nativeRequestId = recordString(event, "id");
         if (method === undefined) return;
+        if (method === "setWidget" && recordString(event, "widgetKey") === "subagent-inspect") {
+          const lines = event["widgetLines"];
+          const line = Array.isArray(lines) ? lines[0] : undefined;
+          const prefix = "PI_SUBAGENT_INSPECT_JSON:";
+          if (typeof line !== "string" || !line.startsWith(prefix)) return;
+          const payload = line.slice(prefix.length);
+          if (
+            payload.length > 64 * 1024 ||
+            new TextEncoder().encode(payload).byteLength > 64 * 1024
+          )
+            return;
+          const response = Schema.decodeUnknownOption(
+            Schema.fromJsonString(PiSubagentInspectReply),
+          )(payload);
+          if (Option.isNone(response)) return;
+          const pending = inspectionRequests.get(response.value.requestId);
+          if (
+            pending !== undefined &&
+            (response.value.asyncId === undefined || response.value.asyncId === pending.runId) &&
+            (response.value.childId === undefined || response.value.childId === pending.childId)
+          )
+            yield* Deferred.succeed(pending.reply, response.value);
+          return;
+        }
+        if (method === "setWidget" && recordString(event, "widgetKey") === "t3-subagent-liveness") {
+          const lines = event["widgetLines"];
+          if (!Array.isArray(lines) || typeof lines[0] !== "string") return;
+          const data = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(
+            lines[0],
+          ).pipe(Effect.catchCause(() => Effect.succeed(undefined)));
+          if (recordField(data, "version") !== 1) return;
+          if (recordField(data, "ready") === true) livenessReady = true;
+          const requestId = recordString(data, "requestId");
+          const status = recordString(data, "status");
+          const reply = requestId === undefined ? undefined : livenessRequests.get(requestId);
+          if (
+            reply !== undefined &&
+            (status === "active" || status === "inactive" || status === "unavailable")
+          ) {
+            yield* Deferred.succeed(reply, status);
+          }
+          return;
+        }
+        if (
+          method === "setWidget" &&
+          (recordString(event, "widgetKey") === "subagent-async" ||
+            recordString(event, "widgetKey") === "t3-subagents")
+        ) {
+          const state = threadState;
+          yield* emitSubagentObservations(
+            yield* reconcileSubagentSnapshot(event["widgetLines"]),
+            state?.activeTurn ?? state?.lastTurn ?? null,
+            undefined,
+            true,
+          );
+          for (const runId of piSubagentWorkflowRunIds(event["widgetLines"])) {
+            const binding = subagentRuns.get(runId);
+            if (binding !== undefined) binding.workflow = true;
+          }
+          for (const [runId, status] of piSubagentRunStates(event["widgetLines"])) {
+            const binding = subagentRuns.get(runId);
+            if (binding !== undefined) {
+              binding.executionMode = "async";
+              if (
+                !["completed", "failed", "interrupted"].includes(binding.nativeStatus ?? "") ||
+                ["completed", "failed", "interrupted"].includes(status)
+              )
+                binding.nativeStatus = status;
+              if (["completed", "failed", "interrupted", "idle"].includes(status))
+                binding.awaitingFirstChild = false;
+            }
+          }
+          return;
+        }
         if (method === "notify") {
           const state = threadState;
           const turn = state?.activeTurn ?? null;
@@ -1459,9 +2646,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         };
       });
 
-      const finalizeTurn = Effect.fnUntraced(function* (state: PiThreadState, readUsage = true) {
+      const finalizeTurn = Effect.fnUntraced(function* (
+        state: PiThreadState,
+        readUsage = true,
+        transportAlive = true,
+      ) {
         const turn = state.activeTurn;
         if (turn === null) return;
+        state.lastTurn = turn;
         state.activeTurn = null;
         const interrupted = turn.interrupted || turn.nativeAborted;
         const completedAt = yield* DateTime.now;
@@ -1550,6 +2742,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             failureItemOrdinal: itemOrdinal(turn, failureItemId),
             status: "failed",
             failure,
+            ...(transportAlive && !stopRequested && !interrupted
+              ? { childTurnsContinue: true as const }
+              : {}),
             ...(turn.activeProviderRetry === null
               ? {}
               : {
@@ -1570,6 +2765,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             threadDisposition: "reusable",
           });
         }
+        turn.nativeParentSettled = true;
+        yield* Queue.offer(nativeMaintenanceChanged, undefined);
       });
 
       const scheduleSettleProbe = (
@@ -1615,7 +2812,31 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       });
 
       const handleSessionEvent = Effect.fnUntraced(function* (event: PiRpcRecord) {
-        // Model hooks can show dialogs before turn ownership; keep requests session-scoped and buffer output.
+        const state = threadState;
+        const turn = state?.activeTurn ?? null;
+        if (
+          event["type"] === "tool_execution_update" &&
+          recordString(event, "toolName") === "subagent"
+        ) {
+          const toolCallId = recordString(event, "toolCallId");
+          const result = event["partialResult"];
+          const runId = recordString(recordField(result, "details"), "runId");
+          const retained = runId === undefined ? undefined : subagentRuns.get(runId);
+          if (
+            toolCallId !== undefined &&
+            retained?.turn !== turn &&
+            retained?.confirmedLaunch &&
+            retained.executionMode === "attached"
+          ) {
+            if (retained.toolCallId === toolCallId)
+              yield* emitSubagentTasks(retained.turn, toolCallId, result, false);
+            return;
+          }
+        }
+        // Model-selection hooks can await a dialog before startTurn can claim
+        // a wake. Keep interactive requests session-scoped until a turn owns
+        // them; buffer native output and notifications for that turn. Private observer
+        // replies must still complete session-scoped requests while wake admission waits.
         const interactiveUiRequest =
           event["type"] === "extension_ui_request" &&
           ["select", "confirm", "input", "editor"].includes(String(event["method"]));
@@ -1624,15 +2845,19 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           pendingWake !== null &&
           !interactiveUiRequest &&
           !String(event["type"]).startsWith("t3.") &&
-          event["type"] !== "response"
+          event["type"] !== "response" &&
+          !(
+            event["type"] === "extension_ui_request" &&
+            ["t3-subagent-liveness", "subagent-inspect", "t3-subagents", "subagent-async"].includes(
+              recordString(event, "widgetKey") ?? "",
+            )
+          )
         ) {
           pendingWake.events.push(event);
           if (event["type"] === "agent_start") yield* updateProviderSession("running", null);
           if (event["type"] === "agent_settled") yield* updateProviderSession("ready", null);
           return;
         }
-        const state = threadState;
-        const turn = state?.activeTurn ?? null;
         switch (event["type"]) {
           case "agent_start": {
             if (
@@ -1741,9 +2966,21 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               yield* emitToolItem(turn, event, "start");
             }
             return;
-          case "tool_execution_update":
+          case "tool_execution_update": {
+            const toolCallId = recordString(event, "toolCallId");
+            if (
+              recordString(event, "toolName") === "subagent" &&
+              toolCallId !== undefined &&
+              !turn?.toolArgs.has(toolCallId) &&
+              [...subagentRuns.values()].some(
+                (binding) =>
+                  binding.executionMode === "attached" && binding.toolCallId === toolCallId,
+              )
+            )
+              return;
             if (turn !== null) yield* emitToolItem(turn, event, "update");
             return;
+          }
           case "tool_execution_end":
             if (turn !== null) yield* emitToolItem(turn, event, "end");
             return;
@@ -2063,54 +3300,100 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       yield* Effect.gen(function* () {
         while (true) {
           const event = yield* Queue.take(connection.events);
-          yield* sessionEventPermit.withPermits(1)(handleSessionEvent(event));
+          yield* sessionEventPermit.withPermits(1)(
+            Effect.gen(function* () {
+              yield* maintainNativeHistory();
+              yield* handleSessionEvent(event);
+              yield* maintainNativeHistory();
+              yield* Queue.offer(nativeMaintenanceChanged, undefined);
+            }),
+          );
         }
       }).pipe(
         Effect.catchCause((cause) =>
-          sessionEventPermit.withPermits(1)(
-            Effect.gen(function* () {
-              const state = threadState;
-              if (rollbackBarrier !== null)
-                yield* Deferred.fail(
-                  rollbackBarrier,
-                  protocolError("Pi transport closed during rollback"),
+          Effect.gen(function* () {
+            const acknowledgements = yield* sessionEventPermit.withPermit(
+              Effect.gen(function* () {
+                livenessReady = false;
+                const state = threadState;
+                if (rollbackBarrier !== null)
+                  yield* Deferred.fail(
+                    rollbackBarrier,
+                    protocolError("Pi transport closed during rollback"),
+                  );
+                pendingWake = null;
+                const interrupted = state?.activeTurn?.interrupted === true;
+                const retainedAcknowledgements: Deferred.Deferred<void>[] = [];
+                for (const delivery of pendingDeliveries.values()) {
+                  delivery.acknowledged ??= yield* Deferred.make<void>();
+                  retainedAcknowledgements.push(delivery.acknowledged);
+                }
+                const acknowledgements = yield* closeNativeObservations(
+                  [...nativeSubagents.values()].filter(
+                    (child) =>
+                      !child.observationClosed &&
+                      (["running", "pending", "waiting", "idle"].includes(child.subagent.status) ||
+                        child.inspectionPhase === "requesting" ||
+                        child.refreshNeeded),
+                  ),
+                  [...subagentRuns]
+                    .filter(([, binding]) => binding.awaitingFirstChild)
+                    .map(([runId]) => runId),
+                  "Native worker observer was lost. Final activity is unavailable. Workers may still be running; shutdown is unconfirmed.",
                 );
-              pendingWake = null;
-              const interrupted = state?.activeTurn?.interrupted === true;
-              if (state?.activeTurn != null) {
-                state.activeTurn.failure = interrupted
-                  ? null
-                  : makeProviderFailure({
-                      cause,
-                      message: "Pi process exited unexpectedly.",
-                      class: "transport_error",
-                    });
-                yield* finalizeTurn(state, false);
-              } else {
-                yield* cancelPendingPrompts(yield* DateTime.now);
-              }
-              if (unsolicitedActivityDetected) {
-                yield* updateProviderSession("error", PI_UNSOLICITED_ACTIVITY_ERROR);
+                if (state?.activeTurn != null) {
+                  state.activeTurn.failure = interrupted
+                    ? null
+                    : makeProviderFailure({
+                        cause,
+                        message: "Pi process exited unexpectedly.",
+                        class: "transport_error",
+                      });
+                  yield* finalizeTurn(state, false, false);
+                } else {
+                  yield* cancelPendingPrompts(yield* DateTime.now);
+                }
+                return [...retainedAcknowledgements, ...acknowledgements];
+              }),
+            );
+            // Ingestion needs the session permit; persistence ACKs must be awaited outside it.
+            const persisted = yield* Effect.forEach(acknowledgements, Deferred.await, {
+              discard: true,
+            }).pipe(
+              Effect.as(true),
+              Effect.timeoutOrElse({
+                duration: Duration.seconds(5),
+                orElse: () => Effect.succeed(false),
+              }),
+            );
+            if (!persisted)
+              yield* Effect.logWarning(
+                "Pi native observation cleanup persistence is unconfirmed after transport loss.",
+              );
+            const interrupted = threadState?.lastTurn?.interrupted === true;
+            if (unsolicitedActivityDetected) {
+              yield* updateProviderSession("error", PI_UNSOLICITED_ACTIVITY_ERROR);
+              yield* Queue.end(events);
+            } else if (stopRequested) {
+              yield* updateProviderSession("stopped", null);
+              yield* Queue.end(events);
+            } else {
+              yield* updateProviderSession(
+                "error",
+                interrupted ? "Pi process was stopped." : "Pi process exited unexpectedly.",
+              );
+              const failure = new ProviderAdapter.ProviderAdapterEventStreamError({
+                driver: PI_PROVIDER,
+                providerSessionId: input.providerSessionId,
+                cause,
+              });
+              if (persisted) yield* Queue.fail(events, failure);
+              else {
+                drainedStreamFailure = failure;
                 yield* Queue.end(events);
-              } else if (stopRequested) {
-                yield* updateProviderSession("stopped", null);
-                yield* Queue.end(events);
-              } else {
-                yield* updateProviderSession(
-                  "error",
-                  interrupted ? "Pi process was stopped." : "Pi process exited unexpectedly.",
-                );
-                yield* Queue.fail(
-                  events,
-                  new ProviderAdapter.ProviderAdapterEventStreamError({
-                    driver: PI_PROVIDER,
-                    providerSessionId: input.providerSessionId,
-                    cause,
-                  }),
-                );
               }
-            }),
-          ),
+            }
+          }),
         ),
         Effect.forkIn(scope),
       );
@@ -2331,12 +3614,68 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         get providerSession() {
           return sessionEntity;
         },
-        events: Stream.fromQueue(events),
-        hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null),
-        hasPendingBackgroundWorkForThread: (providerThread) =>
-          Effect.sync(
-            () => pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id,
+        events: Stream.fromQueue(events).pipe(
+          Stream.concat(
+            Stream.suspend(() =>
+              drainedStreamFailure === null ? Stream.empty : Stream.fail(drainedStreamFailure),
+            ),
           ),
+        ),
+        backgroundWorkStatus: observeBackgroundWork(),
+        hasPendingBackgroundWork: Effect.sync(
+          () =>
+            pendingWake !== null ||
+            hasObservedChildren() ||
+            pendingDeliveries.size > 0 ||
+            [...subagentRuns.values()].some((binding) => binding.awaitingFirstChild === true),
+        ),
+        hasOpenEventSourceForRun: (runId) =>
+          Effect.sync(
+            () =>
+              !closed &&
+              [...subagentRuns.values()].some(
+                (binding) => binding.turn.turnInput.runId === runId && !binding.observationExpired,
+              ),
+          ),
+        hasPendingEventDeliveryForRun: (runId) =>
+          Effect.sync(
+            () =>
+              [...pendingDeliveries.values()].some((delivery) => delivery.runId === runId) ||
+              [...subagentRuns.values()].some(
+                (binding) =>
+                  binding.turn.turnInput.runId === runId && binding.awaitingFirstChild === true,
+              ) ||
+              [...nativeSubagents.values()].some(
+                (child) =>
+                  child.turn.turnInput.runId === runId &&
+                  (child.inspectionPhase === "requesting" || child.refreshNeeded),
+              ),
+          ),
+        // This runs for every delivered event, not just native cleanup fences.
+        acknowledgeEvent: Effect.fnUntraced(function* (event, runId) {
+          yield* sessionEventPermit.withPermit(
+            Effect.gen(function* () {
+              const delivery = pendingDeliveries.get(event);
+              if (delivery?.runId !== runId) return;
+              pendingDeliveries.delete(event);
+              if (delivery.acknowledged !== undefined)
+                yield* Deferred.succeed(delivery.acknowledged, undefined);
+              yield* maintainNativeHistory();
+              yield* Queue.offer(nativeMaintenanceChanged, undefined);
+            }),
+          );
+        }),
+        hasPendingBackgroundWorkForThread: Effect.fn("Pi.hasPendingBackgroundWorkForThread")(
+          function* (providerThread: OrchestrationV2ProviderThread) {
+            if (threadState?.providerThread.id !== providerThread.id) return false;
+            // A detached run can be live before its first child snapshot arrives.
+            return (
+              pendingWake !== null ||
+              hasObservedChildren() ||
+              (yield* observeBackgroundWork()) === "active"
+            );
+          },
+        ),
         getModelContextWindow: (selection) => {
           if (selection.instanceId !== options.instanceId) return undefined;
           const slug =
@@ -3211,27 +4550,6 @@ function piUncapturedForkEntry(
     if (timestamp >= from && timestamp <= to) earliest = id;
   }
   return earliest;
-}
-
-function piSubagentOutput(result: unknown): string {
-  const stopReason = recordString(result, "stopReason");
-  const failed =
-    (recordNumber(result, "exitCode") ?? 0) !== 0 ||
-    stopReason === "error" ||
-    stopReason === "aborted";
-  if (failed) {
-    const failure = recordString(result, "errorMessage") || recordString(result, "stderr");
-    if (failure !== undefined && failure.length > 0) return failure;
-  }
-  const messages = recordField(result, "messages");
-  if (!Array.isArray(messages)) return "";
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (recordString(message, "role") !== "assistant") continue;
-    const text = contentText(recordField(message, "content"));
-    if (text.length > 0) return text;
-  }
-  return "";
 }
 
 function piExtensionDisplayName(extensionPath: string | undefined): string {

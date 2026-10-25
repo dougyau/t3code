@@ -35,6 +35,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 
 import * as ServerSettings from "../serverSettings.ts";
@@ -172,7 +173,7 @@ it.effect("routes shared-runtime events only to their owning root run", () =>
   }),
 );
 
-it("routes only enrolled workflow members after the root turn ends", () => {
+it("routes only explicitly enrolled children after the root turn ends", () => {
   const threadId = ThreadId.make("thread:late-child");
   const rootProviderTurnId = ProviderTurnId.make("provider-turn:late-child");
   const identity: RunExecutionService.ProviderEventRouteIdentity = {
@@ -270,6 +271,18 @@ it("routes only enrolled workflow members after the root turn ends", () => {
       agents: [{ index: 0, label: "Reviewer", state: "running", childThreadId: memberId }],
     },
   };
+  const [, withNativeChild] = RunExecutionService.routeProviderEvent(
+    {
+      type: "subagent.updated",
+      driver,
+      subagent: { ...coordinator, childThreadId: lateChild },
+    },
+    identity,
+    ended,
+  );
+  assert.isTrue(
+    RunExecutionService.routeProviderEvent(childCreated(lateChild), identity, withNativeChild)[0],
+  );
   const [foreignAccepted, afterForeign] = RunExecutionService.routeProviderEvent(
     {
       type: "subagent.updated",
@@ -2992,6 +3005,7 @@ function captureRootRunTermination(input: {
   ) => Effect.Effect<void>;
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
+  readonly session?: Partial<ProviderAdapter.ProviderAdapterV2SessionRuntime>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalized"];
@@ -3125,13 +3139,14 @@ function captureRootRunTermination(input: {
                   : []),
                 rootTerminalEvent(ids, "interrupted"),
               ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
-            close: Deferred.succeed(ingestionDone, undefined).pipe(
-              Effect.andThen(input.onSubscriptionClose ?? Effect.void),
+            close: (input.onSubscriptionClose ?? Effect.void).pipe(
+              Effect.andThen(Deferred.succeed(ingestionDone, undefined)),
             ),
           }),
           startTurn: input.startTurn ?? (() => Effect.void),
           interruptTurn: input.interruptTurn ?? (() => Effect.void),
           hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread,
+          ...input.session,
         } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
         run: {
           id: ids.runId,
@@ -3474,7 +3489,7 @@ function makeRunOwnedSubagentNodeFixture(input: {
 
 function makeRunOwnedSubagentChildNodeFixture(input: {
   readonly ids: BackgroundScenarioIds;
-  readonly status: "running" | "interrupted";
+  readonly status: "running" | "interrupted" | "completed";
 }): OrchestrationV2ExecutionNode {
   const now = DateTime.makeUnsafe("2026-07-21T12:00:00.000Z");
   return {
@@ -3499,7 +3514,7 @@ function makeRunOwnedSubagentChildNodeFixture(input: {
 function rootTerminalEvent(
   ids: BackgroundScenarioIds,
   status: "completed" | "interrupted" | "cancelled" | "failed",
-): ProviderAdapter.ProviderAdapterV2Event {
+): Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "turn.terminal" }> {
   const common = {
     type: "turn.terminal" as const,
     driver,
@@ -3725,5 +3740,313 @@ it.effect("keeps a failed root's still-running native children live while the ru
       written.some((event) => event.type === "subagent.updated"),
       "a child that outlives the failed root must not be settled with it",
     );
+  }),
+);
+
+it.effect.each([
+  { handoff: false, root: "completed" },
+  { handoff: true, root: "completed" },
+  { handoff: false, root: "failed" },
+  { handoff: true, root: "failed" },
+] as const)(
+  "persists final native cleanup after root settlement before releasing its owning subscription, %j",
+  ({ handoff, root }) =>
+    Effect.gen(function* () {
+      const key = `native-capture:${handoff}:${root}`;
+      const ids = backgroundScenarioIds(key);
+      const blocked = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const handoffRetained = yield* Deferred.make<void>();
+      const queued = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const persisted: ProviderAdapter.ProviderAdapterV2Event[] = [];
+      const acknowledged: ProviderAdapter.ProviderAdapterV2Event[] = [];
+      let persistedAtClose: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event> = [];
+      let producing = true;
+      let pendingDelivery = true;
+      const fence: ProviderAdapter.ProviderAdapterV2Event = {
+        type: "node.updated",
+        driver,
+        node: {
+          ...makeRunOwnedSubagentChildNodeFixture({ ids, status: "interrupted" }),
+          status: "failed",
+        },
+      };
+      const rejectedFence: ProviderAdapter.ProviderAdapterV2Event = {
+        ...fence,
+        node: { ...fence.node, threadId: ThreadId.make("foreign-child") },
+      };
+      const running: ProviderAdapter.ProviderAdapterV2Event = {
+        type: "subagent.updated",
+        driver,
+        subagent: makeRunOwnedSubagentFixture({
+          ids,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          childThreadId: ids.childThreadId,
+          driver,
+          status: "running",
+        }),
+      };
+      const failed: ProviderAdapter.ProviderAdapterV2Event = {
+        ...running,
+        subagent: { ...running.subagent, status: "failed" },
+      };
+      const ownerUpdate: ProviderAdapter.ProviderAdapterV2Event = {
+        type: "provider_thread.updated",
+        driver,
+        providerThread: {
+          id: ids.providerThreadId,
+          appThreadId: ids.threadId,
+          lastRunOrdinal: 2,
+        } as OrchestrationV2ProviderThread,
+      };
+      const message: ProviderAdapter.ProviderAdapterV2Event = {
+        type: "message.updated",
+        driver,
+        message: {
+          id: MessageId.make(`${key}:final`),
+          threadId: ids.childThreadId,
+          runId: null,
+          nodeId: fence.node.id,
+          role: "assistant",
+          text: "final failure details",
+          createdBy: "agent",
+          creationSource: "provider",
+          attachments: [],
+          streaming: false,
+          createdAt: DateTime.makeUnsafe(0),
+          updatedAt: DateTime.makeUnsafe(0),
+        },
+      };
+      const item: ProviderAdapter.ProviderAdapterV2Event = {
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          ...makeRunOwnedSubagentTurnItemFixture({
+            ids,
+            driver,
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            childThreadId: ids.childThreadId,
+            status: "running",
+          }),
+          id: TurnItemId.make(`${key}:final`),
+          threadId: ids.childThreadId,
+          runId: null,
+          nodeId: fence.node.id,
+          type: "assistant_message",
+          text: "final failure details",
+          messageId: message.message.id,
+          streaming: false,
+          status: "completed",
+        },
+      };
+      const rootTerminal = rootTerminalEvent(ids, root);
+      yield* captureRootRunTermination({
+        key,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.fromIterable([
+            rejectedFence,
+            running,
+            rootTerminal.status === "failed"
+              ? ({
+                  ...rootTerminal,
+                  childTurnsContinue: true,
+                } satisfies ProviderAdapter.ProviderAdapterV2Event)
+              : rootTerminal,
+            failed,
+            ...(handoff ? [ownerUpdate] : []),
+          ]).pipe(Stream.concat(Stream.fromQueue(queued))),
+        session: {
+          hasPendingBackgroundWorkForThread: () => Effect.sync(() => producing),
+          hasPendingEventDeliveryForRun: (runId: RunId) =>
+            Effect.gen(function* () {
+              if (handoff && producing && persisted.includes(ownerUpdate) && runId === ids.runId) {
+                yield* Deferred.succeed(handoffRetained, undefined);
+              }
+              return runId === ids.runId && pendingDelivery;
+            }),
+          acknowledgeEvent: (event: ProviderAdapter.ProviderAdapterV2Event, runId: RunId) =>
+            Effect.sync(() => {
+              assert.isTrue(persisted.includes(event), "only committed events may be acknowledged");
+              acknowledged.push(event);
+              if (event === fence && runId === ids.runId) pendingDelivery = false;
+            }),
+        },
+        ingestNormalized: ({ event }) =>
+          Effect.gen(function* () {
+            if (event === (handoff ? ownerUpdate : failed)) {
+              yield* Deferred.succeed(blocked, undefined);
+              yield* Deferred.await(release);
+            }
+            persisted.push(event);
+            return [];
+          }),
+        afterStart: (closed) =>
+          Effect.gen(function* () {
+            yield* Deferred.await(blocked);
+            assert.isFalse(yield* Deferred.isDone(closed));
+            if (handoff) {
+              yield* Deferred.succeed(release, undefined);
+              const retained = yield* Effect.raceFirst(
+                Deferred.await(handoffRetained).pipe(Effect.as(true)),
+                Deferred.await(closed).pipe(Effect.as(false)),
+              );
+              assert.isTrue(
+                retained,
+                "owner handoff must retain the failed child's pending inspection",
+              );
+            }
+            yield* Queue.offerAll(queued, [message, item, fence]);
+            producing = false;
+            if (!handoff) yield* Deferred.succeed(release, undefined);
+          }),
+        onSubscriptionClose: Effect.sync(() => {
+          persistedAtClose = [...persisted];
+        }),
+      });
+      assert.deepEqual(persistedAtClose.slice(-3), [message, item, fence]);
+      assert.isFalse(pendingDelivery);
+      assert.isFalse(acknowledged.includes(rejectedFence));
+    }),
+);
+
+it.effect.each([false, true])(
+  "retains an original native source across delivery and admission probes, closing=%s",
+  (closingDuringProbe) =>
+    Effect.gen(function* () {
+      const key = "open-native-source";
+      const ids = backgroundScenarioIds(key);
+      const queried = yield* Deferred.make<void>();
+      const queued = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const persisted: ProviderAdapter.ProviderAdapterV2Event[] = [];
+      let open = true;
+      let pending = false;
+      const ownerUpdate: ProviderAdapter.ProviderAdapterV2Event = {
+        type: "provider_thread.updated",
+        driver,
+        providerThread: {
+          id: ids.providerThreadId,
+          appThreadId: ids.threadId,
+          lastRunOrdinal: 2,
+        } as OrchestrationV2ProviderThread,
+      };
+      const now = DateTime.makeUnsafe(1);
+      const fence = {
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          id: ids.itemId,
+          threadId: ids.threadId,
+          runId: ids.runId,
+          nodeId: ids.subagentNodeId,
+          providerThreadId: ids.providerThreadId,
+          providerTurnId: ids.rootProviderTurnId,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 100,
+          status: "completed",
+          title: "subagent",
+          type: "dynamic_tool",
+          toolName: "subagent",
+          input: {},
+          output: {
+            details: {
+              mode: "single",
+              runId: "empty-native",
+              asyncId: "empty-native",
+              results: [],
+            },
+          },
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+        },
+      } satisfies ProviderAdapter.ProviderAdapterV2Event;
+      let subscriptionClosed = false;
+      yield* captureRootRunTermination({
+        key,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.fromIterable([rootTerminalEvent(ids, "completed"), ownerUpdate, fence]).pipe(
+            Stream.concat(Stream.fromQueue(queued)),
+          ),
+        session: {
+          hasPendingEventDeliveryForRun: () => Effect.sync(() => pending),
+          hasOpenEventSourceForRun: (runId: RunId) =>
+            Effect.gen(function* () {
+              assert.equal(runId, ids.runId);
+              if (closingDuringProbe && open && persisted.includes(fence)) {
+                pending = true;
+                open = false;
+                yield* Queue.offer(queued, { ...fence });
+              }
+              const admitted = open;
+              if (persisted.includes(fence)) yield* Deferred.succeed(queried, undefined);
+              return admitted;
+            }),
+          acknowledgeEvent: (event, runId) =>
+            Effect.sync(() => {
+              assert.isTrue(persisted.includes(event));
+              if (event.type === "turn_item.updated" && event !== fence && runId === ids.runId)
+                pending = false;
+            }),
+        },
+        ingestNormalized: ({ event }) =>
+          Effect.sync(() => {
+            persisted.push(event);
+            return [];
+          }),
+        afterStart: (closed) =>
+          Effect.gen(function* () {
+            const retained = yield* Effect.raceFirst(
+              Deferred.await(queried).pipe(Effect.as(true)),
+              Deferred.await(closed).pipe(Effect.as(false)),
+            );
+            assert.isTrue(
+              retained,
+              "First delivery ACK must not close a source that still admits original callbacks",
+            );
+            assert.isFalse(yield* Deferred.isDone(closed));
+            if (!closingDuringProbe) {
+              open = false;
+              pending = true;
+              yield* Queue.offer(queued, { ...fence });
+            }
+          }),
+        onSubscriptionClose: Effect.sync(() => {
+          subscriptionClosed = true;
+        }),
+      });
+      assert.isTrue(subscriptionClosed);
+      assert.equal(persisted.filter((event) => event.type === "turn_item.updated").length, 2);
+    }),
+);
+
+it.effect("does not retain an unrelated run for sibling native delivery or session-wide work", () =>
+  Effect.gen(function* () {
+    const sibling = RunId.make("run:sibling-capture");
+    const probed: RunId[] = [];
+    yield* captureRootRunTermination({
+      key: "unrelated-capture",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make(rootTerminalEvent(ids, "completed")).pipe(Stream.concat(Stream.never)),
+      session: {
+        hasPendingBackgroundWork: Effect.succeed(true),
+        hasPendingBackgroundWorkForThread: () => Effect.succeed(false),
+        hasOpenEventSourceForRun: (runId: RunId) =>
+          Effect.sync(() => {
+            probed.push(runId);
+            return runId === sibling;
+          }),
+        hasPendingEventDeliveryForRun: (runId: RunId) =>
+          Effect.sync(() => {
+            probed.push(runId);
+            return runId === sibling;
+          }),
+      },
+    });
+    assert.isTrue(probed.length > 0);
+    assert.isFalse(probed.includes(sibling));
   }),
 );
