@@ -3,6 +3,7 @@
  * `@earendil-works/pi-coding-agent` and `typebox` from the user's pi install.
  */
 import { T3_CODE_ORCHESTRATION_INSTRUCTIONS } from "@t3tools/provider-core/server/orchestrationInstructions";
+import { PI_SUBAGENT_OBSERVATION_SOURCE } from "./observationExtensionSource.ts";
 
 export const PI_T3_MCP_EXTENSION_FILENAME = "pi-t3-mcp-extension.ts";
 
@@ -246,7 +247,10 @@ function createMcpClient(endpoint: string, token: string) {
   };
 }
 
+${PI_SUBAGENT_OBSERVATION_SOURCE}
+
 export default async function t3McpExtension(pi: ExtensionAPI) {
+  installSubagentObservation(pi);
   // Keep skill chips in the request. Pi expands only one leading /skill:
   // command, so use its own frontmatter loader for every selected chip here.
   pi.on("input", async (event, ctx) => {

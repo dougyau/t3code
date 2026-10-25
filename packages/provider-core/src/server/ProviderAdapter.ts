@@ -562,6 +562,20 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly subscribeEvents?: Effect.Effect<ProviderAdapterV2EventSubscription>;
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   /**
+   * Retain only this run's pending persistence, even after provider-thread ownership moves.
+   * The adapter's FIFO fence must follow every artifact it protects. Consumers acknowledge
+   * the exact accepted original event only after ingestion commits; fanout is not delivery.
+   */
+  readonly hasPendingEventDeliveryForRun?: (runId: RunId) => Effect.Effect<boolean>;
+  /** Admission may outlive its last delivery; closing it must enqueue an accepted original-run fence. */
+  readonly hasOpenEventSourceForRun?: (runId: RunId) => Effect.Effect<boolean>;
+  readonly acknowledgeEvent?: (event: ProviderAdapterV2Event, runId: RunId) => Effect.Effect<void>;
+  /**
+   * A fresh, provider-authoritative observation may retain a silent session beyond
+   * the stale background-work grace. Unavailable observations keep the bounded policy.
+   */
+  readonly backgroundWorkStatus?: Effect.Effect<"active" | "inactive" | "unavailable">;
+  /**
    * When present, RunExecutionService uses only this probe (never the
    * session-wide hasPendingBackgroundWork) so sibling native threads cannot pin
    * an unrelated root subscription open.

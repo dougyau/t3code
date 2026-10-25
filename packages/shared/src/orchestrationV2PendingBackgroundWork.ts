@@ -64,14 +64,21 @@ export function deriveBlockedOnThreadWait(input: {
   readonly turnItems: ReadonlyArray<OrchestrationV2TurnItem>;
 }): boolean {
   if (input.activeRun?.status !== "running") return false;
+  const hasNativeChildren = input.turnItems.some(
+    (item) =>
+      item.runId === input.activeRun?.id &&
+      item.type === "subagent" &&
+      item.origin === "provider_native" &&
+      isOrchestrationV2WorkActive(item.status),
+  );
   let hasWait = false;
   for (const item of input.turnItems) {
     if (
       item.runId !== input.activeRun.id ||
       !EXECUTION_TURN_ITEM_TYPES.has(item.type) ||
       (item.status !== "running" && item.status !== "waiting") ||
-      // App-owned rows track the child, including the child a blocking delegate is waiting for.
-      (item.type === "subagent" && item.origin === "app_owned")
+      // Child activity is not work performed by the parent waiting on its delegation tool.
+      item.type === "subagent"
     ) {
       continue;
     }
@@ -79,6 +86,7 @@ export function deriveBlockedOnThreadWait(input: {
     const tool = resolveT3McpToolId(item.toolName);
     if (
       tool !== "t3_thread_wait" &&
+      !(item.toolName === "subagent" && hasNativeChildren) &&
       !(
         tool === "delegate_task" &&
         Predicate.isObject(item.input) &&

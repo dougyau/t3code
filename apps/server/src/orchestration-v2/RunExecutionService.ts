@@ -385,6 +385,7 @@ export function routeProviderEvent(
         event.appThread.lineage.parentThreadId !== null &&
         ownsThread(event.appThread.lineage.parentThreadId) &&
         (!state.rootTurnEnded ||
+          ownsThread(event.appThread.id) ||
           state.workflowMemberParents.get(event.appThread.id) ===
             event.appThread.lineage.parentThreadId);
       if (!isOwnedSubagent) {
@@ -454,8 +455,7 @@ export function routeProviderEvent(
       // completed at its start (e.g. cancelled by a server restart).
       const adopted =
         ownsRun(coordinator.runId) &&
-        !state.rootTurnEnded &&
-        isOrchestrationV2WorkActive(coordinator.status) &&
+        (isOrchestrationV2WorkActive(coordinator.status) || state.rootTurnEnded) &&
         coordinator.origin === "provider_native" &&
         coordinator.childThreadId !== null &&
         !ownsThread(coordinator.childThreadId)
@@ -1253,6 +1253,24 @@ export const layer: Layer.Layer<
           if (backgroundItems.size > 0) {
             return false;
           }
+          // Final native capture belongs to its launch run, not the thread's newer owner.
+          if (
+            yield* (
+              input.session.hasPendingEventDeliveryForRun?.(input.run.id) ?? Effect.succeed(false)
+            )
+          ) {
+            return false;
+          }
+          if (input.session.hasOpenEventSourceForRun !== undefined) {
+            if (yield* input.session.hasOpenEventSourceForRun(input.run.id)) return false;
+            // Closing admission may have registered its final fence after the first delivery probe.
+            if (
+              yield* (
+                input.session.hasPendingEventDeliveryForRun?.(input.run.id) ?? Effect.succeed(false)
+              )
+            )
+              return false;
+          }
           if (yield* Ref.get(providerThreadOwnerLost)) {
             return true;
           }
@@ -1442,6 +1460,9 @@ export const layer: Layer.Layer<
                 yield* finalizeRootRun(event);
               }
               yield* trackChildLifecycle(event, deliveredEvent !== null);
+              if (deliveredEvent !== null) {
+                yield* input.session.acknowledgeEvent?.(event, input.run.id) ?? Effect.void;
+              }
             }),
           ),
           Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),

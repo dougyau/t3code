@@ -21,14 +21,15 @@ import {
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
+import { TestClock } from "effect/testing";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -159,6 +160,7 @@ interface FakePi {
   readonly queueState: (data: Record<string, unknown>) => void;
   readonly setStreaming: (streaming: boolean) => void;
   readonly deferNextState: () => void;
+  readonly deferNextPromptResponse: () => void;
   readonly resolveDeferredState: (data: unknown) => Effect.Effect<void>;
   readonly failNextState: () => void;
   readonly deferNextLifecycle: (type: "switch_session" | "new_session" | "fork") => void;
@@ -348,6 +350,9 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
     takeRequest,
     queueEntries: (data) => entriesQueue.push(data),
     queueMessages: (data) => messagesQueue.push(data),
+    deferNextPromptResponse: () => {
+      deferredLifecycle = "prompt";
+    },
     deferNextState: () => {
       deferState = true;
     },
@@ -437,6 +442,7 @@ const openRuntime = Effect.fnUntraced(function* (
   providerSessionId = SESSION_ID,
   forkFake?: FakePi,
   continuationRequests?: PiAdapterV2Options["continuationRequests"],
+  beforeEvent?: (event: ProviderAdapter.ProviderAdapterV2Event) => Effect.Effect<void>,
 ) {
   const adapter = yield* makeAdapter(fake, "", forkFake, continuationRequests);
   const runtime = yield* adapter.openSession({
@@ -446,8 +452,21 @@ const openRuntime = Effect.fnUntraced(function* (
     runtimePolicy,
   });
   const emitted = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+  const streamDone = yield* Deferred.make<void>();
+  const observed: ProviderAdapter.ProviderAdapterV2Event[] = [];
+  const streamFailures: string[] = [];
   yield* runtime.events.pipe(
-    Stream.runForEach((event) => Queue.offer(emitted, event)),
+    Stream.runForEach((event) =>
+      Effect.gen(function* () {
+        yield* beforeEvent?.(event) ?? Effect.void;
+        observed.push(event);
+        yield* Queue.offer(emitted, event);
+      }),
+    ),
+    Effect.onExit((exit) => {
+      if (Exit.isFailure(exit)) streamFailures.push(Cause.pretty(exit.cause));
+      return Deferred.succeed(streamDone, undefined);
+    }),
     Effect.forkScoped,
   );
   const takeEvent = (predicate: (event: ProviderAdapter.ProviderAdapterV2Event) => boolean) =>
@@ -457,7 +476,7 @@ const openRuntime = Effect.fnUntraced(function* (
         if (predicate(event)) return event;
       }
     });
-  return { runtime, takeEvent };
+  return { runtime, takeEvent, streamDone, observed, streamFailures };
 });
 
 const makeAppThread = Effect.fnUntraced(function* (model: string, threadId = THREAD_ID) {
@@ -521,7 +540,682 @@ const startTurn = Effect.fnUntraced(function* (
   });
 });
 
+const emitAsyncLaunchReceipt = Effect.fnUntraced(function* (fake: FakePi, runId: string) {
+  const toolCallId = `launch:${runId}`;
+  yield* fake.emit({
+    type: "tool_execution_start",
+    toolCallId,
+    toolName: "subagent",
+    args: { agent: "worker", task: "inspect", async: true },
+  });
+  yield* fake.emit({
+    type: "tool_execution_end",
+    toolCallId,
+    toolName: "subagent",
+    result: { details: { mode: "single", asyncId: runId, results: [] } },
+  });
+});
+
+const emitNativeSnapshot = (fake: FakePi, runs: ReadonlyArray<unknown>) =>
+  fake.emit({
+    type: "extension_ui_request",
+    method: "setWidget",
+    widgetKey: "t3-subagents",
+    widgetLines: [
+      "PI_SUBAGENT_ASYNC_JSON:" +
+        JSON.stringify({ kind: "pi-subagents.async-status-snapshot", version: 1, runs }),
+    ],
+  });
+
+const nativeEventBarrier = Effect.fnUntraced(function* (
+  fake: FakePi,
+  takeEvent: Awaited<Effect.Success<ReturnType<typeof openRuntime>>>["takeEvent"],
+) {
+  yield* fake.emit({ type: "extension_ui_request", method: "notify", message: "native barrier" });
+  yield* takeEvent(
+    (event) =>
+      event.type === "turn_item.updated" &&
+      event.turnItem.type === "system_notice" &&
+      event.turnItem.message === "native barrier",
+  );
+});
+
 describe("PiAdapterV2", () => {
+  it.effect(
+    "expires a permanently omitted first child through its original-run accepted fence",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* emitAsyncLaunchReceipt(fake, "omitted");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "survivor",
+          toolName: "subagent",
+          args: { agent: "survivor", task: "work", async: false },
+        });
+        const survivorResult = {
+          details: {
+            mode: "single",
+            runId: "survivor",
+            results: [{ index: 0, agent: "survivor", task: "work", finished: false }],
+          },
+        };
+        yield* fake.emit({
+          type: "tool_execution_update",
+          toolCallId: "survivor",
+          toolName: "subagent",
+          partialResult: survivorResult,
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "survivor",
+          toolName: "subagent",
+          result: survivorResult,
+        });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        const originalRun = RunId.make(`run:${THREAD_ID}:1`);
+        for (const event of observed) yield* runtime.acknowledgeEvent!(event, originalRun);
+        yield* startTurn(runtime, providerThread, "default", [], "Successor", undefined, 2);
+        yield* fake.takeRequest("prompt");
+        const successor = yield* takeEvent(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+        );
+        if (successor.type !== "provider_turn.updated")
+          return yield* Effect.die("Expected successor");
+        yield* emitNativeSnapshot(fake, [{ id: "other", kind: "subagent", state: "complete" }]);
+        yield* nativeEventBarrier(fake, takeEvent);
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(originalRun));
+        yield* TestClock.adjust("29 minutes");
+        yield* nativeEventBarrier(fake, takeEvent);
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(originalRun));
+        yield* TestClock.adjust("1 minute");
+        yield* nativeEventBarrier(fake, takeEvent);
+        const fence = observed.find(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.runId === originalRun &&
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message.includes("observation window"),
+        );
+        assert.isDefined(fence, "Omitted launch must emit an honest original-run expiry notice");
+        if (fence === undefined) return;
+        assert.isTrue(
+          fence.type === "turn_item.updated" &&
+            fence.turnItem.type === "system_notice" &&
+            fence.turnItem.message.includes("unknown"),
+        );
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(originalRun));
+        yield* runtime.acknowledgeEvent!({ ...fence }, originalRun);
+        yield* runtime.acknowledgeEvent!(fence, RunId.make(`run:${THREAD_ID}:2`));
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(originalRun));
+        yield* runtime.acknowledgeEvent!(fence, originalRun);
+        yield* runtime.acknowledgeEvent!(fence, originalRun);
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(originalRun));
+        assert.isTrue(
+          yield* runtime.hasPendingBackgroundWork!,
+          "Source expiry must not settle a live sibling",
+        );
+        assert.isFalse(
+          observed.some(
+            (event) =>
+              event.type === "subagent.updated" &&
+              event.subagent.title === "survivor" &&
+              event.subagent.status !== "running",
+          ),
+        );
+        const count = observed.filter((event) => event.type === "subagent.updated").length;
+        yield* emitNativeSnapshot(fake, [
+          {
+            id: "omitted",
+            kind: "subagent",
+            state: "running",
+            children: [{ id: "step:0", kind: "step", agent: "worker", state: "running" }],
+          },
+        ]);
+        yield* nativeEventBarrier(fake, takeEvent);
+        assert.equal(observed.filter((event) => event.type === "subagent.updated").length, count);
+        const stop = yield* runtime
+          .interruptTurn({
+            providerThread,
+            providerTurnId: successor.providerTurn.id,
+            requestRuntimeRestart: true,
+          })
+          .pipe(Effect.exit, Effect.forkChild);
+        assert.isTrue(Exit.isSuccess(yield* Fiber.join(stop)));
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["age", "capacity", "replay-overflow"] as const)(
+    "retires fully settled native owner groups without late callback resurrection, %s",
+    (bound) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const callback = (i: number, text: string) => ({
+          type: "tool_execution_update",
+          toolCallId: `call:${i}`,
+          toolName: "subagent",
+          partialResult: {
+            details: {
+              mode: "single",
+              runId: `native:${i}`,
+              results: [
+                {
+                  index: 0,
+                  agent: "worker",
+                  task: "work",
+                  finished: true,
+                  exitCode: 0,
+                  finalOutput: text,
+                },
+              ],
+            },
+          },
+        });
+        const count = bound === "age" ? 1 : bound === "capacity" ? 33 : 66;
+        for (let i = 1; i <= count; i++) {
+          yield* startTurn(runtime, providerThread, "default", [], "Delegate", undefined, i);
+          yield* fake.takeRequest("prompt");
+          yield* fake.emit({
+            type: "tool_execution_start",
+            toolCallId: `call:${i}`,
+            toolName: "subagent",
+            args: { agent: "worker", task: "work", async: false },
+          });
+          const event = callback(i, `result:${i}`);
+          yield* fake.emit(event);
+          yield* fake.emit({
+            type: "tool_execution_end",
+            toolCallId: `call:${i}`,
+            toolName: "subagent",
+            result: event.partialResult,
+          });
+          yield* fake.emit({ type: "agent_settled" });
+          yield* takeEvent((event) => event.type === "turn.terminal");
+          const owner = RunId.make(`run:${THREAD_ID}:${i}`);
+          for (const event of observed) yield* runtime.acknowledgeEvent!(event, owner);
+          assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(owner));
+        }
+        yield* startTurn(runtime, providerThread, "default", [], "Successor", undefined, count + 1);
+        yield* fake.takeRequest("prompt");
+        if (bound === "age") yield* TestClock.adjust("29 minutes");
+        const recentOwner = bound === "age" ? 1 : count;
+        yield* fake.emit(callback(recentOwner, "valid recent changed terminal history"));
+        const recent = yield* takeEvent(
+          (event) =>
+            event.type === "subagent.updated" &&
+            event.subagent.result === "valid recent changed terminal history",
+        );
+        assert.equal(
+          recent.type === "subagent.updated" && recent.subagent.runId,
+          RunId.make(`run:${THREAD_ID}:${recentOwner}`),
+        );
+        yield* nativeEventBarrier(fake, takeEvent);
+        for (const event of observed)
+          yield* runtime.acknowledgeEvent!(event, RunId.make(`run:${THREAD_ID}:${recentOwner}`));
+        if (bound === "age") yield* TestClock.adjust("1 minute");
+        const boundary = observed.length;
+        const stale = callback(1, "retired callback must not appear");
+        yield* fake.emit(stale);
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: stale.toolCallId,
+          toolName: "subagent",
+          result: stale.partialResult,
+        });
+        yield* nativeEventBarrier(fake, takeEvent);
+        const late = observed.slice(boundary);
+        assert.isFalse(
+          late.some(
+            (event) =>
+              event.type === "message.updated" &&
+              event.message.text === "retired callback must not appear",
+          ),
+          "Retired original owner must not project new child history",
+        );
+        assert.isFalse(
+          late.some(
+            (event) => event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool",
+          ),
+          "Unknown old update must not fabricate a successor root tool",
+        );
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "current",
+          toolName: "subagent",
+          args: { agent: "worker", task: "current", async: false },
+        });
+        yield* fake.emit({ ...callback(999, "current started child"), toolCallId: "current" });
+        const current = yield* takeEvent(
+          (event) =>
+            event.type === "message.updated" && event.message.text === "current started child",
+        );
+        assert.equal(current.type, "message.updated");
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+  it.effect.each([
+    "age",
+    "capacity",
+    "active-parent",
+    "unacknowledged",
+    "requesting",
+    "live-sibling",
+    "partial",
+  ] as const)(
+    "bounds finalized native paused history without discarding live obligations, %s",
+    (kind) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const original = RunId.make(`run:${THREAD_ID}:1`);
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* emitAsyncLaunchReceipt(fake, "paused-original");
+        const snapshot = (id: string, state = kind === "partial" ? "partial" : "paused") =>
+          emitNativeSnapshot(fake, [
+            {
+              id,
+              kind: "subagent",
+              state,
+              ...(state === "partial" ? { endedAt: 2 } : {}),
+              children: [
+                {
+                  id: "step:0",
+                  kind: "step",
+                  agent: "worker",
+                  state,
+                  startedAt: 1,
+                  updatedAt: 1,
+                  ...(state === "partial" ? { endedAt: 2 } : {}),
+                },
+                ...(kind === "live-sibling"
+                  ? [
+                      {
+                        id: "step:1",
+                        kind: "step",
+                        agent: "sibling",
+                        state: "running",
+                        startedAt: 1,
+                        updatedAt: 1,
+                      },
+                    ]
+                  : []),
+              ],
+            },
+          ]);
+        yield* snapshot("paused-original");
+        yield* nativeEventBarrier(fake, takeEvent);
+        const paused = observed.find(
+          (event) => event.type === "subagent.updated" && event.subagent.status === "idle",
+        );
+        if (paused?.type !== "subagent.updated")
+          return yield* Effect.die("Expected native paused child");
+        for (let index = 0; index < (kind === "live-sibling" ? 2 : 1); index++) {
+          const request = yield* fake.takeRequest("prompt");
+          if (kind === "requesting") break;
+          const [, requestId, asyncId, childId] = String(request.message).split(" ");
+          yield* fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "subagent-inspect",
+            widgetLines: [
+              "PI_SUBAGENT_INSPECT_JSON:" +
+                JSON.stringify({
+                  kind: "pi-subagents.inspect-reply",
+                  version: 1,
+                  requestId,
+                  asyncId,
+                  childId,
+                  messages: [],
+                }),
+            ],
+          });
+          yield* takeEvent(
+            (event) =>
+              event.type === "node.updated" &&
+              event.node.threadId ===
+                observed.flatMap((event) =>
+                  event.type === "subagent.updated" &&
+                  event.subagent.nativeTaskRef?.nativeId?.endsWith(
+                    JSON.stringify([asyncId, childId]),
+                  )
+                    ? [event.subagent.childThreadId]
+                    : [],
+                )[0],
+          );
+        }
+        if (kind !== "active-parent") {
+          yield* fake.emit({ type: "agent_settled" });
+          yield* takeEvent((event) => event.type === "turn.terminal");
+        }
+        if (kind !== "unacknowledged")
+          for (const event of observed) yield* runtime.acknowledgeEvent!(event, original);
+        const count = kind === "capacity" ? 33 : 1;
+        if (kind !== "active-parent") {
+          for (let ordinal = 2; ordinal <= count; ordinal++) {
+            yield* startTurn(
+              runtime,
+              providerThread,
+              "default",
+              [],
+              "Delegate",
+              undefined,
+              ordinal,
+            );
+            yield* fake.takeRequest("prompt");
+            yield* fake.emit({
+              type: "tool_execution_start",
+              toolName: "subagent",
+              toolCallId: `pressure:${ordinal}`,
+              args: { agent: "worker", task: "work", async: false },
+            });
+            yield* fake.emit({
+              type: "tool_execution_end",
+              toolName: "subagent",
+              toolCallId: `pressure:${ordinal}`,
+              result: {
+                details: {
+                  mode: "single",
+                  runId: `pressure:${ordinal}`,
+                  results: [{ index: 0, agent: "worker", task: "work", exitCode: 0 }],
+                },
+              },
+            });
+            yield* fake.emit({ type: "agent_settled" });
+            yield* takeEvent((event) => event.type === "turn.terminal");
+            for (const event of observed)
+              yield* runtime.acknowledgeEvent!(event, RunId.make(`run:${THREAD_ID}:${ordinal}`));
+          }
+          yield* startTurn(
+            runtime,
+            providerThread,
+            "default",
+            [],
+            "Successor",
+            undefined,
+            count + 1,
+          );
+          yield* fake.takeRequest("prompt");
+        }
+        if (kind !== "capacity") {
+          yield* TestClock.adjust("29 minutes");
+          yield* nativeEventBarrier(fake, takeEvent);
+          assert.isTrue(yield* runtime.hasOpenEventSourceForRun!(original));
+          yield* TestClock.adjust("1 minute");
+        }
+        yield* nativeEventBarrier(fake, takeEvent);
+        const protectedOwner = !["age", "capacity", "partial"].includes(kind);
+        assert.equal(
+          yield* runtime.hasOpenEventSourceForRun!(original),
+          protectedOwner,
+          "Only finalized paused owners without live obligations are retirement eligible",
+        );
+        assert.isFalse(
+          observed.some(
+            (event) =>
+              event.type === "subagent.updated" &&
+              event.subagent.id === paused.subagent.id &&
+              event.subagent.status === "completed",
+          ),
+        );
+        if (protectedOwner) return;
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(original));
+        const fence = observed
+          .filter(
+            (event) =>
+              event.type === "node.updated" &&
+              event.node.threadId === paused.subagent.childThreadId,
+          )
+          .at(-1)!;
+        yield* runtime.acknowledgeEvent!(fence, original);
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(original));
+        const boundary = observed.length;
+        yield* snapshot("paused-original", "running");
+        yield* nativeEventBarrier(fake, takeEvent);
+        assert.isFalse(observed.slice(boundary).some((event) => event.type === "subagent.updated"));
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolName: "subagent",
+          toolCallId: "resume-paused",
+          args: { action: "resume", id: "paused-original", message: "continue" },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolName: "subagent",
+          toolCallId: "resume-paused",
+          result: {
+            details: {
+              mode: "single",
+              runId: "revived-paused",
+              asyncId: "revived-paused",
+              results: [],
+            },
+          },
+        });
+        yield* snapshot("revived-paused", "running");
+        const revived = yield* takeEvent((event) => event.type === "subagent.updated");
+        assert.equal(
+          revived.type === "subagent.updated" && revived.subagent.runId,
+          RunId.make(`run:${THREAD_ID}:${count + 1}`),
+        );
+        assert.notEqual(
+          revived.type === "subagent.updated" && revived.subagent.id,
+          paused.subagent.id,
+        );
+        assert.isFalse(yield* runtime.hasOpenEventSourceForRun!(original));
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["unacknowledged", "live-sibling", "capture"] as const)(
+    "retains an original native owner under capacity pressure until every obligation settles, %s",
+    (obligation) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const result = (id: number, text: string, liveSibling = false) => ({
+          details: {
+            mode: "parallel",
+            runId: `protected:${id}`,
+            results: [
+              {
+                index: 0,
+                agent: "worker",
+                task: "work",
+                finished: true,
+                exitCode: 0,
+                finalOutput: text,
+              },
+              ...(liveSibling
+                ? [{ index: 1, agent: "sibling", task: "work", finished: false }]
+                : []),
+            ],
+          },
+        });
+        const callback = (id: number, text: string, liveSibling = false) =>
+          fake.emit({
+            type: "tool_execution_update",
+            toolCallId: `protected-call:${id}`,
+            toolName: "subagent",
+            partialResult: result(id, text, liveSibling),
+          });
+        const launch = Effect.fnUntraced(function* (id: number, liveSibling = false) {
+          yield* startTurn(runtime, providerThread, "default", [], "Delegate", undefined, id);
+          yield* fake.takeRequest("prompt");
+          yield* fake.emit({
+            type: "tool_execution_start",
+            toolCallId: `protected-call:${id}`,
+            toolName: "subagent",
+            args: {
+              parallel: [
+                { agent: "worker", task: "work" },
+                ...(liveSibling ? [{ agent: "sibling", task: "work" }] : []),
+              ],
+              async: false,
+            },
+          });
+          yield* callback(id, `result:${id}`, liveSibling);
+          yield* fake.emit({
+            type: "tool_execution_end",
+            toolCallId: `protected-call:${id}`,
+            toolName: "subagent",
+            result: result(id, `result:${id}`, liveSibling),
+          });
+          yield* fake.emit({ type: "agent_settled" });
+          yield* takeEvent((event) => event.type === "turn.terminal");
+        });
+        const original = RunId.make(`run:${THREAD_ID}:1`);
+        yield* launch(1, obligation === "live-sibling");
+        const first = observed.find(
+          (event) => event.type === "subagent.updated" && event.subagent.title === "worker",
+        );
+        if (first?.type !== "subagent.updated") return yield* Effect.die("Expected original child");
+        const originalFences = observed.filter(
+          (event) =>
+            event.type === "node.updated" && event.node.threadId === first.subagent.childThreadId,
+        );
+        for (const event of observed)
+          if (obligation !== "unacknowledged") yield* runtime.acknowledgeEvent!(event, original);
+        const snapshot = (updatedAt: number) =>
+          emitNativeSnapshot(fake, [
+            {
+              id: "protected:1",
+              kind: "subagent",
+              state: "complete",
+              children: [
+                {
+                  id: "step:0",
+                  kind: "step",
+                  agent: "worker",
+                  state: "complete",
+                  startedAt: 1,
+                  updatedAt,
+                },
+              ],
+            },
+          ]);
+        let capture: PiRpcRecord | undefined;
+        if (obligation === "capture") {
+          yield* snapshot(1);
+          capture = yield* fake.takeRequest("prompt");
+        }
+        for (let id = 2; id <= 34; id++) {
+          yield* launch(id);
+          for (const event of observed)
+            yield* runtime.acknowledgeEvent!(event, RunId.make(`run:${THREAD_ID}:${id}`));
+        }
+        yield* startTurn(runtime, providerThread, "default", [], "Successor", undefined, 35);
+        yield* fake.takeRequest("prompt");
+        if (obligation === "unacknowledged") yield* TestClock.adjust("30 minutes");
+        if (obligation === "unacknowledged") {
+          yield* runtime.acknowledgeEvent!(originalFences[0]!, original);
+          assert.isTrue(
+            yield* runtime.hasPendingEventDeliveryForRun!(original),
+            "One child fence must not release other deliveries",
+          );
+        }
+        if (capture !== undefined) {
+          yield* fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "subagent-inspect",
+            widgetLines: [
+              "PI_SUBAGENT_INSPECT_JSON:" +
+                JSON.stringify({
+                  kind: "pi-subagents.inspect-reply",
+                  version: 1,
+                  requestId: String(capture.message).split(" ")[1],
+                  asyncId: "protected:1",
+                  childId: "step:0",
+                  finalOutput: "protected original history",
+                  messages: [],
+                }),
+            ],
+          });
+        } else yield* callback(1, "protected original history", obligation === "live-sibling");
+        const history = yield* takeEvent(
+          (event) =>
+            event.type === "message.updated" && event.message.text === "protected original history",
+        );
+        assert.equal(
+          history.type === "message.updated" && history.message.threadId,
+          first.subagent.childThreadId,
+        );
+        yield* nativeEventBarrier(fake, takeEvent);
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(original));
+        if (obligation === "live-sibling") {
+          // The other child's accepted fences cannot make the whole original owner eligible.
+          for (const event of observed) yield* runtime.acknowledgeEvent!(event, original);
+          yield* TestClock.adjust("30 minutes");
+          yield* callback(1, "history retained for live sibling", true);
+          yield* takeEvent(
+            (event) =>
+              event.type === "message.updated" &&
+              event.message.text === "history retained for live sibling",
+          );
+          yield* fake.emit({
+            type: "tool_execution_update",
+            toolCallId: "protected-call:1",
+            toolName: "subagent",
+            partialResult: {
+              details: {
+                ...result(1, "all siblings settled").details,
+                results: [
+                  ...result(1, "all siblings settled").details.results,
+                  { index: 1, agent: "sibling", task: "work", finished: true, exitCode: 0 },
+                ],
+              },
+            },
+          });
+          yield* nativeEventBarrier(fake, takeEvent);
+        }
+        for (const event of observed) yield* runtime.acknowledgeEvent!(event, original);
+        if (
+          !(yield* runtime.hasOpenEventSourceForRun!(original)) &&
+          (yield* runtime.hasPendingEventDeliveryForRun!(original))
+        ) {
+          const retirementFence = yield* takeEvent(
+            (event) =>
+              event.type === "node.updated" && event.node.threadId === first.subagent.childThreadId,
+          );
+          yield* runtime.acknowledgeEvent!(retirementFence, original);
+        }
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(original));
+        yield* TestClock.adjust("30 minutes");
+        const boundary = observed.length;
+        yield* snapshot(2);
+        yield* nativeEventBarrier(fake, takeEvent);
+        assert.isFalse(
+          observed.slice(boundary).some((event) => event.type === "subagent.updated"),
+          "Fully released original group must retire together",
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect.each([false, true])(
     "completes a resumed user turn before native wake events arrive, Pi streaming=%s",
     (streaming) =>
@@ -2217,7 +2911,7 @@ describe("PiAdapterV2", () => {
       }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
-  it.effect("observes official subagent results without inventing child threads", () =>
+  it.effect("projects native agents into the existing child conversation", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;
       const { runtime, takeEvent } = yield* openRuntime(fake);
@@ -2229,6 +2923,12 @@ describe("PiAdapterV2", () => {
       yield* startTurn(runtime, providerThread);
       yield* fake.takeRequest("prompt");
       yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "call_sub",
+        toolName: "subagent",
+        args: { agent: "scout", task: "map the repo" },
+      });
       yield* fake.emit({
         type: "tool_execution_update",
         toolCallId: "call_sub",
@@ -2260,7 +2960,15 @@ describe("PiAdapterV2", () => {
           running.subagent.title === "scout" &&
           running.subagent.prompt === "map the repo" &&
           running.subagent.progress === "scanning files" &&
-          running.subagent.childThreadId === null,
+          running.subagent.childThreadId !== null,
+      );
+      if (running.type !== "subagent.updated") return yield* Effect.die("Expected a child");
+      const child = yield* takeEvent((event) => event.type === "app_thread.created");
+      assert.isTrue(
+        child.type === "app_thread.created" &&
+          child.appThread.id === running.subagent.childThreadId &&
+          child.appThread.lineage.parentThreadId === THREAD_ID &&
+          child.appThread.creationSource === "provider",
       );
 
       yield* fake.emit({
@@ -2293,7 +3001,7 @@ describe("PiAdapterV2", () => {
       assert.isTrue(
         doneCard.type === "subagent.updated" &&
           doneCard.subagent.result === "repo has one file" &&
-          doneCard.subagent.childThreadId === null,
+          doneCard.subagent.childThreadId === running.subagent.childThreadId,
       );
       const subagentItem = yield* takeEvent(
         (event) =>
@@ -2304,7 +3012,3671 @@ describe("PiAdapterV2", () => {
       assert.isTrue(
         subagentItem.type === "turn_item.updated" &&
           subagentItem.turnItem.type === "subagent" &&
-          subagentItem.turnItem.childThreadId === null,
+          subagentItem.turnItem.childThreadId === running.subagent.childThreadId,
+      );
+      const message = yield* takeEvent(
+        (event) =>
+          event.type === "message.updated" &&
+          event.message.threadId === running.subagent.childThreadId &&
+          event.message.role === "assistant" &&
+          event.message.text === "repo has one file",
+      );
+      assert.equal(message.type, "message.updated");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["ascii", "multibyte"] as const)(
+    "accepts near-budget %s inspection JSON separately from its framing",
+    (encoding) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* emitAsyncLaunchReceipt(fake, "budget-run");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "subagent-async",
+          widgetLines: [
+            "PI_SUBAGENT_ASYNC_JSON:" +
+              JSON.stringify({
+                kind: "pi-subagents.async-status-snapshot",
+                version: 1,
+                runs: [
+                  {
+                    id: "budget-run",
+                    kind: "subagent",
+                    children: [
+                      {
+                        id: "step:0",
+                        kind: "step",
+                        agent: "worker",
+                        state: "running",
+                        startedAt: 1,
+                      },
+                    ],
+                  },
+                ],
+              }),
+          ],
+        });
+        const child = yield* takeEvent((event) => event.type === "subagent.updated");
+        if (child.type !== "subagent.updated" || child.subagent.runId === null)
+          return yield* Effect.die("Expected native child");
+        yield* takeEvent(
+          (event) =>
+            event.type === "node.updated" && event.node.threadId === child.subagent.childThreadId,
+        );
+        const request = yield* fake.takeRequest("prompt");
+        const requestId = String(request.message).split(" ")[1];
+        const finalOutput = `${encoding} available`;
+        const payload = {
+          kind: "pi-subagents.inspect-reply",
+          version: 1,
+          requestId,
+          asyncId: "budget-run",
+          childId: "step:0",
+          finalOutput,
+          messages: Array.from({ length: 80 }, (_, index) => ({
+            role: "assistant",
+            kind: "text",
+            text: `${index}:`,
+          })),
+        };
+        const glyph = encoding === "ascii" ? "x" : "界";
+        let remaining = 65_520 - Buffer.byteLength(JSON.stringify(payload), "utf8");
+        for (const message of payload.messages) {
+          const count = Math.min(900, Math.floor(remaining / Buffer.byteLength(glyph, "utf8")));
+          message.text += glyph.repeat(count);
+          remaining -= count * Buffer.byteLength(glyph, "utf8");
+        }
+        payload.messages.at(-1)!.text += "x".repeat(remaining);
+        const json = JSON.stringify(payload);
+        const prefix = "PI_SUBAGENT_INSPECT_JSON:";
+        assert.equal(Buffer.byteLength(json, "utf8"), 65_520);
+        assert.isAbove(Buffer.byteLength(prefix + json, "utf8"), 65_536);
+        const invalid = { ...payload, finalOutput: "invalid reply", messages: [] };
+        const oversized = JSON.stringify({
+          ...payload,
+          finalOutput: "invalid reply",
+          messages: payload.messages.map((message, index) =>
+            index === 0 ? { ...message, text: message.text + "界".repeat(40) } : message,
+          ),
+        });
+        assert.isAbove(Buffer.byteLength(oversized, "utf8"), 65_536);
+        if (encoding === "multibyte") assert.isBelow(oversized.length, 65_536);
+        for (const line of [
+          "wrong-prefix:" + json,
+          prefix + "{",
+          prefix + JSON.stringify({ ...invalid, version: 2 }),
+          prefix +
+            JSON.stringify({
+              ...invalid,
+              messages: [{ role: "assistant", kind: "unsupported", text: "invalid reply" }],
+            }),
+          prefix + JSON.stringify({ ...invalid, requestId: "foreign-request" }),
+          prefix + JSON.stringify({ ...invalid, asyncId: "foreign-run" }),
+          prefix + JSON.stringify({ ...invalid, childId: "foreign-child" }),
+          prefix + oversized,
+          prefix + json,
+        ])
+          yield* fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "subagent-inspect",
+            widgetLines: [line],
+          });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "notify",
+          message: "budget replies consumed",
+        });
+        yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message === "budget replies consumed",
+        );
+        // Advance the protocol deadline so a rejected legal reply fails an assertion, not a test timeout.
+        yield* TestClock.adjust("5 seconds");
+        const fence = yield* takeEvent(
+          (event) =>
+            event.type === "node.updated" && event.node.threadId === child.subagent.childThreadId,
+        );
+        assert.isTrue(
+          observed.some(
+            (event) =>
+              event.type === "message.updated" &&
+              event.message.threadId === child.subagent.childThreadId &&
+              event.message.text === finalOutput,
+          ),
+        );
+        assert.isFalse(
+          observed.some(
+            (event) => event.type === "message.updated" && event.message.text === "invalid reply",
+          ),
+        );
+        assert.isFalse(
+          observed.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              /inspector did not respond/.test(event.turnItem.message),
+          ),
+        );
+        yield* runtime.acknowledgeEvent!(fence, child.subagent.runId);
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(child.subagent.runId));
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("projects native activity into its child conversation without a model turn", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* emitAsyncLaunchReceipt(fake, "native-run");
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "subagent-async",
+        widgetLines: [
+          `PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+            kind: "pi-subagents.async-status-snapshot",
+            version: 1,
+            runs: [
+              {
+                id: "native-run",
+                kind: "subagent",
+                children: [
+                  {
+                    id: "step:0",
+                    kind: "step",
+                    agent: "worker",
+                    task: "read files",
+                    state: "running",
+                    startedAt: 1,
+                  },
+                ],
+              },
+            ],
+          })}`,
+        ],
+      });
+      const event = yield* takeEvent((event) => event.type === "subagent.updated");
+      if (event.type !== "subagent.updated") return yield* Effect.die("Expected a native child");
+      const request = yield* fake.takeRequest("prompt");
+      const requestId = String(request.message).split(" ")[1];
+      assert.equal(
+        request.message,
+        `/subagents-inspect-rpc ${requestId} native-run step:0 --lines 100`,
+      );
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "subagent-inspect",
+        widgetLines: [
+          `PI_SUBAGENT_INSPECT_JSON:${JSON.stringify({
+            kind: "pi-subagents.inspect-reply",
+            version: 1,
+            requestId,
+            asyncId: "other-run",
+            childId: "step:0",
+            messages: [],
+          })}`,
+        ],
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "subagent-inspect",
+        widgetLines: [
+          `PI_SUBAGENT_INSPECT_JSON:${JSON.stringify({
+            kind: "pi-subagents.inspect-reply",
+            version: 1,
+            requestId,
+            asyncId: "native-run",
+            childId: "step:0",
+            task: "read files",
+            messages: [
+              { role: "assistant", kind: "toolCall", name: "read", text: '{"path":"a.ts"}' },
+            ],
+          })}`,
+        ],
+      });
+      const activity = yield* takeEvent(
+        (item) => item.type === "turn_item.updated" && item.turnItem.type === "dynamic_tool",
+      );
+      assert.isTrue(
+        activity.type === "turn_item.updated" &&
+          activity.turnItem.type === "dynamic_tool" &&
+          activity.turnItem.threadId === event.subagent.childThreadId &&
+          activity.turnItem.toolName === "read" &&
+          activity.turnItem.input === '{"path":"a.ts"}',
+      );
+      const runningFence = yield* takeEvent(
+        (item) =>
+          item.type === "node.updated" && item.node.threadId === event.subagent.childThreadId,
+      );
+      yield* runtime.acknowledgeEvent!(runningFence, event.subagent.runId!);
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "subagent-async",
+        widgetLines: [
+          `PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+            kind: "pi-subagents.async-status-snapshot",
+            version: 1,
+            runs: [
+              {
+                id: "native-run",
+                kind: "subagent",
+                children: [
+                  {
+                    id: "step:0",
+                    kind: "step",
+                    agent: "worker",
+                    state: "complete",
+                    startedAt: 1,
+                  },
+                ],
+              },
+            ],
+          })}`,
+        ],
+      });
+      yield* takeEvent(
+        (item) => item.type === "subagent.updated" && item.subagent.status === "completed",
+      );
+      const finalRequest = yield* fake.takeRequest("prompt");
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(event.subagent.runId!));
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "subagent-inspect",
+        widgetLines: [
+          `PI_SUBAGENT_INSPECT_JSON:${JSON.stringify({
+            kind: "pi-subagents.inspect-reply",
+            version: 1,
+            requestId: String(finalRequest.message).split(" ")[1],
+            asyncId: "native-run",
+            childId: "step:0",
+            finalOutput: "read complete",
+            messages: [{ role: "assistant", kind: "text", text: "read complete" }],
+          })}`,
+        ],
+      });
+      const result = yield* takeEvent(
+        (item) =>
+          item.type === "message.updated" &&
+          item.message.threadId === event.subagent.childThreadId &&
+          item.message.text === "read complete",
+      );
+      assert.equal(result.type, "message.updated");
+      const fence = yield* takeEvent(
+        (item) =>
+          item.type === "node.updated" &&
+          item.node.threadId === event.subagent.childThreadId &&
+          item.node.status === "completed",
+      );
+      const owningRunId = event.subagent.runId!;
+      assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(owningRunId));
+      yield* runtime.acknowledgeEvent!(result, owningRunId);
+      assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(owningRunId));
+      yield* runtime.acknowledgeEvent!(fence, owningRunId);
+      assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(owningRunId));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["completed", "failed"] as const)(
+    "projects a correlated %s foreground callback without a root tool stream",
+    (status) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "idle-call",
+          toolName: "subagent",
+          args: {},
+        });
+        const callback = (runId: string, toolCallId: string, terminal = false) => ({
+          type: "tool_execution_update",
+          toolCallId,
+          toolName: "subagent",
+          partialResult: {
+            details: {
+              runId,
+              mode: "single",
+              results: [
+                {
+                  index: 0,
+                  agent: "scout",
+                  task: "inspect",
+                  progress: { status: terminal ? status : "running" },
+                  ...(terminal
+                    ? { finalOutput: `${status} while idle`, exitCode: status === "failed" ? 1 : 0 }
+                    : {}),
+                },
+              ],
+            },
+          },
+        });
+        yield* fake.emit(callback("idle-run", "idle-call"));
+        const first = yield* takeEvent((event) => event.type === "subagent.updated");
+        if (first.type !== "subagent.updated") return yield* Effect.die("Expected child");
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "idle-call",
+          toolName: "subagent",
+          result: {
+            details: {
+              runId: "idle-run",
+              mode: "single",
+              results: [
+                {
+                  index: 0,
+                  agent: "scout",
+                  task: "inspect",
+                  detached: true,
+                  exitCode: -2,
+                  progress: { status: "detached" },
+                  finalOutput: "Detached for intercom coordination before task completion.",
+                },
+              ],
+            },
+          },
+        });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "t3-subagent-liveness",
+          widgetLines: [encodeJsonLine({ version: 1, ready: true })],
+        });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        const before = observed.length;
+        yield* fake.emit(callback("idle-run", "foreign-call", true));
+        yield* fake.emit(callback("foreign-run", "idle-call", true));
+        yield* fake.emit(callback("idle-run", "idle-call", true));
+        // The session-scoped reply is ordered after idle callbacks without creating a model turn.
+        const idleBarrier = Effect.gen(function* () {
+          const probe = yield* Effect.forkChild(runtime.backgroundWorkStatus!);
+          const request = yield* fake.takeRequest("prompt");
+          assert.isTrue(String(request["message"]).startsWith("/t3-subagent-liveness "));
+          yield* fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "t3-subagent-liveness",
+            widgetLines: [
+              encodeJsonLine({
+                version: 1,
+                requestId: String(request["message"]).split(" ")[1],
+                status: "inactive",
+              }),
+            ],
+          });
+          yield* Fiber.join(probe);
+        });
+        yield* idleBarrier;
+        const tail = observed.slice(before);
+        const updates = tail.flatMap((event) =>
+          event.type === "subagent.updated" ? [event.subagent] : [],
+        );
+        assert.deepEqual(
+          updates.map((child) => [child.id, child.runId, child.status, child.result]),
+          [[first.subagent.id, first.subagent.runId, status, `${status} while idle`]],
+        );
+        assert.isTrue(
+          tail.some(
+            (event) =>
+              event.type === "message.updated" &&
+              event.message.threadId === first.subagent.childThreadId &&
+              event.message.role === "assistant" &&
+              event.message.text === `${status} while idle`,
+          ),
+        );
+        assert.isFalse(
+          tail.some(
+            (event) =>
+              event.type === "turn.terminal" ||
+              (event.type === "turn_item.updated" &&
+                event.turnItem.threadId === THREAD_ID &&
+                event.turnItem.type !== "subagent"),
+          ),
+        );
+        const runId = first.subagent.runId!;
+        for (const event of observed) yield* runtime.acknowledgeEvent!(event, runId);
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+        const unchanged = callback("idle-run", "idle-call", true);
+        const unchangedWithHistory = {
+          ...unchanged,
+          partialResult: {
+            details: {
+              ...unchanged.partialResult.details,
+              results: [
+                {
+                  ...unchanged.partialResult.details.results[0],
+                  toolCalls: [{ text: "read late.ts", expandedText: "read late.ts (1-20)" }],
+                },
+              ],
+            },
+          },
+        };
+        const beforeHistory = observed.length;
+        yield* fake.emit(unchangedWithHistory);
+        yield* idleBarrier;
+        const history = observed.slice(beforeHistory);
+        assert.isFalse(history.some((event) => event.type === "subagent.updated"));
+        const summaryIndex = history.findIndex(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message.includes("read late.ts (1-20)"),
+        );
+        assert.isAtLeast(summaryIndex, 0);
+        const fence = history.at(-1)!;
+        assert.equal(fence.type, "node.updated");
+        assert.isBelow(summaryIndex, history.length - 1);
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+        yield* runtime.acknowledgeEvent!(history[summaryIndex]!, runId);
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+        yield* runtime.acknowledgeEvent!(fence, runId);
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+        const beforeRejected = observed.length;
+        yield* fake.emit({
+          ...unchangedWithHistory,
+          partialResult: {
+            details: {
+              ...unchangedWithHistory.partialResult.details,
+              results: [
+                {
+                  ...unchangedWithHistory.partialResult.details.results[0],
+                  progress: { status: "running" },
+                  toolCalls: [{ text: "rejected history", expandedText: "rejected history" }],
+                },
+              ],
+            },
+          },
+        });
+        yield* idleBarrier;
+        assert.deepEqual(observed.slice(beforeRejected), []);
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+        assert.equal(
+          fake
+            .allRequests()
+            .filter(
+              (request) =>
+                request.type === "prompt" && !String(request["message"]).startsWith("/t3-"),
+            ).length,
+          1,
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["unfinished", "detached", "completed", "failed", "provisional"] as const)(
+    "projects %s foreground callbacks after the delegation receipt",
+    (kind) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "detached-call",
+          toolName: "subagent",
+          args: {},
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "detached-call",
+          toolName: "subagent",
+          result: {
+            details: {
+              runId: "native-run",
+              mode: "single",
+              results: [
+                {
+                  index: 7,
+                  agent: "scout",
+                  task: "inspect",
+                  ...(kind !== "unfinished"
+                    ? {
+                        detached: true,
+                        exitCode: -2,
+                        detachedReason: "intercom coordination",
+                        progress: { status: "detached" },
+                        finalOutput: "Detached for intercom coordination before task completion.",
+                      }
+                    : { finished: false }),
+                },
+              ],
+            },
+          },
+        });
+        const child = yield* takeEvent((event) => event.type === "subagent.updated");
+        assert.equal(child.type === "subagent.updated" && child.subagent.status, "running");
+        if (child.type !== "subagent.updated") return yield* Effect.die("Expected child");
+        yield* fake.emit({
+          type: "tool_execution_update",
+          toolCallId: "detached-call",
+          toolName: "subagent",
+          partialResult: {
+            details: {
+              mode: "single",
+              runId: "native-run",
+              results: [
+                {
+                  index: 7,
+                  agent: "scout",
+                  task: "inspect",
+                  finalOutput: "continued after receipt",
+                  exitCode: 0,
+                  progress: { status: "running" },
+                },
+              ],
+            },
+          },
+        });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "notify",
+          message: "continued receipt consumed",
+        });
+        yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message === "continued receipt consumed",
+        );
+        const updates = observed.flatMap((event) =>
+          event.type === "subagent.updated" ? [event.subagent] : [],
+        );
+        assert.equal(updates.at(-1)?.id, child.subagent.id);
+        assert.equal(updates.at(-1)?.status, "running");
+        assert.equal(updates.at(-1)?.progress, "continued after receipt");
+        if (["completed", "failed", "provisional"].includes(kind)) {
+          const finalOutput = `${kind} final response ` + "x".repeat(12_000);
+          yield* fake.emit({
+            type: "tool_execution_update",
+            toolCallId: "detached-call",
+            toolName: "subagent",
+            partialResult: {
+              details: {
+                mode: "single",
+                runId: "native-run",
+                results: [
+                  {
+                    index: 7,
+                    agent: "scout",
+                    task: "inspect",
+                    exitCode: kind === "failed" ? 1 : 0,
+                    finalOutput,
+                    ...(kind === "provisional" ? {} : { progress: { status: kind } }),
+                  },
+                ],
+              },
+            },
+          });
+          yield* fake.emit({
+            type: "extension_ui_request",
+            method: "notify",
+            message: "final callback consumed",
+          });
+          yield* takeEvent(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              event.turnItem.message === "final callback consumed",
+          );
+          const finalChild = observed
+            .flatMap((event) => (event.type === "subagent.updated" ? [event.subagent] : []))
+            .at(-1);
+          assert.equal(finalChild?.id, child.subagent.id);
+          assert.equal(finalChild?.childThreadId, child.subagent.childThreadId);
+          assert.equal(finalChild?.status, kind === "provisional" ? "running" : kind);
+          assert.equal(
+            finalChild?.result,
+            kind === "provisional" ? null : finalOutput.slice(0, 10_000),
+          );
+          assert.equal(
+            observed.filter(
+              (event) =>
+                event.type === "message.updated" &&
+                event.message.threadId === child.subagent.childThreadId &&
+                event.message.role === "assistant" &&
+                event.message.text === finalOutput.slice(0, 10_000),
+            ).length,
+            kind === "provisional" ? 0 : 1,
+          );
+        }
+        assert.isFalse(observed.some((event) => event.type === "turn.terminal"));
+        assert.equal(fake.allRequests().filter((request) => request.type === "prompt").length, 1);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "queries fresh native residency after the main turn without starting another turn",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "t3-subagent-liveness",
+          widgetLines: [encodeJsonLine({ version: 1, ready: true })],
+        });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.isDefined(runtime.backgroundWorkStatus);
+        for (const status of ["active", "inactive"] as const) {
+          const probe = yield* Effect.forkChild(runtime.backgroundWorkStatus!);
+          const request = yield* fake.takeRequest("prompt");
+          const message = String(request["message"]);
+          assert.isTrue(message.startsWith("/t3-subagent-liveness "));
+          yield* fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "t3-subagent-liveness",
+            widgetLines: [encodeJsonLine({ version: 1, requestId: message.split(" ")[1], status })],
+          });
+          assert.equal(yield* Fiber.join(probe), status);
+          const threadProbeReply = yield* Effect.forkChild(
+            Effect.gen(function* () {
+              const threadRequest = yield* fake.takeRequest("prompt");
+              const requestId = String(threadRequest["message"]).split(" ")[1];
+              yield* fake.emit({
+                type: "extension_ui_request",
+                method: "setWidget",
+                widgetKey: "t3-subagent-liveness",
+                widgetLines: [encodeJsonLine({ version: 1, requestId, status })],
+              });
+            }),
+          );
+          assert.equal(
+            yield* runtime.hasPendingBackgroundWorkForThread!(providerThread),
+            status === "active",
+          );
+          yield* Fiber.join(threadProbeReply);
+        }
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "quarantines unowned active snapshots after reopening until a real launch proves ownership",
+    () =>
+      Effect.gen(function* () {
+        const previous = yield* openRuntime(yield* makeFakePi);
+        const retainedThread = yield* previous.runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.resumeThread({ providerThread: retainedThread });
+        yield* startTurn(runtime, providerThread, "default", [], "New root", undefined, 2);
+        yield* fake.takeRequest("prompt");
+        const worker = (id: string, state: string, children: unknown[] = []) => ({
+          id,
+          kind: "subagent",
+          state,
+          children: [
+            {
+              id: "step:0",
+              kind: "step",
+              agent: id,
+              state,
+              startedAt: 1,
+              children,
+            },
+          ],
+        });
+        const snapshot = () =>
+          emitNativeSnapshot(fake, [
+            worker("old-running", "running"),
+            worker("old-pending", "queued"),
+            worker("old-paused", "paused"),
+            worker("legitimate", "queued", [worker("nested", "queued")]),
+          ]);
+        const marker = (message: string) =>
+          fake.emit({ type: "extension_ui_request", method: "notify", message });
+        const seen = (message: string) =>
+          takeEvent(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              event.turnItem.message === message,
+          );
+        yield* snapshot();
+        yield* marker("unowned snapshot consumed");
+        yield* seen("unowned snapshot consumed");
+        assert.isFalse(
+          observed.some(
+            (event) => event.type === "subagent.updated" || event.type === "app_thread.created",
+          ),
+          "a resumed session snapshot is not ownership proof for the new root",
+        );
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "launch",
+          toolName: "subagent",
+          args: { agent: "legitimate", task: "inspect", async: true },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "launch",
+          toolName: "subagent",
+          result: { details: { mode: "single", asyncId: "legitimate", results: [] } },
+        });
+        yield* snapshot();
+        yield* marker("owned snapshot consumed");
+        yield* seen("owned snapshot consumed");
+        const children = observed.flatMap((event) =>
+          event.type === "subagent.updated" ? [event.subagent] : [],
+        );
+        assert.deepEqual(
+          children.map((child) => [child.title, child.status]),
+          [
+            ["legitimate", "pending"],
+            ["nested", "pending"],
+          ],
+        );
+        assert.equal(children[0]!.runId, RunId.make(`run:${THREAD_ID}:2`));
+        assert.equal(children[1]!.runId, children[0]!.runId);
+        assert.equal(children[1]!.parentNodeId, children[0]!.id);
+        assert.equal(children[1]!.threadId, children[0]!.childThreadId);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("captures an inspection reply while a successor wake waits for admission", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const offers =
+        yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+      const { runtime, takeEvent, observed } = yield* openRuntime(
+        fake,
+        "default",
+        THREAD_ID,
+        SESSION_ID,
+        undefined,
+        { offer: (request) => Queue.offer(offers, request).pipe(Effect.asVoid) },
+      );
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* emitAsyncLaunchReceipt(fake, "inspected");
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "t3-subagent-liveness",
+        widgetLines: [encodeJsonLine({ version: 1, ready: true })],
+      });
+      yield* fake.emit({ type: "agent_settled" });
+      yield* takeEvent((event) => event.type === "turn.terminal");
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "t3-subagents",
+        widgetLines: [
+          "PI_SUBAGENT_ASYNC_JSON:" +
+            JSON.stringify({
+              kind: "pi-subagents.async-status-snapshot",
+              version: 1,
+              runs: [
+                {
+                  id: "inspected",
+                  kind: "subagent",
+                  state: "complete",
+                  children: [
+                    {
+                      id: "step:0",
+                      kind: "step",
+                      agent: "worker",
+                      state: "complete",
+                      startedAt: 1,
+                    },
+                  ],
+                },
+              ],
+            }),
+        ],
+      });
+      const child = yield* takeEvent((event) => event.type === "subagent.updated");
+      if (child.type !== "subagent.updated") return yield* Effect.die("Expected child");
+      const inspection = yield* fake.takeRequest("prompt");
+      assert.include(String(inspection.message), "/subagents-inspect-rpc ");
+      yield* fake.emit({ type: "agent_start" });
+      const offer = yield* Queue.take(offers);
+      const admission = yield* Deferred.make<void>();
+      const waiting = yield* Deferred.make<void>();
+      const successor = yield* Effect.gen(function* () {
+        yield* Deferred.succeed(waiting, undefined);
+        yield* Deferred.await(admission);
+        yield* offer.dispatchIfCurrent!(Effect.void);
+      }).pipe(Effect.forkScoped);
+      yield* Deferred.await(waiting);
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "notify",
+        message: "buffered wake notification",
+      });
+      const reply = (asyncId: string, requestId: string, text: string) =>
+        fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "subagent-inspect",
+          widgetLines: [
+            "PI_SUBAGENT_INSPECT_JSON:" +
+              JSON.stringify({
+                kind: "pi-subagents.inspect-reply",
+                version: 1,
+                requestId,
+                asyncId,
+                childId: "step:0",
+                finalOutput: text,
+                messages: [{ role: "assistant", kind: "text", text }],
+              }),
+          ],
+        });
+      const requestId = String(inspection.message).split(" ")[1]!;
+      yield* reply("foreign", requestId, "foreign history");
+      yield* reply("inspected", "foreign-request", "foreign history");
+      yield* reply("inspected", requestId, "available during wake");
+      const probe = yield* Effect.forkChild(runtime.backgroundWorkStatus!);
+      const query = yield* fake.takeRequest("prompt");
+      assert.include(String(query.message), "/t3-subagent-liveness ");
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "t3-subagent-liveness",
+        widgetLines: [
+          encodeJsonLine({
+            version: 1,
+            requestId: String(query.message).split(" ")[1],
+            status: "inactive",
+          }),
+        ],
+      });
+      yield* Fiber.join(probe);
+      yield* TestClock.adjust("5 seconds");
+      const capture = yield* takeEvent(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.threadId === child.subagent.childThreadId &&
+          ((event.turnItem.type === "assistant_message" &&
+            event.turnItem.text === "available during wake") ||
+            (event.turnItem.type === "system_notice" &&
+              event.turnItem.message.includes("inspector did not respond"))),
+      );
+      assert.equal(
+        capture.type === "turn_item.updated" && capture.turnItem.type,
+        "assistant_message",
+        "a valid observer reply must not expire behind the unadmitted root wake",
+      );
+      const fence = yield* takeEvent(
+        (event) =>
+          event.type === "node.updated" && event.node.threadId === child.subagent.childThreadId,
+      );
+      const messageIndex = observed.findIndex(
+        (event) =>
+          event.type === "message.updated" &&
+          event.message.threadId === child.subagent.childThreadId &&
+          event.message.text === "available during wake",
+      );
+      assert.isAtLeast(messageIndex, 0);
+      assert.isBelow(messageIndex, observed.indexOf(capture));
+      assert.isBelow(observed.indexOf(capture), observed.indexOf(fence));
+      assert.isFalse(yield* Deferred.isDone(admission));
+      const runId = child.subagent.runId!;
+      assert.equal(runId, RunId.make(`run:${THREAD_ID}:1`));
+      assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+      yield* runtime.acknowledgeEvent!(fence, RunId.make("foreign"));
+      assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+      yield* runtime.acknowledgeEvent!(fence, runId);
+      assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+      assert.isFalse(
+        observed.some(
+          (event) =>
+            (event.type === "message.updated" && event.message.text === "foreign history") ||
+            (event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              (event.turnItem.message === "buffered wake notification" ||
+                event.turnItem.message.includes("inspector did not respond"))),
+        ),
+      );
+      assert.equal(observed.filter((event) => event.type === "turn.terminal").length, 1);
+      assert.equal(
+        fake
+          .allRequests()
+          .filter(
+            (request) => request.type === "prompt" && !String(request.message).startsWith("/"),
+          ).length,
+        1,
+      );
+      yield* Deferred.succeed(admission, undefined);
+      yield* Fiber.join(successor);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "observes the new native resume run without claiming its source or replayed receipts",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "resume",
+          toolName: "subagent",
+          args: { action: "resume", id: "C", message: "continue" },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "resume",
+          toolName: "subagent",
+          result: {
+            content: [{ type: "text", text: "Revived run: R" }],
+            details: { mode: "single", asyncId: "R", results: [] },
+          },
+        });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "notify",
+          message: "resume consumed",
+        });
+        yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message === "resume consumed",
+        );
+        assert.isTrue(
+          yield* runtime.hasPendingEventDeliveryForRun!(RunId.make(`run:${THREAD_ID}:1`)),
+          "a successful resume receipt must own its new async run before its first snapshot",
+        );
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "resume",
+          toolName: "subagent",
+          result: { details: { mode: "single", asyncId: "replayed-R", results: [] } },
+        });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "t3-subagents",
+          widgetLines: [
+            "PI_SUBAGENT_ASYNC_JSON:" +
+              JSON.stringify({
+                kind: "pi-subagents.async-status-snapshot",
+                version: 1,
+                runs: [
+                  {
+                    id: "replayed-R",
+                    kind: "subagent",
+                    state: "running",
+                    children: [
+                      {
+                        id: "step:0",
+                        kind: "step",
+                        agent: "replay",
+                        state: "running",
+                        startedAt: 1,
+                      },
+                    ],
+                  },
+                  {
+                    id: "R",
+                    kind: "subagent",
+                    state: "running",
+                    children: [
+                      {
+                        id: "step:0",
+                        kind: "step",
+                        agent: "revived",
+                        state: "running",
+                        startedAt: 1,
+                      },
+                    ],
+                  },
+                ],
+              }),
+          ],
+        });
+        const child = yield* takeEvent((event) => event.type === "subagent.updated");
+        if (child.type !== "subagent.updated") return yield* Effect.die("Expected revived child");
+        const inspection = yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "subagent-inspect",
+          widgetLines: [
+            "PI_SUBAGENT_INSPECT_JSON:" +
+              JSON.stringify({
+                kind: "pi-subagents.inspect-reply",
+                version: 1,
+                requestId: String(inspection.message).split(" ")[1],
+                asyncId: "R",
+                childId: "step:0",
+                messages: [],
+              }),
+          ],
+        });
+        yield* nativeEventBarrier(fake, takeEvent);
+        assert.equal(child.subagent.runId, RunId.make(`run:${THREAD_ID}:1`));
+        assert.isTrue(
+          observed
+            .filter((event) => event.type === "subagent.updated")
+            .every(
+              (event) =>
+                event.type === "subagent.updated" && event.subagent.id === child.subagent.id,
+            ),
+        );
+        assert.equal(
+          fake
+            .allRequests()
+            .filter(
+              (request) => request.type === "prompt" && !String(request.message).startsWith("/"),
+            ).length,
+          1,
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([
+    "denied",
+    "error-with-id",
+    "status",
+    "inspect",
+    "stop",
+    "arbitrary",
+    "partial",
+    "source-id",
+  ] as const)("does not establish native resume ownership from a %s receipt", (kind) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      const action = ["status", "inspect", "stop", "arbitrary"].includes(kind) ? kind : "resume";
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "control",
+        toolName: "subagent",
+        args: { action, id: "C", message: "continue" },
+      });
+      const result = {
+        details: {
+          mode: kind === "denied" ? "management" : "single",
+          results: [],
+          ...(kind === "denied" ? {} : { asyncId: kind === "source-id" ? "C" : "R" }),
+        },
+      };
+      yield* fake.emit({
+        type: kind === "partial" ? "tool_execution_update" : "tool_execution_end",
+        toolCallId: "control",
+        toolName: "subagent",
+        isError: kind === "denied" || kind === "error-with-id",
+        ...(kind === "partial" ? { partialResult: result } : { result }),
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "t3-subagents",
+        widgetLines: [
+          "PI_SUBAGENT_ASYNC_JSON:" +
+            JSON.stringify({
+              kind: "pi-subagents.async-status-snapshot",
+              version: 1,
+              runs: [
+                {
+                  id: kind === "source-id" ? "C" : "R",
+                  kind: "subagent",
+                  state: "running",
+                  children: [
+                    {
+                      id: "step:0",
+                      kind: "step",
+                      agent: "unowned",
+                      state: "running",
+                      startedAt: 1,
+                    },
+                  ],
+                },
+              ],
+            }),
+        ],
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "notify",
+        message: "control consumed",
+      });
+      yield* takeEvent(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "system_notice" &&
+          event.turnItem.message === "control consumed",
+      );
+      assert.isFalse(
+        yield* runtime.hasPendingEventDeliveryForRun!(RunId.make(`run:${THREAD_ID}:1`)),
+      );
+      assert.isFalse(
+        observed.some(
+          (event) => event.type === "subagent.updated" || event.type === "app_thread.created",
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("does not steal a confirmed original-run binding with a successor resume receipt", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* emitAsyncLaunchReceipt(fake, "R");
+      yield* fake.emit({ type: "agent_settled" });
+      yield* takeEvent((event) => event.type === "turn.terminal");
+      yield* startTurn(runtime, providerThread, "default", [], "Successor", undefined, 2);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "resume",
+        toolName: "subagent",
+        args: { action: "resume", id: "C", message: "continue" },
+      });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "resume",
+        toolName: "subagent",
+        result: { details: { mode: "single", asyncId: "R", results: [] } },
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "t3-subagents",
+        widgetLines: [
+          "PI_SUBAGENT_ASYNC_JSON:" +
+            JSON.stringify({
+              kind: "pi-subagents.async-status-snapshot",
+              version: 1,
+              runs: [
+                {
+                  id: "R",
+                  kind: "subagent",
+                  state: "running",
+                  children: [
+                    { id: "step:0", kind: "step", agent: "worker", state: "running", startedAt: 1 },
+                  ],
+                },
+              ],
+            }),
+        ],
+      });
+      const child = yield* takeEvent((event) => event.type === "subagent.updated");
+      assert.equal(
+        child.type === "subagent.updated" && child.subagent.runId,
+        RunId.make(`run:${THREAD_ID}:1`),
+      );
+      assert.isFalse(
+        yield* runtime.hasPendingEventDeliveryForRun!(RunId.make(`run:${THREAD_ID}:2`)),
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "updates the same native child from a late snapshot after its parent turn settles",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "async",
+          toolName: "subagent",
+          args: { agent: "scout", task: "inspect", async: true },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "async",
+          toolName: "subagent",
+          result: {
+            details: {
+              asyncId: "run",
+              results: [{ index: 7, agent: "scout", task: "inspect", finished: false }],
+            },
+          },
+        });
+        const first = yield* takeEvent((event) => event.type === "subagent.updated");
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+        yield* startTurn(runtime, providerThread, "default", [], "Next task", undefined, 2);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: "late",
+          method: "setWidget",
+          widgetKey: "t3-subagents",
+          widgetLines: [
+            `PI_SUBAGENT_ASYNC_JSON:${JSON.stringify({
+              kind: "pi-subagents.async-status-snapshot",
+              version: 1,
+              generatedAt: 10,
+              runs: [
+                { id: "historical", kind: "subagent", state: "complete", label: "old worker" },
+                {
+                  id: "run",
+                  kind: "workflow",
+                  state: "complete",
+                  children: [
+                    {
+                      id: "step:7",
+                      kind: "step",
+                      state: "complete",
+                      agent: "scout",
+                      startedAt: 1,
+                      children: [
+                        {
+                          id: "nested",
+                          kind: "subagent",
+                          state: "complete",
+                          children: [
+                            {
+                              id: "step:0",
+                              kind: "step",
+                              state: "complete",
+                              agent: "reviewer",
+                              startedAt: 2,
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            })}`,
+          ],
+        });
+        const done = yield* takeEvent(
+          (event) => event.type === "subagent.updated" && event.subagent.status === "completed",
+        );
+        assert.equal(
+          first.type === "subagent.updated" && first.subagent.id,
+          done.type === "subagent.updated" && done.subagent.id,
+        );
+        assert.equal(
+          first.type === "subagent.updated" && first.subagent.runId,
+          done.type === "subagent.updated" && done.subagent.runId,
+        );
+        const nested = yield* takeEvent(
+          (event) => event.type === "subagent.updated" && event.subagent.title === "reviewer",
+        );
+        assert.equal(
+          nested.type === "subagent.updated" && nested.subagent.runId,
+          first.type === "subagent.updated" && first.subagent.runId,
+        );
+        assert.equal(
+          nested.type === "subagent.updated" && nested.subagent.parentNodeId,
+          first.type === "subagent.updated" && first.subagent.id,
+        );
+        // The final native transcript requests have not received replies yet.
+        assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["attached-first", "summary-first"] as const)(
+    "keeps repeated native nested representations in one child conversation, %s",
+    (order) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolName: "subagent",
+          toolCallId: "launch-C",
+          args: { agent: "parent", task: "work" },
+        });
+        yield* fake.emit({
+          type: "tool_execution_update",
+          toolName: "subagent",
+          toolCallId: "launch-C",
+          partialResult: {
+            details: {
+              runId: "C",
+              results: [{ agent: "parent", task: "work", index: 0, finished: false }],
+            },
+          },
+        });
+        const parent = yield* takeEvent((event) => event.type === "subagent.updated");
+        if (parent.type !== "subagent.updated") return yield* Effect.die("Expected parent");
+        const observed: ProviderAdapter.ProviderAdapterV2Event[] = [];
+        const take = (predicate: (event: ProviderAdapter.ProviderAdapterV2Event) => boolean) =>
+          takeEvent((event) => {
+            observed.push(event);
+            return predicate(event);
+          });
+        const nested = {
+          id: "N",
+          kind: "subagent",
+          state: "running",
+          children: [
+            {
+              id: "step:0",
+              kind: "step",
+              agent: "nested",
+              state: "running",
+              startedAt: 1,
+              updatedAt: 1,
+            },
+          ],
+        };
+        const step = {
+          id: "step:0",
+          kind: "step",
+          agent: "parent",
+          state: "running",
+          startedAt: 1,
+          updatedAt: 1,
+          children: [nested],
+        };
+        const snapshot = () =>
+          fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "subagent-async",
+            widgetLines: [
+              "PI_SUBAGENT_ASYNC_JSON:" +
+                JSON.stringify({
+                  kind: "pi-subagents.async-status-snapshot",
+                  version: 1,
+                  generatedAt: 10,
+                  runs: [
+                    {
+                      id: "C",
+                      kind: "subagent",
+                      state: "running",
+                      children: order === "attached-first" ? [step, nested] : [nested, step],
+                    },
+                  ],
+                }),
+            ],
+          });
+        const marker = (message: string) =>
+          fake.emit({ type: "extension_ui_request", method: "notify", message });
+        const markerSeen = (message: string) =>
+          take(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              event.turnItem.message === message,
+          );
+        yield* snapshot();
+        yield* marker("first duplicate snapshot consumed");
+        yield* markerSeen("first duplicate snapshot consumed");
+        const nestedUpdates = () =>
+          observed.flatMap((event) =>
+            event.type === "subagent.updated" && event.subagent.title === "nested"
+              ? [event.subagent]
+              : [],
+          );
+        assert.equal(nestedUpdates().length, 1);
+        const child = nestedUpdates()[0]!;
+        assert.equal(child.threadId, parent.subagent.childThreadId);
+        assert.equal(child.parentNodeId, parent.subagent.id);
+        assert.equal(child.runId, parent.subagent.runId);
+        const childThread = observed.find(
+          (event) =>
+            event.type === "app_thread.created" && event.appThread.id === child.childThreadId,
+        );
+        assert.equal(
+          childThread?.type === "app_thread.created" &&
+            childThread.appThread.lineage.parentThreadId,
+          parent.subagent.childThreadId,
+        );
+        const cards = observed.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "subagent" &&
+          event.turnItem.subagentId === child.id
+            ? [event.turnItem]
+            : [],
+        );
+        assert.equal(cards.length, 1);
+        assert.equal(cards[0]?.threadId, parent.subagent.childThreadId);
+        assert.equal(cards[0]?.runId, parent.subagent.runId);
+        for (let index = 0; index < 2; index++) {
+          const request = yield* fake.takeRequest("prompt");
+          const [, requestId, asyncId, childId] = String(request.message).split(" ");
+          yield* fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "subagent-inspect",
+            widgetLines: [
+              "PI_SUBAGENT_INSPECT_JSON:" +
+                JSON.stringify({
+                  kind: "pi-subagents.inspect-reply",
+                  version: 1,
+                  requestId,
+                  asyncId,
+                  childId,
+                  messages: [
+                    { role: "assistant", kind: "text", text: `duplicate capture ${index}` },
+                  ],
+                }),
+            ],
+          });
+          yield* take(
+            (event) =>
+              event.type === "message.updated" &&
+              event.message.text === `duplicate capture ${index}`,
+          );
+          yield* take((event) => event.type === "node.updated");
+        }
+        yield* snapshot();
+        yield* marker("repeated snapshot consumed");
+        yield* markerSeen("repeated snapshot consumed");
+        assert.equal(nestedUpdates().length, 1);
+        assert.equal(
+          observed.filter(
+            (event) =>
+              event.type === "app_thread.created" && event.appThread.id === child.childThreadId,
+          ).length,
+          1,
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([false, true])(
+    "keeps launch ownership and nested parent rows, status query=%s",
+    (query) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "launch",
+          toolName: "subagent",
+          args: { agent: "worker", task: "work" },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "launch",
+          toolName: "subagent",
+          result: {
+            details: {
+              runId: "owned",
+              results: [{ index: 0, agent: "worker", task: "work", finished: false }],
+            },
+          },
+        });
+        const first = yield* takeEvent((event) => event.type === "subagent.updated");
+        if (first.type !== "subagent.updated") return yield* Effect.die("Expected child");
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        yield* startTurn(runtime, providerThread, "default", [], "Check status", undefined, 2);
+        yield* fake.takeRequest("prompt");
+        if (query) {
+          yield* fake.emit({
+            type: "tool_execution_start",
+            toolCallId: "query",
+            toolName: "subagent",
+            args: { action: "status", id: "owned" },
+          });
+          yield* fake.emit({
+            type: "tool_execution_end",
+            toolCallId: "query",
+            toolName: "subagent",
+            result: { details: { runId: "owned", results: [] } },
+          });
+        }
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "t3-subagents",
+          widgetLines: [
+            "PI_SUBAGENT_ASYNC_JSON:" +
+              JSON.stringify({
+                kind: "pi-subagents.async-status-snapshot",
+                version: 1,
+                generatedAt: 10,
+                runs: [
+                  {
+                    id: "owned",
+                    kind: "workflow",
+                    children: [
+                      { id: "step:1", kind: "step", state: "running", agent: "late", startedAt: 1 },
+                      {
+                        id: "step:0",
+                        kind: "step",
+                        state: "running",
+                        agent: "worker",
+                        startedAt: 1,
+                        children: [
+                          {
+                            id: "nested",
+                            kind: "subagent",
+                            children: [
+                              {
+                                id: "step:0",
+                                kind: "step",
+                                state: "running",
+                                agent: "nested",
+                                startedAt: 2,
+                              },
+                            ],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              }),
+          ],
+        });
+        const late = yield* takeEvent(
+          (event) => event.type === "subagent.updated" && event.subagent.title === "late",
+        );
+        assert.equal(late.type === "subagent.updated" && late.subagent.runId, first.subagent.runId);
+        assert.equal(
+          late.type === "subagent.updated" && late.subagent.parentNodeId,
+          first.subagent.parentNodeId,
+        );
+        const nested = yield* takeEvent(
+          (event) => event.type === "subagent.updated" && event.subagent.title === "nested",
+        );
+        assert.equal(
+          nested.type === "subagent.updated" && nested.subagent.threadId,
+          first.subagent.childThreadId,
+        );
+        assert.equal(
+          nested.type === "subagent.updated" && nested.subagent.runId,
+          first.subagent.runId,
+        );
+        const item = yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "subagent" &&
+            event.turnItem.title === "nested",
+        );
+        assert.equal(
+          item.type === "turn_item.updated" && item.turnItem.threadId,
+          first.subagent.childThreadId,
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("does not bind an unknown native run from a status or control receipt", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "unknown-query",
+        toolName: "subagent",
+        args: { action: "status", id: "unknown" },
+      });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "unknown-query",
+        toolName: "subagent",
+        result: {
+          details: {
+            runId: "unknown",
+            results: [{ index: 0, agent: "old", task: "old task", finished: false }],
+          },
+        },
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "notify",
+        message: "query consumed",
+      });
+      const observed: ProviderAdapter.ProviderAdapterV2Event[] = [];
+      yield* takeEvent((event) => {
+        observed.push(event);
+        return (
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "system_notice" &&
+          event.turnItem.message === "query consumed"
+        );
+      });
+      assert.isFalse(observed.some((event) => event.type === "subagent.updated"));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("does not replay unchanged terminal snapshots as provider activity", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "launch",
+        toolName: "subagent",
+        args: { agent: "worker", task: "work" },
+      });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "launch",
+        toolName: "subagent",
+        result: {
+          details: {
+            runId: "retained",
+            results: [{ index: 0, agent: "worker", task: "work", finished: true, exitCode: 0 }],
+          },
+        },
+      });
+      yield* takeEvent(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "user_message",
+      );
+      const snapshot = {
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "t3-subagents",
+        widgetLines: [
+          "PI_SUBAGENT_ASYNC_JSON:" +
+            JSON.stringify({
+              kind: "pi-subagents.async-status-snapshot",
+              version: 1,
+              generatedAt: 10,
+              runs: [
+                {
+                  id: "retained",
+                  kind: "subagent",
+                  children: [
+                    {
+                      id: "step:0",
+                      kind: "step",
+                      agent: "worker",
+                      state: "complete",
+                      startedAt: 1,
+                      updatedAt: 1,
+                    },
+                  ],
+                },
+              ],
+            }),
+        ],
+      };
+      yield* fake.emit(snapshot);
+      yield* takeEvent((event) => event.type === "subagent.updated");
+      yield* fake.emit({
+        ...snapshot,
+        widgetLines: snapshot.widgetLines.map((line) =>
+          line.replace('"generatedAt":10', '"generatedAt":20'),
+        ),
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "notify",
+        message: "replay consumed",
+      });
+      const replay: ProviderAdapter.ProviderAdapterV2Event[] = [];
+      yield* takeEvent((event) => {
+        replay.push(event);
+        return (
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "system_notice" &&
+          event.turnItem.message === "replay consumed"
+        );
+      });
+      assert.isFalse(replay.some((event) => event.type === "subagent.updated"));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([
+    { status: "completed", completion: "ack" },
+    { status: "failed", completion: "ack" },
+    { status: "completed", completion: "deadline" },
+  ] as const)(
+    "settles unfinished terminal capture on observer loss without changing known status, %j",
+    ({ status, completion }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const blocked = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const { runtime, takeEvent, observed, streamDone, streamFailures } = yield* openRuntime(
+          fake,
+          "default",
+          THREAD_ID,
+          SESSION_ID,
+          undefined,
+          undefined,
+          (event) =>
+            completion === "deadline" &&
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            /observer.*lost/i.test(event.turnItem.message)
+              ? Deferred.succeed(blocked, undefined).pipe(Effect.andThen(Deferred.await(release)))
+              : Effect.void,
+        );
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolName: "subagent",
+          toolCallId: "launch",
+          args: { agent: "worker", task: "work", async: true },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolName: "subagent",
+          toolCallId: "launch",
+          result: {
+            details: {
+              asyncId: "owned",
+              results: [{ index: 0, agent: "worker", task: "work", finished: false }],
+            },
+          },
+        });
+        const child = yield* takeEvent((event) => event.type === "subagent.updated");
+        if (child.type !== "subagent.updated" || child.subagent.runId === null)
+          return yield* Effect.die("Expected owned child");
+        const runId = child.subagent.runId;
+        const snapshot = (state: string, updatedAt: number) =>
+          emitNativeSnapshot(fake, [
+            {
+              id: "owned",
+              kind: "subagent",
+              state,
+              children: [
+                {
+                  id: "step:0",
+                  kind: "step",
+                  agent: "worker",
+                  state,
+                  startedAt: 1,
+                  updatedAt,
+                },
+              ],
+            },
+          ]);
+        yield* snapshot("running", 1);
+        const inspect = yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "subagent-inspect",
+          widgetLines: [
+            "PI_SUBAGENT_INSPECT_JSON:" +
+              JSON.stringify({
+                kind: "pi-subagents.inspect-reply",
+                version: 1,
+                requestId: String(inspect.message).split(" ")[1],
+                asyncId: "owned",
+                childId: "step:0",
+                messages: [
+                  { role: "assistant", kind: "toolCall", name: "read", text: "read a.ts" },
+                ],
+              }),
+          ],
+        });
+        yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "dynamic_tool" &&
+            event.turnItem.status === "idle",
+        );
+        const oldFence = yield* takeEvent((event) => event.type === "node.updated");
+        yield* runtime.acknowledgeEvent!(oldFence, runId);
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+        yield* fake.emit({
+          type: "auto_retry_end",
+          success: false,
+          attempt: 3,
+          finalError: "model unavailable",
+        });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        yield* snapshot(status === "completed" ? "complete" : "failed", 2);
+        yield* takeEvent(
+          (event) => event.type === "subagent.updated" && event.subagent.status === status,
+        );
+        const unfinished = yield* fake.takeRequest("prompt");
+        assert.equal(String(unfinished.message).split(" ")[0], "/subagents-inspect-rpc");
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+        yield* fake.closeStdout;
+        if (completion === "deadline") {
+          const reached = yield* Effect.raceFirst(
+            Deferred.await(blocked).pipe(Effect.as(true)),
+            Deferred.await(streamDone).pipe(Effect.as(false)),
+          );
+          assert.isTrue(
+            reached,
+            "Terminal capture must enqueue unavailable cleanup before stream failure",
+          );
+          yield* TestClock.adjust("5 seconds");
+          yield* Deferred.succeed(release, undefined);
+        }
+        const cleanup = yield* Effect.raceFirst(
+          takeEvent(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              /observer.*lost/i.test(event.turnItem.message),
+          ).pipe(Effect.as(true)),
+          Deferred.await(streamDone).pipe(Effect.as(false)),
+        );
+        assert.isTrue(
+          cleanup,
+          "A terminal child's unfinished capture must report observer loss before stream failure",
+        );
+        const fence = yield* takeEvent(
+          (event) => event.type === "node.updated" && event.node.status === status,
+        );
+        yield* runtime.acknowledgeEvent!(fence, RunId.make("foreign"));
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(runId));
+        if (completion === "ack") yield* runtime.acknowledgeEvent!(fence, runId);
+        yield* Deferred.await(streamDone);
+        yield* TestClock.adjust("5 seconds");
+        assert.equal(streamFailures.length, 1);
+        assert.isFalse(
+          observed.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.threadId === child.subagent.childThreadId &&
+              event.turnItem.type === "dynamic_tool" &&
+              event.turnItem.status === "running",
+          ),
+        );
+        assert.equal(observed.filter((event) => event.type === "turn.terminal").length, 1);
+        assert.isTrue(
+          observed.some((event) => event.type === "turn.terminal" && event.status === "failed"),
+        );
+        assert.equal(
+          observed
+            .flatMap((event) => (event.type === "subagent.updated" ? [event.subagent.status] : []))
+            .at(-1),
+          status,
+        );
+        assert.equal(
+          observed
+            .flatMap((event) =>
+              event.type === "turn_item.updated" && event.turnItem.type === "subagent"
+                ? [event.turnItem.status]
+                : [],
+            )
+            .at(-1),
+          status,
+        );
+        assert.isTrue(
+          observed.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              /outcome is unknown/.test(event.turnItem.message),
+          ),
+        );
+        assert.isTrue(
+          observed.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              /observer.*lost/i.test(event.turnItem.message),
+          ),
+        );
+        assert.equal(
+          yield* runtime.hasPendingEventDeliveryForRun!(runId),
+          completion === "deadline",
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["ack", "deadline"] as const)(
+    "persists observation-loss cleanup after reusable principal failure, %s",
+    (completion) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const blocked = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const { runtime, takeEvent, streamDone, observed, streamFailures } = yield* openRuntime(
+          fake,
+          "default",
+          THREAD_ID,
+          SESSION_ID,
+          undefined,
+          undefined,
+          (event) =>
+            completion === "deadline" &&
+            event.type === "subagent.updated" &&
+            event.subagent.status === "interrupted"
+              ? Deferred.succeed(blocked, undefined).pipe(Effect.andThen(Deferred.await(release)))
+              : Effect.void,
+        );
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "launch",
+          toolName: "subagent",
+          args: {
+            parallel: [
+              { agent: "worker", task: "work" },
+              { agent: "second", task: "work" },
+            ],
+            async: true,
+          },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "launch",
+          toolName: "subagent",
+          result: {
+            details: {
+              asyncId: "owned",
+              results: [
+                { index: 0, agent: "worker", task: "work", finished: false },
+                { index: 1, agent: "second", task: "work", finished: false },
+              ],
+            },
+          },
+        });
+        const child = yield* takeEvent((event) => event.type === "subagent.updated");
+        assert.isTrue(child.type === "subagent.updated");
+        if (child.type !== "subagent.updated") return;
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "t3-subagents",
+          widgetLines: [
+            "PI_SUBAGENT_ASYNC_JSON:" +
+              JSON.stringify({
+                kind: "pi-subagents.async-status-snapshot",
+                version: 1,
+                runs: [
+                  {
+                    id: "owned",
+                    kind: "subagent",
+                    state: "running",
+                    children: [
+                      {
+                        id: "step:0",
+                        kind: "step",
+                        agent: "worker",
+                        state: "running",
+                        startedAt: 1,
+                        updatedAt: 2,
+                      },
+                    ],
+                  },
+                ],
+              }),
+          ],
+        });
+        const inspect = yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "subagent-inspect",
+          widgetLines: [
+            "PI_SUBAGENT_INSPECT_JSON:" +
+              JSON.stringify({
+                kind: "pi-subagents.inspect-reply",
+                version: 1,
+                requestId: String(inspect.message).split(" ")[1],
+                asyncId: "owned",
+                childId: "step:0",
+                messages: [
+                  { role: "assistant", kind: "toolCall", name: "read", text: "read a.ts" },
+                ],
+              }),
+          ],
+        });
+        yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "dynamic_tool" &&
+            event.turnItem.status === "idle",
+        );
+        const captureFence = yield* takeEvent((event) => event.type === "node.updated");
+        yield* fake.emit({
+          type: "auto_retry_end",
+          success: false,
+          attempt: 3,
+          finalError: "model unavailable",
+        });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        yield* fake.closeStdout;
+        if (completion === "deadline") {
+          const waiting = yield* Effect.raceFirst(
+            Deferred.await(blocked).pipe(Effect.as(true)),
+            Deferred.await(streamDone).pipe(Effect.as(false)),
+          );
+          assert.isTrue(waiting, "Cleanup must reach the blocked consumer before stream failure");
+          assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(child.subagent.runId!));
+          yield* TestClock.adjust("5 seconds");
+          yield* Deferred.succeed(release, undefined);
+        }
+        const cleanup = yield* Effect.raceFirst(
+          takeEvent(
+            (event) => event.type === "node.updated" && event.node.status === "interrupted",
+          ).pipe(Effect.map((event) => ({ event }))),
+          Deferred.await(streamDone).pipe(Effect.as({ event: undefined })),
+        );
+        assert.isDefined(
+          cleanup.event,
+          "Observer loss must enqueue cleanup before failing the stream",
+        );
+        if (cleanup.event === undefined) return;
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(child.subagent.runId!));
+        yield* runtime.acknowledgeEvent!(cleanup.event, RunId.make("foreign"));
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(child.subagent.runId!));
+        if (completion === "ack") {
+          yield* runtime.acknowledgeEvent!(cleanup.event, child.subagent.runId!);
+          yield* runtime.acknowledgeEvent!(cleanup.event, child.subagent.runId!);
+          assert.isTrue(
+            yield* runtime.hasPendingEventDeliveryForRun!(child.subagent.runId!),
+            "The second original-run cleanup obligation is enrolled before the first inactive child",
+          );
+        }
+        const secondFence = yield* takeEvent(
+          (event) => event.type === "node.updated" && event.node.status === "interrupted",
+        );
+        if (completion === "ack") {
+          yield* runtime.acknowledgeEvent!(secondFence, child.subagent.runId!);
+          assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(child.subagent.runId!));
+          yield* runtime.acknowledgeEvent!(captureFence, child.subagent.runId!);
+        }
+        yield* Deferred.await(streamDone);
+        assert.equal(streamFailures.length, 1);
+        const principalTerminals = observed.filter((event) => event.type === "turn.terminal");
+        assert.equal(principalTerminals.length, 1);
+        assert.equal(principalTerminals[0]!.status, "failed");
+        assert.isTrue(
+          observed.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "dynamic_tool" &&
+              event.turnItem.status === "idle",
+          ),
+        );
+        assert.isTrue(
+          observed.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              /outcome is unknown/.test(event.turnItem.message),
+          ),
+        );
+        assert.isTrue(
+          observed.some(
+            (event) => event.type === "subagent.updated" && event.subagent.status === "interrupted",
+          ),
+        );
+        assert.isTrue(
+          observed.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "subagent" &&
+              event.turnItem.status === "interrupted",
+          ),
+        );
+        assert.isTrue(
+          observed.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              /observer.*lost/i.test(event.turnItem.message),
+          ),
+        );
+        assert.equal(
+          yield* runtime.hasPendingEventDeliveryForRun!(child.subagent.runId!),
+          completion === "deadline",
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["failure", "abort", "transport"] as const)(
+    "continues native children only across reusable principal failure, %s",
+    (ending) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "launch",
+          toolName: "subagent",
+          args: { agent: "worker", task: "work" },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "launch",
+          toolName: "subagent",
+          result: {
+            details: {
+              runId: "detached",
+              results: [{ index: 0, agent: "worker", task: "work", finished: false }],
+            },
+          },
+        });
+        yield* takeEvent((event) => event.type === "subagent.updated");
+        if (ending === "transport") yield* fake.closeStdout;
+        else {
+          if (ending === "failure")
+            yield* fake.emit({
+              type: "auto_retry_end",
+              success: false,
+              attempt: 3,
+              finalError: "model unavailable",
+            });
+          yield* fake.emit({ type: "agent_settled", aborted: ending === "abort" });
+        }
+        const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.isTrue(terminal.type === "turn.terminal");
+        if (terminal.type !== "turn.terminal") return;
+        assert.equal(
+          terminal.status === "failed" && terminal.childTurnsContinue === true,
+          ending === "failure",
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["stock-first", "bridge-first"] as const)(
+    "reconciles grouped/root native worker identities in either source order, %s",
+    (order) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped();
+        const parentDir = `${dir}/workflow`;
+        const childDir = `${dir}/child`;
+        const secondDir = `${dir}/second`;
+        yield* fs.makeDirectory(parentDir);
+        yield* fs.makeDirectory(childDir);
+        yield* fs.makeDirectory(secondDir);
+        yield* fs.writeFileString(
+          `${parentDir}/status.json`,
+          JSON.stringify({
+            lifecycleArtifactVersion: 3,
+            runId: "W",
+            mode: "workflow",
+            steps: [
+              { workflowKey: "lane", runId: "C" },
+              { workflowKey: "other", runId: "D" },
+            ],
+          }),
+        );
+        yield* fs.writeFileString(
+          `${childDir}/status.json`,
+          JSON.stringify({
+            lifecycleArtifactVersion: 3,
+            runId: "C",
+            mode: "single",
+            parentWorkflowRunId: "W",
+            workflowKey: "lane",
+            steps: [{ index: 0 }],
+          }),
+        );
+        yield* fs.writeFileString(
+          `${secondDir}/status.json`,
+          JSON.stringify({
+            lifecycleArtifactVersion: 3,
+            runId: "D",
+            mode: "single",
+            parentWorkflowRunId: "W",
+            workflowKey: "other",
+            steps: [{ index: 0 }],
+          }),
+        );
+        const fake = yield* makeFakePi;
+        const opened = yield* openRuntime(fake);
+        const { runtime } = opened;
+        const events: ProviderAdapter.ProviderAdapterV2Event[] = [];
+        const take = (predicate: (event: ProviderAdapter.ProviderAdapterV2Event) => boolean) =>
+          opened.takeEvent((event) => {
+            events.push(event);
+            return predicate(event);
+          });
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolName: "subagent",
+          toolCallId: "launch-W",
+          args: { workflow: "work" },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolName: "subagent",
+          toolCallId: "launch-W",
+          result: { details: { mode: "workflow", asyncId: "W", asyncDir: parentDir, results: [] } },
+        });
+        const hints = [
+          {
+            runId: "W",
+            childId: "lane",
+            childRunId: "C",
+            workflowKey: "lane",
+            asyncDir: parentDir,
+          },
+          { runId: "C", asyncDir: childDir, workflowKey: "lane" },
+          { runId: "D", asyncDir: secondDir, workflowKey: "other" },
+        ];
+        const grouped = (state: string, updatedAt: number) => [
+          {
+            id: "W",
+            kind: "workflow",
+            state: state === "running" ? "running" : "complete",
+            children: ["lane", "other"].map((id) => ({
+              id,
+              kind: "step",
+              agent: "worker",
+              state,
+              startedAt: 1,
+              updatedAt,
+            })),
+          },
+        ];
+        const snapshot = (runs: unknown[], bridge: boolean) =>
+          fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: bridge ? "t3-subagents" : "subagent-async",
+            widgetLines: [
+              "PI_SUBAGENT_ASYNC_JSON:" +
+                JSON.stringify({
+                  kind: "pi-subagents.async-status-snapshot",
+                  version: 1,
+                  runs,
+                  ...(bridge ? { lifecycleHints: hints } : {}),
+                }),
+            ],
+          });
+        const answer = (request: PiRpcRecord, text: string) => {
+          const [, requestId, asyncId, childId] = String(request.message).split(" ");
+          return fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "subagent-inspect",
+            widgetLines: [
+              "PI_SUBAGENT_INSPECT_JSON:" +
+                JSON.stringify({
+                  kind: "pi-subagents.inspect-reply",
+                  version: 1,
+                  requestId,
+                  asyncId,
+                  childId,
+                  messages: [{ role: "assistant", kind: "text", text }],
+                }),
+            ],
+          });
+        };
+        const captureTargets: { targets: string[]; actualTarget: boolean }[] = [];
+        const captureFences: ProviderAdapter.ProviderAdapterV2Event[] = [];
+        const capture = Effect.fnUntraced(function* (label: string, actualTarget: boolean) {
+          const targets = new Set<string>();
+          for (let index = 0; index < 2; index++) {
+            const request = yield* fake.takeRequest("prompt");
+            targets.add(String(request.message).split(" ").slice(2, 4).join(" "));
+            yield* answer(request, `${label} ${index}`);
+            yield* take(
+              (event) =>
+                event.type === "message.updated" && event.message.text === `${label} ${index}`,
+            );
+            captureFences.push(yield* take((event) => event.type === "node.updated"));
+          }
+          captureTargets.push({ targets: [...targets].sort(), actualTarget });
+        });
+        yield* snapshot(grouped("running", 1), order === "bridge-first");
+        const original = yield* take((event) => event.type === "subagent.updated");
+        if (original.type !== "subagent.updated") return yield* Effect.die("Expected child");
+        yield* capture("first capture", order === "bridge-first");
+        yield* snapshot(grouped("running", 1), order !== "bridge-first");
+        if (order !== "bridge-first") yield* capture("correlated capture", true);
+        yield* fake.emit({ type: "agent_settled" });
+        yield* take((event) => event.type === "turn.terminal");
+        yield* startTurn(runtime, providerThread, "default", [], "Successor", undefined, 2);
+        yield* fake.takeRequest("prompt");
+        yield* snapshot(
+          [
+            { id: "W", kind: "workflow", state: "complete" },
+            ...["C", "D"].map((id) => ({
+              id,
+              kind: "subagent",
+              state: "running",
+              children: [
+                {
+                  id: "step:0",
+                  kind: "step",
+                  agent: "worker",
+                  state: "running",
+                  startedAt: 1,
+                  updatedAt: 2,
+                },
+              ],
+            })),
+          ],
+          false,
+        );
+        yield* capture("promoted capture", true);
+        const originalRunId = original.subagent.runId;
+        if (originalRunId === null) return yield* Effect.die("Expected original run");
+        for (const fence of captureFences) yield* runtime.acknowledgeEvent!(fence, originalRunId);
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(originalRunId));
+        yield* snapshot(
+          [
+            { id: "W", kind: "workflow", state: "complete" },
+            {
+              id: "C",
+              kind: "subagent",
+              state: "running",
+              children: [
+                {
+                  id: "step:0",
+                  kind: "step",
+                  agent: "worker",
+                  state: "running",
+                  startedAt: 1,
+                  updatedAt: 2,
+                  children: [
+                    {
+                      id: "N",
+                      kind: "subagent",
+                      state: "running",
+                      children: [
+                        {
+                          id: "step:0",
+                          kind: "step",
+                          agent: "descendant",
+                          state: "running",
+                          startedAt: 2,
+                          updatedAt: 2,
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+          false,
+        );
+        const descendant = yield* take(
+          (event) => event.type === "subagent.updated" && event.subagent.title === "descendant",
+        );
+        if (descendant.type !== "subagent.updated") return yield* Effect.die("Expected descendant");
+        assert.equal(descendant.subagent.runId, originalRunId);
+        assert.equal(descendant.subagent.threadId, original.subagent.childThreadId);
+        assert.equal(descendant.subagent.parentNodeId, original.subagent.id);
+        const descendantThread = yield* take(
+          (event) =>
+            event.type === "app_thread.created" &&
+            event.appThread.id === descendant.subagent.childThreadId,
+        );
+        assert.equal(
+          descendantThread.type === "app_thread.created" &&
+            descendantThread.appThread.lineage.parentThreadId,
+          original.subagent.childThreadId,
+        );
+        const descendantCard = yield* take(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "subagent" &&
+            event.turnItem.subagentId === descendant.subagent.id,
+        );
+        assert.equal(
+          descendantCard.type === "turn_item.updated" && descendantCard.turnItem.threadId,
+          original.subagent.childThreadId,
+        );
+        assert.equal(
+          descendantCard.type === "turn_item.updated" && descendantCard.turnItem.runId,
+          originalRunId,
+        );
+        const descendantRequest = yield* fake.takeRequest("prompt");
+        assert.include(String(descendantRequest.message), " N step:0 --lines 100");
+        yield* answer(descendantRequest, "descendant capture");
+        yield* take(
+          (event) =>
+            event.type === "message.updated" && event.message.text === "descendant capture",
+        );
+        const descendantFence = yield* take(
+          (event) =>
+            event.type === "node.updated" &&
+            event.node.threadId === descendant.subagent.childThreadId,
+        );
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(originalRunId));
+        assert.isFalse(
+          yield* runtime.hasPendingEventDeliveryForRun!(RunId.make(`run:${THREAD_ID}:2`)),
+        );
+        yield* runtime.acknowledgeEvent!(descendantFence, originalRunId);
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(originalRunId));
+        yield* snapshot(grouped("complete", 3), true);
+        yield* capture("terminal capture", true);
+        const children = events.flatMap((event) =>
+          event.type === "subagent.updated" ? [event.subagent] : [],
+        );
+        assert.equal(new Set(children.map((child) => child.id)).size, 3);
+        assert.equal(new Set(children.map((child) => child.childThreadId)).size, 3);
+        assert.isTrue(children.every((child) => child.runId === originalRunId));
+        assert.isTrue(
+          children
+            .filter((child) => child.id !== descendant.subagent.id)
+            .every((child) => child.parentNodeId === original.subagent.parentNodeId),
+        );
+        assert.equal(events.filter((event) => event.type === "app_thread.created").length, 3);
+        for (const id of new Set(
+          children.filter((child) => child.id !== descendant.subagent.id).map((child) => child.id),
+        ))
+          assert.equal(children.filter((child) => child.id === id).at(-1)?.status, "completed");
+        for (const { targets, actualTarget } of captureTargets)
+          assert.deepEqual(
+            targets,
+            actualTarget ? ["C step:0", "D step:0"] : ["W lane", "W other"],
+          );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([
+    "missing",
+    "partial",
+    "version",
+    "id",
+    "parent",
+    "key",
+    "step",
+    "mode",
+    "owner",
+    "hint",
+  ] as const)(
+    "quarantines ambiguous promotion without stealing the original owner: %s",
+    (invalid) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped();
+        const parentDir = `${dir}/W`;
+        const childDir = `${dir}/C`;
+        yield* fs.makeDirectory(parentDir);
+        yield* fs.makeDirectory(childDir);
+        yield* fs.writeFileString(
+          `${parentDir}/status.json`,
+          JSON.stringify({
+            lifecycleArtifactVersion: 3,
+            runId: "W",
+            mode: "workflow",
+            steps: [{ workflowKey: "lane", runId: invalid === "step" ? "not-C" : "C" }],
+          }),
+        );
+        if (invalid !== "missing")
+          yield* fs.writeFileString(
+            `${childDir}/status.json`,
+            invalid === "partial"
+              ? "{"
+              : JSON.stringify({
+                  lifecycleArtifactVersion: invalid === "version" ? 999 : 3,
+                  runId: invalid === "id" ? "not-C" : "C",
+                  mode: invalid === "mode" ? "chain" : "single",
+                  parentWorkflowRunId: invalid === "parent" ? "not-W" : "W",
+                  workflowKey: invalid === "key" ? "not-lane" : "lane",
+                  steps: [{ index: 0 }],
+                }),
+          );
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        if (invalid === "owner") {
+          yield* fake.emit({
+            type: "tool_execution_start",
+            toolName: "subagent",
+            toolCallId: "original-C",
+            args: { agent: "worker", task: "separate launch" },
+          });
+          yield* fake.emit({
+            type: "tool_execution_update",
+            toolName: "subagent",
+            toolCallId: "original-C",
+            partialResult: {
+              details: {
+                runId: "C",
+                results: [{ index: 0, agent: "worker", task: "separate launch", finished: false }],
+              },
+            },
+          });
+          yield* takeEvent((event) => event.type === "subagent.updated");
+        }
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolName: "subagent",
+          toolCallId: "launch-W",
+          args: {
+            workflowScript: 'await runs.run("lane", { agent: "worker", task: "work" })',
+            async: true,
+          },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolName: "subagent",
+          toolCallId: "launch-W",
+          result: { details: { asyncId: "W", asyncDir: parentDir, results: [] } },
+        });
+        const snapshot = (promoted: boolean) =>
+          fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "t3-subagents",
+            widgetLines: [
+              "PI_SUBAGENT_ASYNC_JSON:" +
+                JSON.stringify({
+                  kind: "pi-subagents.async-status-snapshot",
+                  version: 1,
+                  lifecycleHints: [
+                    {
+                      runId: "W",
+                      childId: "lane",
+                      workflowKey: "lane",
+                      childRunId: "C",
+                      asyncDir: parentDir,
+                    },
+                    ...(invalid === "hint" ? [] : [{ runId: "C", asyncDir: childDir }]),
+                  ],
+                  runs: promoted
+                    ? [
+                        { id: "W", kind: "workflow", state: "complete" },
+                        {
+                          id: "C",
+                          kind: "subagent",
+                          state: "running",
+                          children: [
+                            {
+                              id: "step:0",
+                              kind: "step",
+                              state: "running",
+                              agent: "worker",
+                              startedAt: 1,
+                              updatedAt: 1,
+                            },
+                          ],
+                        },
+                      ]
+                    : [
+                        {
+                          id: "W",
+                          kind: "workflow",
+                          state: "running",
+                          children: [
+                            {
+                              id: "lane",
+                              kind: "step",
+                              state: "running",
+                              agent: "worker",
+                              startedAt: 1,
+                              updatedAt: 1,
+                            },
+                          ],
+                        },
+                      ],
+                }),
+            ],
+          });
+        yield* snapshot(false);
+        const original = yield* takeEvent((event) => event.type === "subagent.updated");
+        if (original.type !== "subagent.updated")
+          return yield* Effect.die("Expected workflow lane");
+        const inspection = yield* fake.takeRequest("prompt");
+        assert.include(String(inspection.message), " W lane --lines 100");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "subagent-inspect",
+          widgetLines: [
+            "PI_SUBAGENT_INSPECT_JSON:" +
+              JSON.stringify({
+                kind: "pi-subagents.inspect-reply",
+                version: 1,
+                requestId: String(inspection.message).split(" ")[1],
+                asyncId: "W",
+                childId: "lane",
+                error: { code: "unavailable", message: "no transcript" },
+              }),
+          ],
+        });
+        yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message === "no transcript",
+        );
+        yield* takeEvent((event) => event.type === "node.updated");
+        yield* snapshot(true);
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "notify",
+          message: "ambiguous consumed",
+        });
+        const later: ProviderAdapter.ProviderAdapterV2Event[] = [];
+        yield* takeEvent((event) => {
+          later.push(event);
+          return (
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message === "ambiguous consumed"
+          );
+        });
+        assert.isFalse(later.some((event) => event.type === "app_thread.created"));
+        assert.isFalse(
+          later.some(
+            (event) =>
+              event.type === "subagent.updated" &&
+              event.subagent.id === original.subagent.id &&
+              event.subagent.status !== "running",
+          ),
+        );
+        if (invalid === "owner")
+          assert.isFalse(
+            later.some(
+              (event) =>
+                event.type === "subagent.updated" &&
+                event.subagent.parentNodeId === original.subagent.parentNodeId,
+            ),
+          );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "projects foreground-only descendants into original-owner child conversations without async duplicates",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolName: "subagent",
+          toolCallId: "nested",
+          args: { agent: "parent", task: "delegate", async: false },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolName: "subagent",
+          toolCallId: "nested",
+          result: {
+            details: {
+              mode: "single",
+              runId: "foreground",
+              results: [
+                {
+                  agent: "parent",
+                  task: "delegate",
+                  exitCode: 0,
+                  children: [
+                    {
+                      id: "child",
+                      parentRunId: "foreground",
+                      parentStepIndex: 0,
+                      state: "complete",
+                      steps: [
+                        {
+                          agent: "worker",
+                          status: "complete",
+                          startedAt: 1,
+                          children: [
+                            {
+                              id: "grandchild",
+                              parentRunId: "child",
+                              parentStepIndex: 0,
+                              state: "complete",
+                              steps: [{ agent: "reviewer", status: "complete", startedAt: 2 }],
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        });
+        yield* nativeEventBarrier(fake, takeEvent);
+        const children = observed.flatMap((event) =>
+          event.type === "subagent.updated" ? [event.subagent] : [],
+        );
+        assert.equal(children.length, 3);
+        const [parent, child, grandchild] = children;
+        assert.equal(child!.parentNodeId, parent!.id);
+        assert.equal(grandchild!.parentNodeId, child!.id);
+        assert.equal(child!.runId, RunId.make(`run:${THREAD_ID}:1`));
+        assert.equal(grandchild!.runId, parent!.runId);
+        for (const [nested, owner] of [
+          [child!, parent!],
+          [grandchild!, child!],
+        ]) {
+          const chat = observed.find(
+            (event) =>
+              event.type === "app_thread.created" && event.appThread.id === nested!.childThreadId,
+          );
+          assert.equal(
+            chat?.type === "app_thread.created" && chat.appThread.lineage.parentThreadId,
+            owner!.childThreadId,
+          );
+        }
+        yield* emitNativeSnapshot(fake, [
+          {
+            id: "foreground",
+            kind: "subagent",
+            state: "complete",
+            children: [
+              {
+                id: "step:0",
+                kind: "step",
+                agent: "parent",
+                state: "complete",
+                startedAt: 1,
+                children: [
+                  {
+                    id: "child",
+                    kind: "subagent",
+                    state: "complete",
+                    children: [
+                      {
+                        id: "step:0",
+                        kind: "step",
+                        agent: "worker",
+                        state: "complete",
+                        startedAt: 1,
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ]);
+        yield* nativeEventBarrier(fake, takeEvent);
+        assert.equal(observed.filter((event) => event.type === "app_thread.created").length, 3);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("preserves known raw foreground tool-result outcomes after native interruption", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolName: "subagent",
+        toolCallId: "interrupted",
+        args: { agent: "worker", task: "inspect", async: false },
+      });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolName: "subagent",
+        toolCallId: "interrupted",
+        result: {
+          details: {
+            mode: "single",
+            results: [
+              {
+                agent: "worker",
+                task: "inspect",
+                interrupted: true,
+                exitCode: 0,
+                progress: { status: "running" },
+                messages: [
+                  {
+                    role: "toolResult",
+                    toolCallId: "historical-error",
+                    toolName: "bash",
+                    isError: true,
+                    content: [{ type: "text", text: "command failed" }],
+                  },
+                  {
+                    role: "toolResult",
+                    toolCallId: "historical-ok",
+                    toolName: "read",
+                    isError: false,
+                    content: [{ type: "text", text: "file contents" }],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      });
+      yield* nativeEventBarrier(fake, takeEvent);
+      const child = observed.find((event) => event.type === "subagent.updated");
+      if (child?.type !== "subagent.updated") return yield* Effect.die("Expected child");
+      assert.equal(child.subagent.status, "idle");
+      assert.isTrue(
+        observed.some(
+          (event) =>
+            event.type === "node.updated" &&
+            event.node.threadId === child.subagent.childThreadId &&
+            event.node.runId === null &&
+            event.node.status === "idle",
+        ),
+      );
+      assert.isFalse(
+        observed.some(
+          (event) => event.type === "subagent.updated" && event.subagent.status === "completed",
+        ),
+      );
+      const tools = observed.flatMap((event) =>
+        event.type === "turn_item.updated" &&
+        event.turnItem.threadId === child.subagent.childThreadId &&
+        event.turnItem.type === "dynamic_tool"
+          ? [event.turnItem]
+          : [],
+      );
+      assert.deepEqual(
+        tools.map((item) => [item.toolName, item.status, item.output, item.input]),
+        [
+          ["bash", "failed", "command failed", null],
+          ["read", "completed", "file contents", null],
+        ],
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("projects compact foreground tool summaries without inventing tool results", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      const row = {
+        agent: "scout",
+        task: "inspect",
+        finished: false,
+        toolCalls: [{ text: "read a.ts", expandedText: "read a.ts (1-20)" }],
+      };
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolName: "subagent",
+        toolCallId: "compact",
+        args: { agent: "scout", task: "inspect" },
+      });
+      yield* fake.emit({
+        type: "tool_execution_update",
+        toolName: "subagent",
+        toolCallId: "compact",
+        partialResult: { details: { mode: "single", results: [row], progress: [row] } },
+      });
+      const child = yield* takeEvent((event) => event.type === "subagent.updated");
+      if (child.type !== "subagent.updated") return yield* Effect.die("Expected child");
+      const observed: ProviderAdapter.ProviderAdapterV2Event[] = [];
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolName: "subagent",
+        toolCallId: "compact",
+        result: {
+          details: {
+            mode: "single",
+            results: [
+              {
+                ...row,
+                finished: true,
+                exitCode: 0,
+                toolCalls: [...row.toolCalls, { text: "$ pwd", expandedText: "$ pwd" }],
+              },
+            ],
+          },
+        },
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "notify",
+        message: "compact consumed",
+      });
+      yield* takeEvent((event) => {
+        observed.push(event);
+        return (
+          event.type === "turn_item.updated" &&
+          event.turnItem.type === "system_notice" &&
+          event.turnItem.message === "compact consumed"
+        );
+      });
+      const summaries = observed.flatMap((event) =>
+        event.type === "turn_item.updated" &&
+        event.turnItem.threadId === child.subagent.childThreadId &&
+        event.turnItem.type === "system_notice"
+          ? [event.turnItem.message]
+          : [],
+      );
+      assert.isTrue(summaries.some((text) => text.includes("read a.ts (1-20)")));
+      assert.isTrue(summaries.some((text) => text.includes("$ pwd")));
+      assert.isFalse(
+        observed.some(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.threadId === child.subagent.childThreadId &&
+            event.turnItem.type === "dynamic_tool",
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["failed", "paused", "partial", "complete"] as const)(
+    "retains unknown historical tool outcomes on %s and permits paused resume",
+    (state) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* emitAsyncLaunchReceipt(fake, "missed-result");
+        const snapshot = (state: string, updatedAt: number) =>
+          emitNativeSnapshot(fake, [
+            {
+              id: "missed-result",
+              kind: "subagent",
+              children: [
+                {
+                  id: "step:0",
+                  kind: "step",
+                  agent: "worker",
+                  startedAt: 1,
+                  state,
+                  updatedAt,
+                  ...(state === "partial" ? { endedAt: updatedAt } : {}),
+                },
+              ],
+            },
+          ]);
+        const reply = (request: PiRpcRecord, data: object) =>
+          fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "subagent-inspect",
+            widgetLines: [
+              "PI_SUBAGENT_INSPECT_JSON:" +
+                JSON.stringify({
+                  kind: "pi-subagents.inspect-reply",
+                  version: 1,
+                  requestId: String(request.message).split(" ")[1],
+                  asyncId: "missed-result",
+                  childId: "step:0",
+                  ...data,
+                }),
+            ],
+          });
+        yield* snapshot("running", 1);
+        const child = yield* takeEvent((event) => event.type === "subagent.updated");
+        if (child.type !== "subagent.updated") return yield* Effect.die("Expected child");
+        yield* reply(yield* fake.takeRequest("prompt"), {
+          messages: [
+            {
+              role: "assistant",
+              kind: "toolCall",
+              name: "read",
+              text: "read before omitted result",
+            },
+          ],
+        });
+        const call = yield* takeEvent(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool",
+        );
+        if (call.type !== "turn_item.updated") return yield* Effect.die("Expected call");
+        yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            /outcome.*unknown/i.test(event.turnItem.message),
+        );
+        const firstFence = yield* takeEvent(
+          (event) =>
+            event.type === "node.updated" && event.node.threadId === child.subagent.childThreadId,
+        );
+        const originalRunId = child.subagent.runId;
+        if (originalRunId === null) return yield* Effect.die("Expected owning run");
+        yield* runtime.acknowledgeEvent!(firstFence, originalRunId);
+        if (state === "complete") {
+          yield* snapshot("running", 2);
+          yield* reply(yield* fake.takeRequest("prompt"), {
+            messages: [
+              { role: "assistant", kind: "text", text: "new activity with unchanged tool name" },
+            ],
+          });
+          yield* takeEvent(
+            (event) =>
+              event.type === "message.updated" &&
+              event.message.text === "new activity with unchanged tool name",
+          );
+          const interimFence = yield* takeEvent(
+            (event) =>
+              event.type === "node.updated" && event.node.threadId === child.subagent.childThreadId,
+          );
+          yield* runtime.acknowledgeEvent!(interimFence, originalRunId);
+        }
+        yield* snapshot(state, 3);
+        yield* reply(
+          yield* fake.takeRequest("prompt"),
+          state === "complete"
+            ? { messages: [{ role: "assistant", kind: "text", text: "bounded final output" }] }
+            : { error: { code: "unavailable", message: "bounded tail unavailable" } },
+        );
+        const later: ProviderAdapter.ProviderAdapterV2Event[] = [];
+        for (let index = 0; index < 2; index++) {
+          const fence = yield* takeEvent((event) => {
+            later.push(event);
+            return (
+              event.type === "node.updated" && event.node.threadId === child.subagent.childThreadId
+            );
+          });
+          if (index === 1) {
+            assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(originalRunId));
+            yield* runtime.acknowledgeEvent!(fence, originalRunId);
+            assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(originalRunId));
+          }
+        }
+        assert.equal(call.turnItem.status, "idle");
+        if (state === "partial") {
+          assert.isTrue(
+            later.some(
+              (event) => event.type === "subagent.updated" && event.subagent.status === "idle",
+            ),
+          );
+          assert.isFalse(
+            later.some(
+              (event) =>
+                event.type === "subagent.updated" &&
+                ["completed", "failed"].includes(event.subagent.status),
+            ),
+          );
+          assert.isTrue(
+            later.some(
+              (event) =>
+                event.type === "turn_item.updated" &&
+                event.turnItem.type === "system_notice" &&
+                /partial result.*outcome is unknown/i.test(event.turnItem.message),
+            ),
+          );
+        }
+        assert.isFalse(
+          later.some(
+            (event) => event.type === "turn_item.updated" && event.turnItem.id === call.turnItem.id,
+          ),
+        );
+        if (state === "complete") {
+          assert.isTrue(
+            later.some(
+              (event) =>
+                event.type === "message.updated" && event.message.text === "bounded final output",
+            ),
+          );
+          assert.isTrue(
+            later.some(
+              (event) => event.type === "node.updated" && event.node.status === "completed",
+            ),
+          );
+        } else
+          assert.isTrue(
+            later.some(
+              (event) =>
+                event.type === "turn_item.updated" &&
+                event.turnItem.type === "system_notice" &&
+                /unavailable/i.test(event.turnItem.message),
+            ),
+          );
+        if (state === "paused") {
+          yield* snapshot("running", 3);
+          yield* reply(yield* fake.takeRequest("prompt"), {
+            messages: [
+              { role: "assistant", kind: "toolCall", name: "bash", text: "fresh resumed work" },
+            ],
+          });
+          const resumed = yield* takeEvent(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "dynamic_tool" &&
+              event.turnItem.toolName === "bash",
+          );
+          assert.equal(resumed.type === "turn_item.updated" && resumed.turnItem.status, "idle");
+        }
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["child", "empty-terminal"] as const)(
+    "retains an empty async launch across successor turns until native settlement, %s",
+    (ending) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "empty-launch",
+          toolName: "subagent",
+          args: { agent: "worker", task: "work", async: true },
+        });
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "empty-launch",
+          toolName: "subagent",
+          result: { details: { mode: "single", asyncId: "delayed", results: [] } },
+        });
+        yield* fake.emit({ type: "agent_settled" });
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        const originalRun = RunId.make(`run:${THREAD_ID}:1`);
+        yield* startTurn(runtime, providerThread, "default", [], "Next task", undefined, 2);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "t3-subagent-liveness",
+          widgetLines: [encodeJsonLine({ version: 1, ready: true })],
+        });
+        yield* fake.emit({ type: "agent_settled" });
+        const successorTerminal = yield* takeEvent((event) => event.type === "turn.terminal");
+        yield* runtime.acknowledgeEvent!(successorTerminal, RunId.make(`run:${THREAD_ID}:2`));
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(originalRun));
+        assert.isFalse(
+          yield* runtime.hasPendingEventDeliveryForRun!(RunId.make(`run:${THREAD_ID}:2`)),
+        );
+        const snapshot = (runs: unknown[]) => emitNativeSnapshot(fake, runs);
+        yield* snapshot([{ id: "unrelated", kind: "subagent", state: "complete" }]);
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "t3-subagent-liveness",
+          widgetLines: [encodeJsonLine({ version: 1, ready: true })],
+        });
+        const probe = yield* Effect.forkChild(runtime.backgroundWorkStatus!);
+        const query = yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "setWidget",
+          widgetKey: "t3-subagent-liveness",
+          widgetLines: [
+            encodeJsonLine({
+              version: 1,
+              requestId: String(query.message).split(" ")[1],
+              status: "inactive",
+            }),
+          ],
+        });
+        assert.equal(yield* Fiber.join(probe), "inactive");
+        assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(originalRun));
+        yield* snapshot([
+          {
+            id: "delayed",
+            kind: "subagent",
+            state: "complete",
+            children:
+              ending === "child"
+                ? [{ id: "step:0", kind: "step", agent: "worker", state: "complete", startedAt: 1 }]
+                : [],
+          },
+        ]);
+        if (ending === "child") {
+          const child = yield* takeEvent((event) => event.type === "subagent.updated");
+          assert.equal(child.type === "subagent.updated" && child.subagent.runId, originalRun);
+          const inspection = yield* fake.takeRequest("prompt");
+          yield* fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "subagent-inspect",
+            widgetLines: [
+              "PI_SUBAGENT_INSPECT_JSON:" +
+                JSON.stringify({
+                  kind: "pi-subagents.inspect-reply",
+                  version: 1,
+                  requestId: String(inspection.message).split(" ")[1],
+                  asyncId: "delayed",
+                  childId: "step:0",
+                  finalOutput: "delayed result",
+                  messages: [],
+                }),
+            ],
+          });
+          yield* takeEvent(
+            (event) => event.type === "message.updated" && event.message.text === "delayed result",
+          );
+          const fence = yield* takeEvent((event) => event.type === "node.updated");
+          yield* runtime.acknowledgeEvent!(fence, RunId.make(`run:${THREAD_ID}:2`));
+          assert.isTrue(yield* runtime.hasPendingEventDeliveryForRun!(originalRun));
+          yield* runtime.acknowledgeEvent!(fence, originalRun);
+        } else {
+          // A correlated probe reply is a deterministic event-pump milestone after the empty terminal snapshot.
+          const processed = yield* Effect.forkChild(runtime.backgroundWorkStatus!);
+          const request = yield* fake.takeRequest("prompt");
+          yield* fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "t3-subagent-liveness",
+            widgetLines: [
+              encodeJsonLine({
+                version: 1,
+                requestId: String(request.message).split(" ")[1],
+                status: "inactive",
+              }),
+            ],
+          });
+          yield* Fiber.join(processed);
+        }
+        assert.isFalse(yield* runtime.hasPendingEventDeliveryForRun!(originalRun));
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "projects separate workflow single results and compact final replies into the correct child chats",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        const a = {
+          index: 0,
+          workflowKey: "scout",
+          runId: "child-a",
+          agent: "scout",
+          task: "inspect",
+          exitCode: 0,
+          messages: [{ role: "assistant", content: "scout transcript" }],
+        };
+        const b = {
+          index: 0,
+          workflowKey: "review",
+          runId: "child-b",
+          agent: "reviewer",
+          task: "review",
+          exitCode: 0,
+          messages: [{ role: "assistant", content: "review transcript" }],
+        };
+        yield* fake.emit({
+          type: "tool_execution_start",
+          toolCallId: "workflow",
+          toolName: "subagent",
+          args: {
+            workflowScript:
+              'await runs.run("scout", { agent: "scout", task: "inspect" }); await runs.run("review", { agent: "reviewer", task: "review" });',
+          },
+        });
+        yield* fake.emit({
+          type: "tool_execution_update",
+          toolCallId: "workflow",
+          toolName: "subagent",
+          partialResult: { details: { mode: "workflow", runId: "workflow", results: [a, b] } },
+        });
+        const first = yield* takeEvent(
+          (event) => event.type === "subagent.updated" && event.subagent.title === "scout",
+        );
+        const second = yield* takeEvent(
+          (event) => event.type === "subagent.updated" && event.subagent.title === "reviewer",
+        );
+        if (first.type !== "subagent.updated" || second.type !== "subagent.updated")
+          return yield* Effect.die("Expected individual agents");
+        assert.notEqual(first.subagent.childThreadId, second.subagent.childThreadId);
+        const scoutText = yield* takeEvent(
+          (event) => event.type === "message.updated" && event.message.text === "scout transcript",
+        );
+        const reviewText = yield* takeEvent(
+          (event) => event.type === "message.updated" && event.message.text === "review transcript",
+        );
+        assert.equal(
+          scoutText.type === "message.updated" && scoutText.message.threadId,
+          first.subagent.childThreadId,
+        );
+        assert.equal(
+          reviewText.type === "message.updated" && reviewText.message.threadId,
+          second.subagent.childThreadId,
+        );
+        yield* fake.emit({
+          type: "tool_execution_end",
+          toolCallId: "workflow",
+          toolName: "subagent",
+          result: {
+            details: {
+              mode: "workflow",
+              runId: "workflow",
+              results: [
+                { ...b, messages: undefined, finalOutput: "review compact reply" },
+                { ...a, messages: undefined, finalOutput: "scout compact reply" },
+              ],
+            },
+          },
+        });
+        const finalReview = yield* takeEvent(
+          (event) =>
+            event.type === "message.updated" && event.message.text === "review compact reply",
+        );
+        const finalScout = yield* takeEvent(
+          (event) =>
+            event.type === "message.updated" && event.message.text === "scout compact reply",
+        );
+        assert.equal(
+          finalReview.type === "message.updated" && finalReview.message.threadId,
+          second.subagent.childThreadId,
+        );
+        assert.equal(
+          finalScout.type === "message.updated" && finalScout.message.threadId,
+          first.subagent.childThreadId,
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([
+    { named: true, isError: false },
+    { named: false, isError: false },
+    { named: true, isError: true },
+  ])(
+    "keeps ambiguous sequential results separate from tool calls across child failure, %j",
+    ({ named, isError }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* emitAsyncLaunchReceipt(fake, "history");
+        const snapshot = (state: string) =>
+          emitNativeSnapshot(fake, [
+            {
+              id: "history",
+              kind: "subagent",
+              children: [{ id: "step:0", kind: "step", agent: "worker", startedAt: 1, state }],
+            },
+          ]);
+        const reply = (request: PiRpcRecord, data: object) =>
+          fake.emit({
+            type: "extension_ui_request",
+            method: "setWidget",
+            widgetKey: "subagent-inspect",
+            widgetLines: [
+              "PI_SUBAGENT_INSPECT_JSON:" +
+                JSON.stringify({
+                  kind: "pi-subagents.inspect-reply",
+                  version: 1,
+                  requestId: String(request.message).split(" ")[1],
+                  asyncId: "history",
+                  childId: "step:0",
+                  ...data,
+                }),
+            ],
+          });
+        yield* snapshot("running");
+        const activeChild = yield* takeEvent((event) => event.type === "subagent.updated");
+        assert.equal(
+          activeChild.type === "subagent.updated" && activeChild.subagent.status,
+          "running",
+        );
+        yield* reply(yield* fake.takeRequest("prompt"), {
+          messages: [
+            { role: "assistant", kind: "toolCall", name: "read", text: "read a.ts" },
+            {
+              role: "assistant",
+              kind: "toolCall",
+              name: named ? "read" : "bash",
+              text: "second historical call",
+            },
+            {
+              role: "toolResult",
+              kind: named ? "toolResult" : "text",
+              ...(named ? { name: "read" } : {}),
+              text: isError ? "native read failure" : "file contents",
+              isError,
+            },
+          ],
+        });
+        const call = yield* takeEvent(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool",
+        );
+        if (call.type !== "turn_item.updated") return yield* Effect.die("Expected call");
+        const secondCall = yield* takeEvent(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool",
+        );
+        if (secondCall.type !== "turn_item.updated")
+          return yield* Effect.die("Expected second call");
+        const result = yield* takeEvent(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool",
+        );
+        assert.equal(
+          result.type === "turn_item.updated" && result.turnItem.status,
+          isError ? "failed" : "completed",
+        );
+        yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            /outcome.*unknown/i.test(event.turnItem.message),
+        );
+        yield* takeEvent((event) => event.type === "node.updated");
+        assert.equal(secondCall.turnItem.status, "idle");
+        assert.equal(call.turnItem.status, "idle");
+        assert.isNotNull(call.turnItem.completedAt);
+        assert.isNotNull(secondCall.turnItem.completedAt);
+        yield* snapshot("failed");
+        yield* reply(yield* fake.takeRequest("prompt"), {
+          error: { code: "unavailable", message: "terminal tail unavailable" },
+        });
+        const later: ProviderAdapter.ProviderAdapterV2Event[] = [];
+        yield* takeEvent((event) => {
+          later.push(event);
+          return event.type === "node.updated" && event.node.status === "failed";
+        });
+        // Consume the final capture fence, not the first status projection.
+        yield* takeEvent((event) => {
+          later.push(event);
+          return event.type === "node.updated" && event.node.status === "failed";
+        });
+        // A separate same-name result cannot prove which historical call finished.
+        for (const observedCall of [call, secondCall]) {
+          assert.isFalse(
+            later.some(
+              (event) =>
+                event.type === "turn_item.updated" &&
+                event.turnItem.id === observedCall.turnItem.id,
+            ),
+          );
+        }
+        assert.isTrue(
+          later.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "system_notice" &&
+              /unavailable/i.test(event.turnItem.message),
+          ),
+        );
+        if (result.type !== "turn_item.updated")
+          return yield* Effect.die("Expected result history");
+        assert.isFalse(
+          later.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.id === result.turnItem.id &&
+              event.turnItem.status !== result.turnItem.status,
+          ),
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("keeps a late timed-out observer acknowledgement out of a parent command dialog", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread, "default", [], "/parent-dialog");
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "setWidget",
+        widgetKey: "t3-subagent-liveness",
+        widgetLines: [encodeJsonLine({ version: 1, ready: true })],
+      });
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "confirm",
+        id: "parent-dialog",
+        title: "Confirm parent command",
+      });
+      yield* takeEvent((event) => event.type === "runtime_request.updated");
+      fake.deferNextPromptResponse();
+      const probe = yield* Effect.forkChild(runtime.backgroundWorkStatus!);
+      const observer = yield* fake.takeRequest("prompt");
+      yield* TestClock.adjust("5 seconds");
+      assert.equal(yield* Fiber.join(probe), "unavailable");
+      yield* fake.emit({ type: "response", id: observer.id, command: "prompt", success: true });
+      yield* fake.emit({
+        type: "response",
+        command: "prompt",
+        success: false,
+        error: "Actual parent command rejection",
+      });
+      const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
+      assert.isTrue(
+        terminal.type === "turn.terminal" &&
+          terminal.status === "failed" &&
+          terminal.failure.message === "Actual parent command rejection",
       );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
@@ -4047,6 +8419,41 @@ describe("PiAdapterV2", () => {
 });
 
 describe("PiRpc framing", () => {
+  it.effect(
+    "drops late issued request responses after timeout without swallowing id-less or foreign replies",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const connection = yield* makePiRpcConnection({
+          command: "pi",
+          args: ["--mode", "rpc"],
+          cwd: undefined,
+          env: {},
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, fake.spawner));
+        fake.deferNextPromptResponse();
+        const request = yield* Effect.forkChild(
+          connection.request({ type: "prompt", message: "/observer" }, 5_000).pipe(Effect.exit),
+        );
+        const sent = yield* fake.takeRequest("prompt");
+        yield* TestClock.adjust("5 seconds");
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(request)));
+        yield* fake.emit({ type: "response", id: sent.id, command: "prompt", success: true });
+        yield* fake.emit({
+          type: "response",
+          command: "prompt",
+          success: false,
+          error: "parent rejection",
+        });
+        yield* fake.emit({ type: "response", id: "external-id", command: "prompt", success: true });
+        const parent = yield* Queue.take(connection.events);
+        assert.isUndefined(parent.id);
+        assert.equal(parent.error, "parent rejection");
+        assert.equal((yield* Queue.take(connection.events)).id, "external-id");
+        const state = yield* connection.request({ type: "get_state" });
+        assert.equal((state as { sessionFile: string }).sessionFile, FAKE_SESSION_FILE);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("reassembles records across chunk boundaries and strips CR", () =>
     Effect.gen(function* () {
       const stdout = yield* Queue.unbounded<Uint8Array>();

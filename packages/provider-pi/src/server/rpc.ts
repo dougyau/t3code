@@ -285,6 +285,15 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
           }
           return;
         }
+        const issuedId = Number(record["id"].slice(3));
+        // Timed-out or interrupted requests still own their correlated replies, never the id-less prompt FIFO.
+        if (
+          Number.isSafeInteger(issuedId) &&
+          issuedId >= 0 &&
+          issuedId < nextRequestId &&
+          record["id"] === `t3-${issuedId}`
+        )
+          return;
       }
       yield* Queue.offer(events, record);
     });
