@@ -1,8 +1,19 @@
 import { describe, expect, it } from "vite-plus/test";
-import { ProviderInstanceId, ProviderThreadId } from "@t3tools/contracts";
+import {
+  NodeId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ProviderThreadId,
+  RunId,
+  ThreadId,
+  TurnItemId,
+  type OrchestrationV2TurnItem,
+} from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import {
   backgroundWorkHoldsCompletion,
   derivePendingBackgroundWork,
+  deriveBlockedOnThreadWait,
 } from "./orchestrationV2PendingBackgroundWork.ts";
 
 describe("backgroundWorkHoldsCompletion", () => {
@@ -17,6 +28,58 @@ describe("backgroundWorkHoldsCompletion", () => {
 });
 
 describe("derivePendingBackgroundWork", () => {
+  it("shows a native delegation wait only while the parent tool and its children are active", () => {
+    const runId = RunId.make("native-wait");
+    const now = DateTime.makeUnsafe("2026-01-01T00:00:00Z");
+    const base = {
+      threadId: ThreadId.make("thread"),
+      runId,
+      nodeId: NodeId.make("node"),
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 1,
+      status: "running" as const,
+      title: null,
+      startedAt: now,
+      completedAt: null,
+      updatedAt: now,
+    };
+    const tool = {
+      ...base,
+      id: TurnItemId.make("tool"),
+      type: "dynamic_tool",
+      toolName: "subagent",
+      input: {},
+    } satisfies OrchestrationV2TurnItem;
+    const child = {
+      ...base,
+      id: TurnItemId.make("child"),
+      type: "subagent",
+      subagentId: NodeId.make("child"),
+      origin: "provider_native",
+      driver: ProviderDriverKind.make("pi"),
+      providerInstanceId: ProviderInstanceId.make("pi"),
+      childThreadId: null,
+      prompt: "inspect",
+      result: null,
+    } satisfies OrchestrationV2TurnItem;
+    const activeRun = { id: runId, status: "running" as const };
+    expect(deriveBlockedOnThreadWait({ activeRun, turnItems: [tool, child] })).toBe(true);
+    expect(
+      deriveBlockedOnThreadWait({
+        activeRun,
+        turnItems: [{ ...tool, status: "completed" }, child],
+      }),
+    ).toBe(false);
+    expect(
+      deriveBlockedOnThreadWait({
+        activeRun,
+        turnItems: [tool, { ...child, status: "completed" }],
+      }),
+    ).toBe(false);
+  });
   it("takes each subagent item's instance from its joined owner", () => {
     const owner = ProviderInstanceId.make("claude-owner");
     const tasks = derivePendingBackgroundWork({
