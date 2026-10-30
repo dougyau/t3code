@@ -7,6 +7,10 @@ const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", 
 
 export type PiThinkingLevel = (typeof PI_THINKING_LEVELS)[number];
 
+export function parsePiThinkingLevel(value: unknown): PiThinkingLevel | undefined {
+  return PI_THINKING_LEVELS.find((level) => level === value);
+}
+
 const PI_THINKING_LEVEL_LABELS: Record<PiThinkingLevel, string> = {
   off: "Off",
   minimal: "Minimal",

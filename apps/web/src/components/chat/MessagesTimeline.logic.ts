@@ -1,6 +1,6 @@
 import { worktreeSetupAgentStarted } from "@t3tools/client-runtime/worktree-setup";
 import { resolveUserMessagePresentation } from "@t3tools/client-runtime/user-message";
-import { isLiveSubagentTurnItem } from "@t3tools/client-runtime/state/subagentRuntime";
+import { shouldKeepSubagentCardVisible } from "@t3tools/client-runtime/state/subagentRuntime";
 import * as DateTime from "effect/DateTime";
 import * as Equal from "effect/Equal";
 import {
@@ -275,6 +275,7 @@ export function workEntryIsVisibleInGroup(
       (entry.toolLifecycleStatus === "inProgress" ||
         entry.sourceActivityKind === "task.progress")) ||
     entry.toolLifecycleStatus === "stopped" ||
+    entry.toolLifecycleStatus === "idle" ||
     !workEntryIndicatesToolNeutralStatus(entry)
   );
 }
@@ -777,7 +778,7 @@ function completeSupersededReplyEntryIds(
 function deriveSupersededAttemptFolds(
   timelineEntries: ReadonlyArray<TimelineEntry>,
   unfoldedRunIds: ReadonlySet<RunId>,
-  liveSubagentEntryIds: ReadonlySet<string>,
+  visibleSubagentEntryIds: ReadonlySet<string>,
   completeReplyEntryIds: ReadonlySet<string>,
 ): ReadonlyMap<string, SupersededAttemptFold> {
   const completeAttemptIds = new Set(
@@ -796,7 +797,7 @@ function deriveSupersededAttemptFolds(
       entry.kind === "html-render" ||
       entry.kind === "mcp-app" ||
       timelineEntryIsPersistentResourceCard(entry) ||
-      liveSubagentEntryIds.has(entry.id) ||
+      visibleSubagentEntryIds.has(entry.id) ||
       (entry.kind === "work" && entry.entry.itemType === "system_notice")
     ) {
       continue;
@@ -844,13 +845,12 @@ function deriveUnsettledRunId(
   return isSettled ? null : latestRun.runId;
 }
 
-// Children can outlive their launching turn; keep cards visible while the footer counts them.
-function liveSubagentCardEntryIds(entries: ReadonlyArray<TimelineEntry>): ReadonlySet<string> {
+function visibleSubagentCardEntryIds(entries: ReadonlyArray<TimelineEntry>): ReadonlySet<string> {
   const visible = new Set<string>();
   let batch: Array<Extract<TimelineEntry, { kind: "event" }>> = [];
   const flush = () => {
     if (batch.length === 0) return;
-    if (batch.some((entry) => isLiveSubagentTurnItem(entry.projectedItem.item))) {
+    if (batch.some((entry) => shouldKeepSubagentCardVisible(entry.projectedItem.item))) {
       for (const entry of batch) visible.add(entry.id);
     }
     batch = [];
@@ -1004,7 +1004,7 @@ function deriveTurnFolds(input: {
   latestRun: TimelineLatestRun | null;
   unfoldedRunIds: ReadonlySet<RunId>;
   runlessWorkActive: boolean;
-  liveSubagentEntryIds: ReadonlySet<string>;
+  visibleSubagentEntryIds: ReadonlySet<string>;
   completeSupersededReplyEntryIds: ReadonlySet<string>;
 }): ReadonlyMap<string, TurnFold> {
   const interruptedRunIds = new Set<RunId>();
@@ -1135,7 +1135,7 @@ function deriveTurnFolds(input: {
       if (
         isCompaction ||
         timelineEntryIsPersistentResourceCard(entry) ||
-        input.liveSubagentEntryIds.has(entry.id) ||
+        input.visibleSubagentEntryIds.has(entry.id) ||
         input.completeSupersededReplyEntryIds.has(entry.id)
       ) {
         continue;
@@ -1385,7 +1385,7 @@ function deriveTimelineTurnFolds(
     latestRun: input.latestRun ?? null,
     unfoldedRunIds: new Set([...activeVisualResponseRunIds, ...failedRunIds]),
     runlessWorkActive: input.isWorking && input.runlessWorkActive === true,
-    liveSubagentEntryIds: liveSubagentCardEntryIds(timelineEntries),
+    visibleSubagentEntryIds: visibleSubagentCardEntryIds(timelineEntries),
     completeSupersededReplyEntryIds: completeSupersededReplyEntryIds(timelineEntries),
   });
 }
@@ -1436,12 +1436,12 @@ export function deriveMessagesTimelineRows(input: {
   const terminalAssistantMessageIds = deriveTerminalAssistantMessageIds(timelineEntries);
   const failedRunIds = failedTimelineRunIds(timelineEntries, input.latestRun ?? null);
   const itemizedRunIds = itemizedFailedRunIds(timelineEntries, failedRunIds);
-  const liveSubagentEntryIds = liveSubagentCardEntryIds(timelineEntries);
+  const visibleSubagentEntryIds = visibleSubagentCardEntryIds(timelineEntries);
   const completeSupersededReplyIds = completeSupersededReplyEntryIds(timelineEntries);
   const supersededFoldsByAnchorEntryId = deriveSupersededAttemptFolds(
     timelineEntries,
     failedRunIds,
-    liveSubagentEntryIds,
+    visibleSubagentEntryIds,
     completeSupersededReplyIds,
   );
   const supersededWorkItemIds = new Set(
@@ -1459,7 +1459,7 @@ export function deriveMessagesTimelineRows(input: {
     latestRun: input.latestRun ?? null,
     unfoldedRunIds: new Set([...activeVisualResponseRunIds, ...failedRunIds]),
     runlessWorkActive,
-    liveSubagentEntryIds,
+    visibleSubagentEntryIds,
     completeSupersededReplyEntryIds: completeSupersededReplyIds,
   });
   const timelineEntryById = new Map(timelineEntries.map((entry) => [entry.id, entry]));

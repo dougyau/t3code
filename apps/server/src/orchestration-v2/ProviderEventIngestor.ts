@@ -674,6 +674,38 @@ export const layer: Layer.Layer<
                   nodeId: input.event.runtimeRequest.nodeId,
                 }),
               ];
+            case "checklist.updated": {
+              const { providerThread, plan, turnItem } = input.event;
+              return [
+                ...(plan === null
+                  ? []
+                  : [
+                      yield* makeDomainEvent(input, {
+                        type: "plan.updated",
+                        threadId: plan.threadId,
+                        payload: plan,
+                        runId: plan.runId,
+                        nodeId: plan.nodeId,
+                      }),
+                    ]),
+                ...(turnItem === null
+                  ? []
+                  : [
+                      yield* makeDomainEvent(input, {
+                        type: "turn-item.updated",
+                        threadId: turnItem.threadId,
+                        payload: turnItem,
+                        runId: turnItem.runId,
+                        nodeId: turnItem.nodeId,
+                      }),
+                    ]),
+                yield* makeDomainEvent(input, {
+                  type: "provider-thread.updated",
+                  threadId: providerThread.appThreadId ?? input.threadId,
+                  payload: providerThread,
+                }),
+              ];
+            }
             case "plan.updated": {
               const occurredAt = yield* DateTime.now;
               const plan = input.event.plan;

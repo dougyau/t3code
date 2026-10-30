@@ -13,6 +13,8 @@ export interface PiSubagentObservation {
   readonly inspectionTarget?: { readonly runId: string; readonly childId: string };
   readonly parentId: string | null;
   readonly title: string;
+  readonly label?: string;
+  readonly workflowKey?: string;
   readonly prompt?: string | undefined;
   readonly model?: string | undefined;
   readonly status: OrchestrationV2Subagent["status"];
@@ -43,11 +45,12 @@ export interface PiSubagentLifecycle {
     runId?: string | undefined;
     workflowKey?: string | undefined;
     childId: string;
+    label?: string | undefined;
+    sessionName?: string | undefined;
   }>;
 }
 
-/** Lifecycle metadata proves identity only; partial files never prove absence or settlement. */
-export function piSubagentLifecycle(text: string, runId: string): PiSubagentLifecycle | undefined {
+function subagentMetadata(text: string): unknown {
   if (
     text.length > PI_SUBAGENT_LIFECYCLE_MAX_BYTES ||
     new TextEncoder().encode(text).byteLength > PI_SUBAGENT_LIFECYCLE_MAX_BYTES
@@ -68,8 +71,13 @@ export function piSubagentLifecycle(text: string, runId: string): PiSubagentLife
       Object.values(value).every((child) => bounded(child, depth + 1))
     );
   };
+  return bounded(data, 0) ? data : undefined;
+}
+
+/** Lifecycle metadata proves identity only; partial files never prove absence or settlement. */
+export function piSubagentLifecycle(text: string, runId: string): PiSubagentLifecycle | undefined {
+  const data = subagentMetadata(text);
   if (
-    !bounded(data, 0) ||
     recordField(data, "lifecycleArtifactVersion") !== 3 ||
     recordString(data, "runId") !== runId ||
     (recordString(data, "id") !== undefined && recordString(data, "id") !== runId)
@@ -95,8 +103,36 @@ export function piSubagentLifecycle(text: string, runId: string): PiSubagentLife
         piSubagentMetadataString(step, "workflowKey") ??
         piSubagentMetadataString(step, "runId") ??
         `step:${recordNumber(step, "index") ?? position}`,
+      label: piSubagentMetadataString(step, "label"),
+      sessionName: piSubagentMetadataString(step, "sessionName"),
     })),
   };
+}
+
+export function piSubagentWorkflowChildren(
+  text: string,
+  runId: string,
+  toolCallId: string,
+): ReadonlyArray<PiSubagentObservation> {
+  const data = subagentMetadata(text);
+  if (
+    recordString(data, "runId") !== runId ||
+    recordString(data, "toolCallId") !== toolCallId ||
+    recordString(data, "mode") !== "workflow"
+  )
+    return [];
+  return piSubagentResults(
+    {
+      details: {
+        mode: "workflow",
+        runId,
+        results: [],
+        workflowChildren: recordField(data, "workflowChildren"),
+      },
+    },
+    toolCallId,
+    false,
+  );
 }
 
 export function piSubagentLifecycleHints(lines: unknown) {
@@ -260,7 +296,9 @@ export function piSubagentResults(
       }
     }
   };
-  for (const observation of [...observations]) {
+  const rootCount = observations.length;
+  for (let index = 0; index < rootCount; index++) {
+    const observation = observations[index]!;
     if (observation.resultPosition !== undefined)
       visit(recordField(results[observation.resultPosition], "children"), observation, 0);
   }
@@ -297,12 +335,15 @@ export function piSubagentResults(
         continue;
       }
       const currentTool = piSubagentMetadataString(recordField(child, "activity"), "currentTool");
+      const label = piSubagentMetadataString(child, "label");
       observations.push({
         id,
         runId,
         childId,
         parentId: null,
-        title,
+        title: label ?? key,
+        ...(label === undefined ? {} : { label }),
+        workflowKey: key,
         status,
         paused: state === "paused",
         model: piSubagentMetadataString(child, "model"),
@@ -427,12 +468,16 @@ export function piSubagentSnapshot(lines: unknown): ReadonlyArray<PiSubagentObse
       (kind !== "step" || recordNumber(node, "startedAt") !== undefined || status === "running")
     ) {
       const id = piSubagentObservationId(runId, childId);
+      const agent = recordString(node, "agent");
+      const publicLabel = recordString(node, "label");
+      const label = publicLabel !== childId && publicLabel !== agent ? publicLabel : undefined;
       observations.push({
         id,
         runId,
         childId,
         parentId,
-        title: recordString(node, "agent") ?? recordString(node, "label") ?? "Subagent",
+        title: label ?? agent ?? publicLabel ?? "Subagent",
+        ...(label === undefined ? {} : { label }),
         model: recordString(node, "model"),
         status,
         paused: recordField(node, "state") === "paused",

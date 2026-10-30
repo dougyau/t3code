@@ -13,6 +13,7 @@ import {
   isWorkflowScriptMessage,
   projectedSubagentsToRuntime,
   resolveWorkflowOpening,
+  resolveSubagentProgress,
 } from "./subagentRuntime.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
@@ -47,6 +48,21 @@ const member = (
 
 const groupsOf = (subagents: ReadonlyArray<ProjectedSubagent>) =>
   deriveWorkflowGroups(projectedSubagentsToRuntime(subagents));
+
+it("replaces Pi native activity even when the latest tool is absent or terminal", () => {
+  const item = {
+    origin: "provider_native" as const,
+    driver: ProviderDriverKind.make("pi"),
+    status: "running" as const,
+    progress: "bash",
+  };
+  expect(resolveSubagentProgress(item, { status: "running", progress: "read" })).toBe("read");
+  expect(resolveSubagentProgress(item, { status: "running" })).toBeUndefined();
+  expect(resolveSubagentProgress(item, { status: "completed", progress: "bash" })).toBeUndefined();
+  expect(resolveSubagentProgress({ ...item, origin: "app_owned" }, { status: "running" })).toBe(
+    "bash",
+  );
+});
 
 describe("projectedSubagentsToRuntime workflow expansion", () => {
   it("uses a settled member's wall-clock completion separately from its execution duration", () => {

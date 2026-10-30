@@ -4,11 +4,59 @@ import {
   piSubagentRunStates,
   piSubagentSnapshot,
   piSubagentLifecycle,
+  piSubagentWorkflowChildren,
   piSubagentLifecycleHints,
   PI_SUBAGENT_LIFECYCLE_MAX_BYTES,
 } from "./subagents.ts";
 
 describe("Pi native subagent observations", () => {
+  it("validates the public membership contract independently of lifecycle identity metadata", () => {
+    const data = {
+      runId: "W",
+      toolCallId: "launch",
+      mode: "workflow",
+      workflowChildren: {
+        version: 1,
+        workflowRunId: "W",
+        parentToolCallId: "launch",
+        children: [
+          {
+            childId: "review-contracts",
+            runId: "C",
+            label: "Review contracts",
+            agent: "reviewer",
+            state: "running",
+          },
+        ],
+      },
+    };
+    const text = JSON.stringify(data);
+    expect(piSubagentLifecycle(text, "W")).toBeUndefined();
+    expect(piSubagentWorkflowChildren(text, "W", "launch")[0]?.title).toBe("Review contracts");
+    const fallback = piSubagentWorkflowChildren(
+      JSON.stringify({
+        ...data,
+        workflowChildren: {
+          ...data.workflowChildren,
+          children: [{ ...data.workflowChildren.children[0], label: undefined }],
+        },
+      }),
+      "W",
+      "launch",
+    )[0];
+    expect(fallback?.title).toBe("review-contracts");
+    expect(fallback?.label).toBeUndefined();
+    for (const invalid of [
+      { ...data, runId: "foreign" },
+      { ...data, workflowChildren: { ...data.workflowChildren, version: 2 } },
+      { ...data, workflowChildren: { ...data.workflowChildren, parentToolCallId: "other" } },
+    ])
+      expect(piSubagentWorkflowChildren(JSON.stringify(invalid), "W", "launch")).toEqual([]);
+    expect(
+      piSubagentWorkflowChildren(" ".repeat(PI_SUBAGENT_LIFECYCLE_MAX_BYTES + 1), "W", "launch"),
+    ).toEqual([]);
+  });
+
   it("preserves bounded foreground nested public steps and their real parents", () => {
     const grandchild = {
       id: "grandchild",

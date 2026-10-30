@@ -14,6 +14,7 @@ import { createThreadVisitTracker } from "@t3tools/client-runtime/state/thread-v
 import { useChildThreadInputs, useThreadReportedModelSelection } from "../../state/entities";
 import { UsageLimitRecoveryCard } from "./UsageLimitRecoveryCard";
 import { ChatGptUsageLimitNotice } from "./ChatGptUsageLimitNotice";
+import { NativeChecklist } from "./NativeChecklist";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import {
   effectiveSnoozed,
@@ -1502,6 +1503,12 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
                         environmentId: props.environmentId,
                         threadId: props.selectedThread.id,
                       });
+                    }}
+                  />
+                  <NativeChecklist
+                    threadRef={{
+                      environmentId: props.environmentId,
+                      threadId: props.selectedThread.id,
                     }}
                   />
                   {props.queuedRunEdit !== null ? (
