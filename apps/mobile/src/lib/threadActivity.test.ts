@@ -941,7 +941,7 @@ describe("buildThreadFeed", () => {
       updatedAt: string,
       ordinal: number,
       status: OrchestrationV2TurnItem["status"],
-    ): OrchestrationV2TurnItem => ({
+    ): Extract<OrchestrationV2TurnItem, { type: "subagent" }> => ({
       ...base(id, updatedAt, ordinal),
       providerTurnId: ProviderTurnId.make("provider-turn-1"),
       status,
@@ -1000,6 +1000,14 @@ describe("buildThreadFeed", () => {
 
     const finished = present([subagent("item-done", "2026-06-20T00:00:03.000Z", 2, "completed")]);
     expect(finished.map((entry) => entry.type)).toEqual(["message", "run-fold", "message"]);
+
+    const nativePi = {
+      ...subagent("item-pi", "2026-06-20T00:00:03.000Z", 2, "completed"),
+      origin: "provider_native" as const,
+      driver: ProviderDriverKind.make("pi"),
+    };
+    expect(visibleSubagentIds(present([nativePi]))).toEqual(["item-pi"]);
+    expect(visibleSubagentIds(present([{ ...nativePi, origin: "app_owned" }]))).toEqual([]);
   });
 
   it("folds each run of a provider-native subagent thread like a normal turn", () => {

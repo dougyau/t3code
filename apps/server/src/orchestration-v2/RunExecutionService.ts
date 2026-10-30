@@ -399,6 +399,7 @@ export function routeProviderEvent(
         },
       ];
     }
+    case "checklist.updated":
     case "provider_thread.updated": {
       const belongs =
         state.ownedProviderThreadIds.has(event.providerThread.id) ||

@@ -1018,6 +1018,13 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   claudeAttachmentBudget: Schema.optional(
     Schema.Struct({ bytesUsed: NonNegativeInt, pagesUsed: NonNegativeInt }),
   ),
+  checklistSelection: Schema.optional(
+    Schema.Struct({
+      state: Schema.Literals(["ready", "unavailable"]),
+      planId: Schema.NullOr(PlanId),
+      sourceEntryId: Schema.NullOr(Schema.String),
+    }),
+  ),
 });
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;

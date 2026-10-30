@@ -139,6 +139,13 @@ export const ProviderAdapterV2Event = Schema.Union([
     plan: OrchestrationV2PlanArtifact,
   }),
   Schema.Struct({
+    type: Schema.Literal("checklist.updated"),
+    driver: ProviderDriverKind,
+    providerThread: OrchestrationV2ProviderThread,
+    plan: Schema.NullOr(OrchestrationV2PlanArtifact),
+    turnItem: Schema.NullOr(OrchestrationV2TurnItem),
+  }),
+  Schema.Struct({
     type: Schema.Literal("turn.terminal"),
     driver: ProviderDriverKind,
     providerThreadId: ProviderThreadId,

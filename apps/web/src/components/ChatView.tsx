@@ -270,6 +270,8 @@ import { useCitedHistory } from "./chat/citationProcedure";
 import type { MessagesTimelineHistoryControls } from "./chat/MessagesTimeline";
 import { ThreadTimeline } from "./chat/ThreadTimeline";
 import { ProviderSubagentBar } from "./chat/ProviderSubagentBar";
+import { NativeChecklist } from "./chat/NativeChecklist";
+import { selectPiChecklist } from "@t3tools/client-runtime/state/pi-checklist";
 import { getTriggerDisplayModelName } from "./chat/providerIconUtils";
 import { resolveScrollToEndClearance } from "./composerFooterLayout";
 import { ChatHeader } from "./chat/ChatHeader";
@@ -1067,6 +1069,7 @@ export default function ChatView(props: ChatViewProps) {
   const [chatCanvasStore] = useState(createChatCanvasStore);
 
   const latestRunSettled = isLatestRunSettled(activeLatestRun, activeRuntime);
+  const nativeChecklist = selectPiChecklist(serverProjection?.plans ?? [], activeProviderThread);
   const activeThreadEnvironmentId = activeThread?.environmentId;
   const activeThreadProjectId = activeThread?.projectId;
   const activeProjectRef =
@@ -3442,21 +3445,29 @@ export default function ChatView(props: ChatViewProps) {
                         aria-busy={queuedRunEdit.isSaving}
                       >
                         <div className="relative z-10">
+                          {nativeChecklist &&
+                          (showProviderSubagentBar ||
+                            !latestRunSettled ||
+                            nativeChecklist.steps.some((step) => step.status !== "completed")) ? (
+                            <NativeChecklist plan={nativeChecklist} />
+                          ) : null}
                           {showProviderSubagentBar ? (
-                            <ProviderSubagentBar
-                              provider={selectedProviderEntry ?? null}
-                              showInstanceBadge={
-                                selectedProviderEntry !== undefined &&
-                                shouldShowInstanceBadge(
-                                  selectedProviderEntry,
-                                  providerInstanceEntries,
-                                )
-                              }
-                              modelLabel={providerSubagentModelLabel}
-                              effortLabel={providerSubagentEffortLabel}
-                              status={providerSubagentStatus}
-                              onOpenParent={parentThreadLink?.open ?? null}
-                            />
+                            <ComposerSurface.Main>
+                              <ProviderSubagentBar
+                                provider={selectedProviderEntry ?? null}
+                                showInstanceBadge={
+                                  selectedProviderEntry !== undefined &&
+                                  shouldShowInstanceBadge(
+                                    selectedProviderEntry,
+                                    providerInstanceEntries,
+                                  )
+                                }
+                                modelLabel={providerSubagentModelLabel}
+                                effortLabel={providerSubagentEffortLabel}
+                                status={providerSubagentStatus}
+                                onOpenParent={parentThreadLink?.open ?? null}
+                              />
+                            </ComposerSurface.Main>
                           ) : null}
                           {!composerMounted ? null : (
                             <ChatComposer

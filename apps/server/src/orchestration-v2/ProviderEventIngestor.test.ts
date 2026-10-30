@@ -8,6 +8,7 @@ import {
   GitCommandError,
   type ModelSelection,
   NodeId,
+  PlanId,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ExecutionNode,
@@ -513,6 +514,69 @@ layer("ProviderEventIngestorV2", (it) => {
         ["provider-thread.updated"],
       );
       assert.equal(latestThreadSequence, 2);
+
+      const planId = PlanId.make("native-checklist");
+      const nodeId = NodeId.make("native-checklist-node");
+      const steps = [{ id: "entry:1", text: "Inspect", status: "running" as const }];
+      const captured = yield* ingestor.ingestNormalized({
+        providerSessionId,
+        providerInstanceId: modelSelection.instanceId,
+        threadId: threadEvent.threadId,
+        event: {
+          type: "checklist.updated",
+          driver: CODEX_DRIVER,
+          providerThread: {
+            ...providerThread,
+            nativeMetadata: {
+              checklistSelection: { state: "ready", planId, sourceEntryId: "entry" },
+            },
+          },
+          plan: {
+            id: planId,
+            threadId: threadEvent.threadId,
+            runId: null,
+            nodeId,
+            kind: "todo_list",
+            status: "active",
+            steps,
+          },
+          turnItem: {
+            id: TurnItemId.make("native-checklist-item"),
+            threadId: threadEvent.threadId,
+            runId: null,
+            nodeId,
+            providerThreadId: providerThread.id,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 0,
+            type: "todo_list",
+            planId,
+            steps,
+            title: null,
+            status: "running",
+            startedAt: null,
+            completedAt: null,
+            updatedAt: now,
+          },
+        },
+      });
+      assert.deepEqual(
+        captured.map((stored) => stored.event.type),
+        ["plan.updated", "turn-item.updated", "provider-thread.updated"],
+      );
+      const withChecklist = yield* projectionStore.getThreadProjection(threadEvent.threadId);
+      assert.equal(
+        withChecklist.providerThreads[0]?.nativeMetadata?.checklistSelection?.planId,
+        planId,
+      );
+      assert.deepEqual(
+        withChecklist.plans[0]?.kind === "todo_list" ? withChecklist.plans[0].steps : [],
+        steps,
+      );
+      assert.isTrue(
+        withChecklist.turnItems.some((item) => item.type === "todo_list" && item.planId === planId),
+      );
     }),
   );
 

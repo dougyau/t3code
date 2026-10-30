@@ -1,6 +1,9 @@
 import { ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { AgentElapsed } from "./AgentElapsed";
-import { projectedSubagentsToRuntime } from "@t3tools/client-runtime/state/subagentRuntime";
+import {
+  projectedSubagentsToRuntime,
+  resolveSubagentProgress,
+} from "@t3tools/client-runtime/state/subagentRuntime";
 import type { ReactNode } from "react";
 import { useThreadShell, useProject } from "../../state/entities";
 import { useEnvironment } from "../../state/environments";
@@ -400,7 +403,7 @@ function SubagentTimelineLink(props: {
   const status = props.event ? props.event.status : liveStatus;
   const statusLabel = props.event?.label ?? subagentStatusVisual(liveStatus).label;
   const result = (agent?.result ?? props.result)?.trim();
-  const progress = (agent?.progress ?? props.progress)?.trim();
+  const progress = resolveSubagentProgress(props, agent)?.trim();
   const settled = SETTLED_SUBAGENT_STATUSES.has(status ?? liveStatus);
   const rawDetail = settled ? result || progress : progress || result;
   const detail =
@@ -498,7 +501,7 @@ function SubagentTimelineLink(props: {
           modelSelection={agent?.modelSelection}
           status={liveStatus}
           result={agent?.result ?? props.result}
-          progress={agent?.progress ?? props.progress}
+          progress={progress}
         />
       </ThreadHoverCardPopup>
     </Tooltip>

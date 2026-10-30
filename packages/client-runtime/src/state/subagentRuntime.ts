@@ -18,6 +18,17 @@ export type RuntimeSubagentStatus =
   | "cancelled"
   | "interrupted";
 
+export function resolveSubagentProgress(
+  item: Pick<OrchestrationV2Subagent, "origin" | "driver" | "status" | "progress">,
+  current?: Pick<OrchestrationV2Subagent, "status" | "progress"> | null,
+) {
+  if (item.origin === "provider_native" && item.driver === "pi") {
+    const latest = current ?? item;
+    return isOrchestrationV2WorkActive(latest.status) ? latest.progress : undefined;
+  }
+  return current?.progress ?? item.progress;
+}
+
 export interface SubagentUsage {
   readonly totalTokens: number;
   readonly inputTokens?: number;
@@ -92,8 +103,12 @@ export function isActiveSubagentStatus(status: RuntimeSubagentStatus): boolean {
   return isOrchestrationV2WorkActive(status);
 }
 
-export function isLiveSubagentTurnItem(item: OrchestrationV2TurnItem): boolean {
-  return item.type === "subagent" && isOrchestrationV2WorkActive(item.status);
+export function shouldKeepSubagentCardVisible(item: OrchestrationV2TurnItem): boolean {
+  return (
+    item.type === "subagent" &&
+    (isOrchestrationV2WorkActive(item.status) ||
+      (item.origin === "provider_native" && item.driver === "pi"))
+  );
 }
 
 export interface SubagentWorkflowGroup {

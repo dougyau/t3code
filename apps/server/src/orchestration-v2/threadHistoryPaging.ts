@@ -622,10 +622,14 @@ export function buildBoundedThreadProjection(input: {
       latestTodoListOrdinal = ordinal;
     }
   }
+  const selectedChecklist = input.projection.providerThreads.find(
+    (thread) => thread.id === input.projection.thread.activeProviderThreadId,
+  )?.nativeMetadata?.checklistSelection?.planId;
   const controlProjection = {
     ...input.projection,
     plans: input.projection.plans.filter(
-      (plan) => plan.status === "active" || plan.id === latestTodoList?.id,
+      (plan) =>
+        plan.status === "active" || plan.id === latestTodoList?.id || plan.id === selectedChecklist,
     ),
     contextHandoffs: input.projection.contextHandoffs.filter(
       (handoff) => handoff.status === "pending" || handoff.status === "ready",
