@@ -54,6 +54,37 @@ describe("resolveAssistantMessageCopyState", () => {
 });
 
 describe("deriveMessagesTimelineRows", () => {
+  it("keeps unlinked historical tool output visible without claiming success or live activity", () => {
+    const at = "2026-10-25T00:00:00Z";
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          kind: "work",
+          id: "unlinked-results",
+          createdAt: at,
+          entry: {
+            id: "unlinked-results",
+            createdAt: at,
+            label: "Earlier tool results (unlinked)",
+            tone: "tool",
+            itemType: "dynamic_tool",
+            toolLifecycleStatus: "idle",
+            toolData: { output: "README contents" },
+          },
+        },
+      ],
+      isWorking: false,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+    expect(rows).toMatchObject([
+      {
+        kind: "work",
+        groupedEntries: [{ toolLifecycleStatus: "idle", toolData: { output: "README contents" } }],
+      },
+    ]);
+  });
+
   it("stops stranded thinking after a steer and follows the next thought or tool", () => {
     const runId = RunId.make("steered-run");
     const at = "2026-10-01T06:19:10Z";
@@ -4036,7 +4067,7 @@ describe("live subagents after their parent turn settles", () => {
     second: number,
     status: OrchestrationV2TurnItem["status"],
     origin: "app_owned" | "provider_native" = "app_owned",
-  ): OrchestrationV2TurnItem => ({
+  ): Extract<OrchestrationV2TurnItem, { type: "subagent" }> => ({
     ...base(id, second),
     status,
     completedAt: status === "running" ? null : at(second),
@@ -4123,6 +4154,24 @@ describe("live subagents after their parent turn settles", () => {
     expect(rows.find((row) => row.id === "done")).toMatchObject({
       subagents: [{ item: { id: "done" } }, { item: { id: "live" } }],
     });
+  });
+
+  it("keeps a completed native Pi card visible without unfolding ordinary work", () => {
+    const nativePi = {
+      ...child("pi-child", 3, "completed", "provider_native"),
+      driver: ProviderDriverKind.make("pi"),
+    };
+    expect(rowsFor([nativePi]).map((row) => row.id)).toEqual([
+      "user",
+      `turn-fold:${runId}`,
+      "pi-child",
+      "assistant",
+    ]);
+    expect(rowsFor([{ ...nativePi, origin: "app_owned" }]).map((row) => row.id)).toEqual([
+      "user",
+      `turn-fold:${runId}`,
+      "assistant",
+    ]);
   });
 
   it("keeps a running child visible when a steer supersedes its attempt", () => {

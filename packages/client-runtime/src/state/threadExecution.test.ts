@@ -15,11 +15,13 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { usageLimitBlockedRun } from "@t3tools/shared/orchestrationV2ThreadError";
+import { createModelCapabilities } from "@t3tools/shared/model";
 import { describe, expect, it } from "vite-plus/test";
 
 import { v2Projection } from "./orchestrationV2TestFixtures.ts";
 import {
   deriveReportedModelSelection,
+  formatModelSelectionEffort,
   deriveLatestThreadRun,
   deriveProviderSubagentStatus,
   deriveRunlessWorkStartedAt,
@@ -51,6 +53,33 @@ function run(id: string, ordinal: number, status: OrchestrationV2RunStatus) {
 }
 
 describe("thread execution presentation", () => {
+  it("shows Pi thinking effort from the reported selection, not a catalog default", () => {
+    const selection = { ...v2Projection.thread.modelSelection, model: "pi-model", options: [] };
+    const models = [
+      {
+        slug: "pi-model",
+        name: "Pi",
+        isCustom: false,
+        capabilities: createModelCapabilities({
+          optionDescriptors: [
+            {
+              id: "thinking",
+              label: "Thinking",
+              type: "select",
+              options: [{ id: "high", label: "High", isDefault: true }],
+            },
+          ],
+        }),
+      },
+    ];
+    expect(
+      formatModelSelectionEffort(selection, models, {
+        ...selection,
+        options: [{ id: "thinking", value: "high" }],
+      }),
+    ).toBe("High");
+    expect(formatModelSelectionEffort(selection, models)).toBeNull();
+  });
   it("derives the current root failure without inheriting errors from children or previous runs", () => {
     const failed = { ...run("limited", 1, "failed"), rootNodeId: NodeId.make("root") };
     const item = {

@@ -2,7 +2,10 @@ import { useAtomValue } from "@effect/atom-react";
 import { StackActions, useNavigation } from "@react-navigation/native";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { summarizeSubagentStatuses } from "@t3tools/client-runtime/state/subagent-display";
-import { isActiveSubagentStatus } from "@t3tools/client-runtime/state/subagentRuntime";
+import {
+  isActiveSubagentStatus,
+  resolveSubagentProgress,
+} from "@t3tools/client-runtime/state/subagentRuntime";
 import type {
   EnvironmentId,
   OrchestrationV2Subagent,
@@ -90,7 +93,7 @@ export function ThreadSubagentGroup(props: {
       startedAt: live?.startedAt ?? item.startedAt,
       completedAt: live?.completedAt ?? item.completedAt,
       result: live?.result ?? item.result,
-      progress: live?.progress ?? item.progress,
+      progress: resolveSubagentProgress(item, live),
       model: live?.model ?? null,
     };
   });
