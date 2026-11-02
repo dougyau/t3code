@@ -166,7 +166,9 @@ interface FakePi {
   readonly deferNextPromptResponse: () => void;
   readonly resolveDeferredState: (data: unknown) => Effect.Effect<void>;
   readonly failNextState: () => void;
-  readonly deferNextLifecycle: (type: "switch_session" | "new_session" | "fork") => void;
+  readonly deferNextLifecycle: (
+    type: "switch_session" | "new_session" | "fork" | "get_entries",
+  ) => void;
   readonly deferNextModelSelection: () => void;
   readonly queueModels: (models: ReadonlyArray<unknown>) => void;
   readonly vetoNextNewSession: () => void;
@@ -591,6 +593,234 @@ const nativeEventBarrier = Effect.fnUntraced(function* (
 });
 
 describe("PiAdapterV2", () => {
+  it.effect("keeps the checklist visible after nested todo turn finalization", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const saved = {
+        entries: [
+          {
+            id: "saved-todo",
+            parentId: null,
+            type: "message",
+            message: {
+              role: "toolResult",
+              toolName: "todo",
+              toolCallId: "saved",
+              details: {
+                nextId: 2,
+                tasks: [{ id: 1, subject: "Keep visible", status: "pending" }],
+              },
+            },
+          },
+        ],
+        leafId: "saved-todo",
+      };
+      for (let i = 0; i < 5; i++) fake.queueEntries(saved);
+      const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolName: "todo",
+        toolCallId: "codemode/1",
+        parentToolCallId: "codemode",
+        isError: false,
+        result: {
+          details: { nextId: 2, tasks: [{ id: 1, subject: "Keep visible", status: "pending" }] },
+        },
+      });
+      yield* fake.emit({ type: "agent_end", messages: [], willRetry: false });
+      yield* fake.emit({ type: "agent_settled" });
+      yield* takeEvent((event) => event.type === "turn.terminal");
+      const latest = observed.filter((event) => event.type === "checklist.updated").at(-1);
+      assert.equal(latest?.type, "checklist.updated");
+      if (latest?.type === "checklist.updated" && latest.plan?.kind === "todo_list") {
+        assert.isNotNull(latest.plan);
+        assert.equal(latest.plan?.steps[0]?.text, "Keep visible");
+        assert.equal(latest.providerThread.nativeMetadata?.checklistSelection?.state, "ready");
+      } else assert.fail("missing todo checklist");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("updates out-of-turn state entries and deduplicates replayed entries", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+      yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* takeEvent((event) => event.type === "provider_thread.updated");
+      const entries = [
+        {
+          id: "pitako-state",
+          parentId: null,
+          type: "custom",
+          customType: "pitako-todo-state",
+          data: {
+            version: 1,
+            nextId: 3,
+            tasks: [
+              { id: 2, parentId: 1, subject: " Child ", status: "cancelled" },
+              { id: 1, subject: " Parent ", status: "completed" },
+            ],
+          },
+        },
+        {
+          id: "rpiv-state",
+          parentId: "pitako-state",
+          type: "custom",
+          customType: "rpiv-todo-state",
+          data: {
+            nextId: 3,
+            tasks: [
+              { id: 1, subject: " Parent ", status: "completed" },
+              { id: 2, parentId: 1, subject: " Child ", status: "cancelled" },
+            ],
+          },
+        },
+      ];
+      for (const entry of entries) {
+        const before = observed.filter((event) => event.type === "checklist.updated").length;
+        const reads = fake
+          .allRequests()
+          .filter((request) => request["type"] === "get_entries").length;
+        yield* fake.emit({ type: "entry_appended", entry });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "input",
+          id: entry.id,
+          title: "barrier",
+        });
+        yield* takeEvent(
+          (event) =>
+            event.type === "runtime_request.updated" &&
+            event.runtimeRequest.nativeRequestRef?.nativeId === entry.id,
+        );
+        const updates = observed.filter((event) => event.type === "checklist.updated");
+        assert.equal(updates.length, before + 1);
+        const updated = updates.at(-1);
+        assert.equal(updated?.type, "checklist.updated");
+        if (updated?.type === "checklist.updated" && updated.plan?.kind === "todo_list") {
+          assert.equal(updated.plan?.runId, null);
+          assert.equal(updated.plan?.status, "completed");
+          assert.deepEqual(updated.plan?.steps, [
+            { id: "pitako-state:1", text: "Parent", status: "completed" },
+            { id: "pitako-state:2", text: "↳ ⊘ Child", status: "completed" },
+          ]);
+        } else assert.fail("missing updated todo checklist");
+        assert.equal(
+          fake.allRequests().filter((request) => request["type"] === "get_entries").length,
+          reads,
+        );
+      }
+      const replayFake = yield* makeFakePi;
+      replayFake.queueEntries({ entries, leafId: "rpiv-state" });
+      const replay = yield* openRuntime(replayFake);
+      yield* replay.runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* replay.takeEvent((event) => event.type === "provider_thread.updated");
+      const live = observed.filter((event) => event.type === "checklist.updated").at(-1);
+      const replayed = replay.observed.filter((event) => event.type === "checklist.updated").at(-1);
+      if (
+        live?.type === "checklist.updated" &&
+        live.plan?.kind === "todo_list" &&
+        replayed?.type === "checklist.updated" &&
+        replayed.plan?.kind === "todo_list"
+      ) {
+        assert.deepEqual(replayed.plan?.steps, live.plan?.steps);
+        assert.deepEqual(
+          replayed.providerThread.nativeMetadata?.checklistSelection,
+          live.providerThread.nativeMetadata?.checklistSelection,
+        );
+      } else assert.fail("missing live or replay checklist");
+      const count = replay.observed.filter((event) => event.type === "checklist.updated").length;
+      for (const entry of entries) yield* replayFake.emit({ type: "entry_appended", entry });
+      yield* replayFake.emit({
+        type: "extension_ui_request",
+        method: "input",
+        id: "replay-barrier",
+        title: "barrier",
+      });
+      yield* replay.takeEvent(
+        (event) =>
+          event.type === "runtime_request.updated" &&
+          event.runtimeRequest.nativeRequestRef?.nativeId === "replay-barrier",
+      );
+      assert.equal(
+        replay.observed.filter((event) => event.type === "checklist.updated").length,
+        count,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("preserves a state append racing the adoption baseline", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      fake.deferNextLifecycle("get_entries");
+      const { runtime, takeEvent, observed } = yield* openRuntime(fake);
+      const adopting = yield* runtime
+        .ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        })
+        .pipe(Effect.forkChild);
+      const baseline = yield* fake.takeRequest("get_entries");
+      yield* fake.emit({
+        type: "entry_appended",
+        entry: {
+          id: "B-entry",
+          parentId: null,
+          type: "custom",
+          customType: "pitako-todo-state",
+          data: {
+            version: 1,
+            nextId: 2,
+            tasks: [{ id: 1, subject: "Concurrent append", status: "pending" }],
+          },
+        },
+      });
+      yield* takeEvent(
+        (event) =>
+          event.type === "checklist.updated" &&
+          event.plan?.kind === "todo_list" &&
+          event.plan.steps[0]?.id === "B-entry:1",
+      );
+      yield* fake.emit({
+        type: "response",
+        id: baseline["id"],
+        command: "get_entries",
+        success: true,
+        data: { entries: [], leafId: null },
+      });
+      yield* Fiber.join(adopting);
+      yield* takeEvent((event) => event.type === "provider_thread.updated");
+      const latest = observed.filter((event) => event.type === "checklist.updated").at(-1);
+      assert.deepEqual(
+        latest?.type === "checklist.updated" && latest.plan?.kind === "todo_list"
+          ? latest.plan.steps
+          : null,
+        [{ id: "B-entry:1", text: "Concurrent append", status: "pending" }],
+        "stale adoption baseline must not replace the concurrent append",
+      );
+      assert.equal(
+        fake.allRequests().filter((request) => request["type"] === "get_entries").length,
+        1,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect("hydrates only the selected native TODO branch on session adoption", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakePi;

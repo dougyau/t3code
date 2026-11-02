@@ -48,3 +48,8 @@ node_modules/
 
 # pnpm content-addressable store; never belongs in the repo.
 .pnpm-store/
+
+# Local agent tooling state.
+.pi/
+.pitako/
+.codegraph/

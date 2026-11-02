@@ -76,7 +76,15 @@ import {
   resolvePiLaunchArgs,
 } from "./mcpInjection.ts";
 import { PI_FILE_CHANGE_TOOLS } from "./mcpExtensionSource.ts";
-import { piTodoBranch, piTodoSnapshot, unavailablePiTodos, type PiTodoSource } from "./piTodo.ts";
+import {
+  piTodoBranch,
+  piTodoEmptyFold,
+  piTodoSnapshot,
+  piTodoStep,
+  piTodoSteps,
+  type PiTodoFold,
+  type PiTodoSource,
+} from "./piTodo.ts";
 import {
   PI_SUBAGENT_EVENT_BYTES,
   piSubagentEventLines,
@@ -451,6 +459,7 @@ function piApprovalRequestKind(title: string): "command" | "file-change" {
 interface PiThreadState {
   providerThread: OrchestrationV2ProviderThread;
   activeTurn: ActivePiTurn | null;
+  todoFold: PiTodoFold;
   lastTurn?: ActivePiTurn;
 }
 
@@ -577,6 +586,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       const sessionEventPermit = yield* Semaphore.make(1);
       const subagentEventPermit = yield* Semaphore.make(1);
       let threadState: PiThreadState | null = null;
+      let adoptionTodoReplay: { state: PiThreadState; entries: Array<PiSessionEntry> } | null =
+        null;
       let registrationAttempted = false;
       let lastNativeThreadId: string | null = null;
       let stopRequested = false;
@@ -875,18 +886,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           nativeItemId,
         });
         const now = yield* DateTime.now;
-        const steps = source.tasks
-          .filter((task) => task.status !== "deleted")
-          .map((task) => ({
-            id: `${task.identityEntryId}:${task.id}`,
-            text: task.subject,
-            status:
-              task.status === "in_progress"
-                ? ("running" as const)
-                : task.status === "completed"
-                  ? ("completed" as const)
-                  : ("pending" as const),
-          }));
+        const steps = piTodoSteps(source.tasks);
         const visible = source.state === "ready" && steps.length > 0;
         const completed = visible && steps.every((step) => step.status === "completed");
         const updated = {
@@ -947,10 +947,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         listing: PiSessionListing | null,
       ) {
         const walk = listing === null ? null : walkPiBranch(listing.entries, listing.leafId, null);
-        state.providerThread = yield* emitPiChecklist(
-          state.providerThread,
-          piTodoBranch(walk?.reachedStop ? walk.entries.toReversed() : null),
-        );
+        const branch = walk?.reachedStop ? walk.entries.toReversed() : null;
+        state.todoFold = piTodoBranch(branch);
+        state.providerThread = yield* emitPiChecklist(state.providerThread, state.todoFold.winner);
       });
       const reconcilePiTodos = Effect.fn("Pi.reconcileTodos")(function* (
         state: PiThreadState,
@@ -969,7 +968,11 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         if (pendingTodos.size === 0) yield* publishPiTodoListing(state, listing);
         else if (final) {
           pendingTodos.clear();
-          state.providerThread = yield* emitPiChecklist(state.providerThread, unavailablePiTodos);
+          state.todoFold = piTodoBranch(null);
+          state.providerThread = yield* emitPiChecklist(
+            state.providerThread,
+            state.todoFold.winner,
+          );
         }
       });
 
@@ -3557,6 +3560,25 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           return;
         }
         switch (event["type"]) {
+          case "entry_appended": {
+            if (state === null) return;
+            const raw = event["entry"];
+            if (
+              recordString(raw, "type") !== "custom" ||
+              !["pitako-todo-state", "rpiv-todo-state"].includes(
+                recordString(raw, "customType") ?? "",
+              )
+            )
+              return;
+            const entry = piSessionEntry(raw);
+            if (entry === null) return;
+            if (adoptionTodoReplay?.state === state) adoptionTodoReplay.entries.push(entry);
+            const fold = piTodoStep(state.todoFold, entry);
+            if (fold === state.todoFold) return;
+            state.todoFold = fold;
+            state.providerThread = yield* emitPiChecklist(state.providerThread, fold.winner);
+            return;
+          }
           case "agent_start": {
             if (
               turn === null &&
@@ -3688,6 +3710,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               recordString(event, "toolName") === "todo" &&
               event["isError"] !== true
             ) {
+              if (recordString(event, "parentToolCallId") !== undefined) return;
               const call = recordString(event, "toolCallId");
               if (call) pendingTodos.add(call);
               yield* reconcilePiTodos(state);
@@ -4219,14 +4242,32 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 createdAt,
                 updatedAt: createdAt,
               };
-        threadState = { providerThread, activeTurn: null };
-        const baselineEntries = yield* request({ type: "get_entries" }).pipe(
-          Effect.orElseSucceed(() => undefined),
+        threadState = { providerThread, activeTurn: null, todoFold: piTodoEmptyFold() };
+        const adoption = { state: threadState, entries: [] as Array<PiSessionEntry> };
+        adoptionTodoReplay = adoption;
+        yield* Effect.gen(function* () {
+          const baselineEntries = yield* request({ type: "get_entries" }).pipe(
+            Effect.orElseSucceed(() => undefined),
+          );
+          lastKnownLeaf = recordString(baselineEntries, "leafId") ?? null;
+          leafCursorStale = baselineEntries === undefined;
+          pendingTodos.clear();
+          yield* publishPiTodoListing(adoption.state, piSessionListing(baselineEntries));
+          const fold = adoption.entries.reduce(piTodoStep, adoption.state.todoFold);
+          if (fold !== adoption.state.todoFold) {
+            adoption.state.todoFold = fold;
+            adoption.state.providerThread = yield* emitPiChecklist(
+              adoption.state.providerThread,
+              fold.winner,
+            );
+          }
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (adoptionTodoReplay === adoption) adoptionTodoReplay = null;
+            }),
+          ),
         );
-        lastKnownLeaf = recordString(baselineEntries, "leafId") ?? null;
-        leafCursorStale = baselineEntries === undefined;
-        pendingTodos.clear();
-        yield* publishPiTodoListing(threadState, piSessionListing(baselineEntries));
         if (publish)
           yield* emit({
             type: "provider_thread.updated",
@@ -5110,6 +5151,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
 
 interface PiSessionEntry {
   readonly id: string;
+  readonly type: unknown;
+  readonly customType: unknown;
+  readonly data: unknown;
   readonly message: unknown;
   readonly parentId: string | null;
   readonly isUserMessage: boolean;
@@ -5130,27 +5174,35 @@ function piSessionListing(data: unknown): PiSessionListing | null {
     : null;
 }
 
+function piSessionEntry(entry: unknown): PiSessionEntry | null {
+  const id = recordString(entry, "id");
+  const parentId = recordField(entry, "parentId");
+  if (id === undefined || (parentId !== null && typeof parentId !== "string")) return null;
+  const timestamp = recordString(entry, "timestamp");
+  return {
+    id,
+    type: recordField(entry, "type"),
+    customType: recordField(entry, "customType"),
+    data: recordField(entry, "data"),
+    message: recordField(entry, "message"),
+    parentId,
+    isUserMessage:
+      recordField(entry, "type") === "message" &&
+      recordString(recordField(entry, "message"), "role") === "user",
+    timestamp:
+      timestamp === undefined
+        ? null
+        : Option.getOrNull(Option.map(DateTime.make(timestamp), DateTime.toEpochMillis)),
+  };
+}
+
 function piSessionEntries(entries: unknown): ReadonlyMap<string, PiSessionEntry> | null {
   const byId = new Map<string, PiSessionEntry>();
   if (!Array.isArray(entries)) return null;
-  for (const entry of entries) {
-    const id = recordString(entry, "id");
-    const parentId = recordField(entry, "parentId");
-    if (id === undefined || byId.has(id) || (parentId !== null && typeof parentId !== "string"))
-      return null;
-    const timestamp = recordString(entry, "timestamp");
-    byId.set(id, {
-      id,
-      message: recordField(entry, "message"),
-      parentId,
-      isUserMessage:
-        recordField(entry, "type") === "message" &&
-        recordString(recordField(entry, "message"), "role") === "user",
-      timestamp:
-        timestamp === undefined
-          ? null
-          : Option.getOrNull(Option.map(DateTime.make(timestamp), DateTime.toEpochMillis)),
-    });
+  for (const raw of entries) {
+    const entry = piSessionEntry(raw);
+    if (entry === null || byId.has(entry.id)) return null;
+    byId.set(entry.id, entry);
   }
   return byId;
 }
