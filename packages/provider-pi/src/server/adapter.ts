@@ -101,7 +101,7 @@ import {
   piSubagentWorkflowChildren,
   piSubagentLifecycleHints,
   piSubagentMetadataString,
-  PI_SUBAGENT_LIFECYCLE_MAX_BYTES,
+  PI_SUBAGENT_STATUS_MAX_BYTES,
   type PiSubagentLifecycle,
   type PiSubagentObservation,
 } from "./subagents.ts";
@@ -2240,11 +2240,21 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         toolCallId?: string,
       ) {
         return yield* Effect.gen(function* () {
+          const path = `${asyncDir}/status.json`;
           const chunks = yield* fileSystem
-            .stream(`${asyncDir}/status.json`, { bytesToRead: PI_SUBAGENT_LIFECYCLE_MAX_BYTES + 1 })
+            .stream(path, { bytesToRead: PI_SUBAGENT_STATUS_MAX_BYTES + 1 })
             .pipe(Stream.runCollect);
           const size = chunks.reduce((total, chunk) => total + chunk.length, 0);
-          if (size > PI_SUBAGENT_LIFECYCLE_MAX_BYTES) return undefined;
+          if (size > PI_SUBAGENT_STATUS_MAX_BYTES) {
+            // Known children stay registered; an unread file proves nothing about membership.
+            const info = yield* Effect.option(fileSystem.stat(path));
+            yield* Effect.logWarning("Pi subagent status.json exceeds the safety cap.", {
+              path,
+              size: Option.isSome(info) ? Number(info.value.size) : size,
+              maxBytes: PI_SUBAGENT_STATUS_MAX_BYTES,
+            });
+            return undefined;
+          }
           const bytes = new Uint8Array(size);
           let offset = 0;
           for (const chunk of chunks) {
