@@ -6,7 +6,6 @@ import {
   piSubagentLifecycle,
   piSubagentWorkflowChildren,
   piSubagentLifecycleHints,
-  PI_SUBAGENT_LIFECYCLE_MAX_BYTES,
 } from "./subagents.ts";
 
 describe("Pi native subagent observations", () => {
@@ -52,9 +51,33 @@ describe("Pi native subagent observations", () => {
       { ...data, workflowChildren: { ...data.workflowChildren, parentToolCallId: "other" } },
     ])
       expect(piSubagentWorkflowChildren(JSON.stringify(invalid), "W", "launch")).toEqual([]);
-    expect(
-      piSubagentWorkflowChildren(" ".repeat(PI_SUBAGENT_LIFECYCLE_MAX_BYTES + 1), "W", "launch"),
-    ).toEqual([]);
+    const members = Array.from({ length: 130 }, (_, index) => ({
+      childId: `lane-${index}`,
+      runId: `C${index}`,
+      agent: "reviewer",
+      state: "running",
+      output: "大".repeat(1_000),
+      history: Array.from({ length: 40 }, () => ({ role: "tool" })),
+    }));
+    const reduced = piSubagentWorkflowChildren(
+      JSON.stringify({
+        ...data,
+        workflowChildren: {
+          ...data.workflowChildren,
+          children: members.map(({ output: _, history: __, ...member }) => member),
+        },
+      }),
+      "W",
+      "launch",
+    );
+    const large = JSON.stringify({
+      ...data,
+      output: "x".repeat(100_000),
+      workflowChildren: { ...data.workflowChildren, children: members },
+    });
+    expect(Buffer.byteLength(large)).toBeGreaterThan(64 * 1024);
+    expect(reduced).toHaveLength(130);
+    expect(piSubagentWorkflowChildren(large, "W", "launch")).toEqual(reduced);
   });
 
   it("preserves bounded foreground nested public steps and their real parents", () => {
@@ -219,19 +242,25 @@ describe("Pi native subagent observations", () => {
       workflowKey: "lane",
       steps: [{ childId: "step:0", runId: undefined, workflowKey: undefined }],
     });
+    const steps = Array.from({ length: 129 }, (_, index) => ({ index }));
+    const reduced = piSubagentLifecycle(JSON.stringify({ ...metadata, steps }), "C");
+    expect(reduced?.steps).toHaveLength(129);
+    expect(
+      piSubagentLifecycle(
+        JSON.stringify({
+          ...metadata,
+          steps: steps.map((step) => ({ ...step, output: "界".repeat(1_000) })),
+          ignored: Array.from({ length: 4097 }, () => 0),
+          nested: Array.from({ length: 17 }).reduce<unknown>((value) => ({ child: value }), null),
+        }),
+        "C",
+      ),
+    ).toEqual(reduced);
     for (const value of [
       "{",
       JSON.stringify({ ...metadata, lifecycleArtifactVersion: 4 }),
       JSON.stringify({ ...metadata, runId: "other" }),
       JSON.stringify({ ...metadata, id: "other" }),
-      JSON.stringify({ ...metadata, steps: Array.from({ length: 129 }, () => ({})) }),
-      JSON.stringify({ ...metadata, ignored: "x".repeat(PI_SUBAGENT_LIFECYCLE_MAX_BYTES) }),
-      JSON.stringify({ ...metadata, ignored: "界".repeat(PI_SUBAGENT_LIFECYCLE_MAX_BYTES / 2) }),
-      JSON.stringify({ ...metadata, ignored: Array.from({ length: 4097 }, () => 0) }),
-      JSON.stringify({
-        ...metadata,
-        ignored: Array.from({ length: 17 }).reduce<unknown>((value) => ({ child: value }), null),
-      }),
     ])
       expect(piSubagentLifecycle(value, "C")).toBeUndefined();
   });

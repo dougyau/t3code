@@ -6635,6 +6635,51 @@ describe("PiAdapterV2", () => {
           ).length,
           2,
         );
+        // Real case: 9 native members, the last two written once status.json outgrew 64 KiB.
+        const appendMembers = (from: number, to: number) => {
+          for (let index = from; index < to; index++)
+            metadata.workflowChildren.children.push({
+              runId: `late-${index}`,
+              childId: `lane-${index}`,
+              agent: "external-reviewer",
+              label: `Review ${index}`,
+              state: "running",
+            });
+        };
+        appendMembers(2, 7);
+        yield* fs.writeFileString(`${dir}/status.json`, JSON.stringify(metadata));
+        yield* emitNativeSnapshot(fake, [root]);
+        yield* nativeEventBarrier(fake, take);
+        yield* fake.emit({ type: "agent_settled" });
+        yield* take((event) => event.type === "turn.terminal");
+        appendMembers(7, 9);
+        const oversizedStatus = JSON.stringify({
+          ...metadata,
+          output: "\u5927".repeat(33_000),
+          history: Array.from({ length: 4097 }, () => 0),
+        });
+        assert.isAbove(Buffer.byteLength(oversizedStatus), 99_508);
+        yield* fs.writeFileString(`${dir}/status.json`, oversizedStatus);
+        yield* emitNativeSnapshot(fake, [root]);
+        yield* take(
+          (event) => event.type === "subagent.updated" && event.subagent.title === "Review 8",
+        );
+        assert.deepEqual(
+          [
+            ...new Map(
+              events.flatMap((event) =>
+                event.type === "subagent.updated"
+                  ? [[event.subagent.id, event.subagent.title] as const]
+                  : [],
+              ),
+            ).values(),
+          ].sort(),
+          [
+            "Review revised contracts",
+            "Review persistence",
+            ...Array.from({ length: 7 }, (_, index) => `Review ${index + 2}`),
+          ].sort(),
+        );
       }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 

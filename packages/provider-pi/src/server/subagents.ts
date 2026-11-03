@@ -29,7 +29,8 @@ export interface PiSubagentObservation {
 export const piSubagentObservationId = (runId: string, childId: string) =>
   JSON.stringify([runId, childId]);
 
-export const PI_SUBAGENT_LIFECYCLE_MAX_BYTES = 64 * 1024;
+/** Memory safety cap only; real status files are far smaller. */
+export const PI_SUBAGENT_STATUS_MAX_BYTES = 16 * 1024 * 1024;
 
 export function piSubagentMetadataString(value: unknown, field: string, limit = 256) {
   const text = recordString(value, field);
@@ -50,28 +51,50 @@ export interface PiSubagentLifecycle {
   }>;
 }
 
+const scalars = (value: unknown, fields: ReadonlyArray<string>) =>
+  Object.fromEntries(
+    fields.flatMap((field) => {
+      const scalar = recordField(value, field);
+      return scalar === null || typeof scalar === "object" ? [] : [[field, scalar]];
+    }),
+  );
+
+/** Projects status.json to the identity and membership fields; bodies are never retained. */
 function subagentMetadata(text: string): unknown {
-  if (
-    text.length > PI_SUBAGENT_LIFECYCLE_MAX_BYTES ||
-    new TextEncoder().encode(text).byteLength > PI_SUBAGENT_LIFECYCLE_MAX_BYTES
-  )
-    return undefined;
   let data: unknown;
   try {
     data = JSON.parse(text);
   } catch {
     return undefined;
   }
-  let remaining = 4096;
-  const bounded = (value: unknown, depth: number): boolean => {
-    if (depth > 16 || --remaining < 0) return false;
-    return (
-      value === null ||
-      typeof value !== "object" ||
-      Object.values(value).every((child) => bounded(child, depth + 1))
-    );
+  const steps = recordField(data, "steps");
+  const summary = recordField(data, "workflowChildren");
+  const children = recordField(summary, "children");
+  return {
+    ...scalars(data, [
+      "lifecycleArtifactVersion",
+      "id",
+      "runId",
+      "toolCallId",
+      "mode",
+      "parentWorkflowRunId",
+      "workflowKey",
+    ]),
+    steps: Array.isArray(steps)
+      ? steps.map((step) =>
+          scalars(step, ["index", "runId", "workflowKey", "label", "sessionName"]),
+        )
+      : undefined,
+    workflowChildren: {
+      ...scalars(summary, ["version", "workflowRunId", "parentToolCallId"]),
+      children: Array.isArray(children)
+        ? children.map((child) => ({
+            ...scalars(child, ["runId", "childId", "agent", "label", "state", "model"]),
+            activity: scalars(recordField(child, "activity"), ["currentTool"]),
+          }))
+        : undefined,
+    },
   };
-  return bounded(data, 0) ? data : undefined;
 }
 
 /** Lifecycle metadata proves identity only; partial files never prove absence or settlement. */
@@ -87,8 +110,7 @@ export function piSubagentLifecycle(text: string, runId: string): PiSubagentLife
   const steps = recordField(data, "steps");
   if (
     (mode !== "single" && mode !== "workflow" && mode !== "chain" && mode !== "parallel") ||
-    !Array.isArray(steps) ||
-    steps.length > 128
+    !Array.isArray(steps)
   )
     return undefined;
   return {
@@ -311,7 +333,7 @@ export function piSubagentResults(
     recordString(summary, "parentToolCallId") === fallbackRunId &&
     Array.isArray(children)
   ) {
-    for (const child of children.slice(0, 128)) {
+    for (const child of children) {
       const runId = piSubagentMetadataString(child, "runId");
       const title = piSubagentMetadataString(child, "agent");
       const key = piSubagentMetadataString(child, "childId", 128);
